@@ -83,6 +83,15 @@ pub struct SuperfileReader {
     /// bytes). Carries the page index when present so `RowSelection`
     /// can skip whole pages.
     arrow_meta: Option<ArrowReaderMetadata>,
+    /// The lazy byte source the reader was opened over, retained only
+    /// on the [`open_lazy`] path. `None` on the eager [`open`] path
+    /// (resident bytes already cover every range). Lets
+    /// [`byte_source`](Self::byte_source) hand callers one uniform
+    /// whole-segment byte source regardless of how the reader opened.
+    ///
+    /// [`open_lazy`]: SuperfileReader::open_lazy
+    /// [`open`]: SuperfileReader::open
+    source: Option<Arc<dyn crate::superfile::LazyByteSource>>,
     schema: Arc<Schema>,
     id_column: String,
     n_docs: u64,
@@ -274,6 +283,7 @@ impl SuperfileReader {
         Ok(Self {
             bytes: None,
             arrow_meta: None,
+            source: Some(source),
             schema,
             id_column,
             n_docs,
@@ -378,6 +388,7 @@ impl SuperfileReader {
         Ok(Self {
             bytes: Some(bytes),
             arrow_meta: Some(arrow_meta),
+            source: None,
             schema,
             id_column,
             n_docs,
@@ -489,6 +500,31 @@ impl SuperfileReader {
         Ok(record_batch)
     }
 
+    /// A [`LazyByteSource`] over the **entire** segment, regardless of
+    /// how the reader was opened. The single byte-access handle the
+    /// SQL/DataFusion path reads through -- callers never branch on
+    /// storage mode:
+    ///
+    /// - resident-bytes readers (eager [`open`], disk-cache mmap) wrap
+    ///   their bytes in a [`BytesLazyByteSource`]; every `range` is a
+    ///   zero-copy `Bytes::slice` (a refcount bump, no copy).
+    /// - lazy readers ([`open_lazy`]) return the source they were
+    ///   opened over, so ranges stream straight from object storage.
+    ///
+    /// [`LazyByteSource`]: crate::superfile::LazyByteSource
+    /// [`BytesLazyByteSource`]: crate::superfile::BytesLazyByteSource
+    /// [`open`]: SuperfileReader::open
+    /// [`open_lazy`]: SuperfileReader::open_lazy
+    pub fn byte_source(&self) -> Arc<dyn crate::superfile::LazyByteSource> {
+        match (&self.bytes, &self.source) {
+            (Some(bytes), _) => Arc::new(crate::superfile::BytesLazyByteSource::new(bytes.clone())),
+            (None, Some(src)) => Arc::clone(src),
+            (None, None) => {
+                unreachable!("a SuperfileReader has either resident bytes or a lazy source")
+            }
+        }
+    }
+
     /// Resolve in-segment row offsets to their durable identity.
     ///
     /// Given a slice of `local_doc_id`s — the per-segment row
@@ -566,34 +602,13 @@ impl SuperfileReader {
             return Ok(RecordBatch::new_empty(out_schema));
         }
 
-        // 4. Sort + dedup so the RowSelection's `(skip, select)`
-        //    pairs are strictly monotonic. local_doc_ids is dense
-        //    parquet-row index (one parquet row per doc, in id
-        //    order — invariant of the superfile body), so the
-        //    selection lines up directly with parquet row offsets.
-        //    Caller's original order (including duplicates) is
-        //    restored below via the rank-back step.
-        let mut sorted_ids: Vec<u32> = local_doc_ids.to_vec();
-        sorted_ids.sort_unstable();
-        sorted_ids.dedup();
-
-        // 5. Build the RowSelection as alternating skip/select
-        //    runs. This decodes only the rows containing the
-        //    requested doc ids — for k=10 hits over a 100k-doc
-        //    body, ~10 page-fragments instead of the entire
-        //    column. (With page indexes present, parquet skips
-        //    whole pages; without, it still avoids the full
-        //    concat_batches over a 100k-row decoded buffer.)
-        let mut selectors: Vec<RowSelector> = Vec::with_capacity(sorted_ids.len() * 2 + 1);
-        let mut cursor: u32 = 0;
-        for &id in &sorted_ids {
-            if id > cursor {
-                selectors.push(RowSelector::skip((id - cursor) as usize));
-            }
-            selectors.push(RowSelector::select(1));
-            cursor = id + 1;
-        }
-        let selection = RowSelection::from(selectors);
+        // 4+5. Sorted/dedup'd ids → monotonic skip/select runs.
+        //    local_doc_ids is dense parquet-row index (one parquet row
+        //    per doc, in id order — invariant of the superfile body),
+        //    so the selection lines up directly with parquet row
+        //    offsets. Caller's original order (including duplicates)
+        //    is restored below via the rank-back step.
+        let (sorted_ids, selection) = row_selection_for_ids(local_doc_ids);
 
         // Metadata-cached read: reuse the `ArrowReaderMetadata` parsed
         // at open (no per-call footer parse), so this targeted read
@@ -622,18 +637,9 @@ impl SuperfileReader {
             "RowSelection rows ≠ requested distinct doc ids"
         );
 
-        // 6. Rank back into the caller's order via take. For each
-        //    requested doc_id, binary-search its row position in
-        //    `sorted_ids` (which is also its row position in
-        //    `selected`). Cheap: typical k is 10..1000.
-        let mut indices_builder = UInt32Array::builder(local_doc_ids.len());
-        for &id in local_doc_ids {
-            let row = sorted_ids
-                .binary_search(&id)
-                .expect("requested id was inserted into sorted_ids above");
-            indices_builder.append_value(row as u32);
-        }
-        let indices = indices_builder.finish();
+        // 6. Rank back into the caller's order via take. Cheap:
+        //    typical k is 10..1000.
+        let indices = rank_back_indices(local_doc_ids, &sorted_ids);
 
         // 7. Gather columns in caller's projection order (the
         //    reader returns columns in file order, which may
@@ -720,8 +726,9 @@ impl SuperfileReader {
     ///
     /// `query` is tokenized by the same v1 tokenizer used at build
     /// time (`AsciiLowerTokenizer`). Returns `(local_doc_id, score)`
-    /// ordered by descending score.
-    pub async fn bm25_search(
+    /// hits ordered by descending score — this is the hit kernel, not a
+    /// row-returning search; row materialization is `take_by_local_doc_ids`.
+    pub async fn bm25_hits_async(
         &self,
         column: &str,
         query: &str,
@@ -989,7 +996,7 @@ impl SuperfileReader {
     /// only a cold `Source::Lazy` miss actually `await`s an
     /// object-store GET. The CPU steps (centroid + 1-bit code scoring,
     /// rerank) parallelize on the global rayon pool.
-    pub async fn vector_search(
+    pub async fn vector_hits_async(
         &self,
         column: &str,
         query: &[f32],
@@ -1122,6 +1129,48 @@ fn slice_or_err(
 // Re-export for convenience: callers want `BoolMode` without diving
 // into the FTS submodule.
 pub use crate::superfile::fts::reader::BoolMode as FtsBoolMode;
+
+/// Sorted, deduplicated copy of `ids` plus the parquet [`RowSelection`]
+/// selecting exactly those rows, as strictly monotonic alternating
+/// skip/select runs. Decodes only the rows the ids land on — for k=10
+/// hits over a 100k-doc body, ~10 page-fragments instead of the whole
+/// column (with page indexes present parquet skips whole pages).
+///
+/// Shared by [`SuperfileReader::take_by_local_doc_ids`] (sync decode
+/// over resident bytes) and the supertable's cold object-store row
+/// resolution — the row-selection contract is identical even though
+/// the I/O models differ. Pair with [`rank_back_indices`] to restore
+/// the caller's order afterwards.
+pub(crate) fn row_selection_for_ids(ids: &[u32]) -> (Vec<u32>, RowSelection) {
+    let mut sorted: Vec<u32> = ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut selectors: Vec<RowSelector> = Vec::with_capacity(sorted.len() * 2 + 1);
+    let mut cursor: u32 = 0;
+    for &id in &sorted {
+        if id > cursor {
+            selectors.push(RowSelector::skip((id - cursor) as usize));
+        }
+        selectors.push(RowSelector::select(1));
+        cursor = id + 1;
+    }
+    (sorted, RowSelection::from(selectors))
+}
+
+/// Rank-back `take` indices restoring the caller's id order (duplicates
+/// honored) over rows selected via [`row_selection_for_ids`]: for each
+/// requested id, its row position in `sorted` is its row position in
+/// the selected batch. Cheap — typical k is 10..1000.
+pub(crate) fn rank_back_indices(ids: &[u32], sorted: &[u32]) -> UInt32Array {
+    let mut builder = UInt32Array::builder(ids.len());
+    for &id in ids {
+        let row = sorted
+            .binary_search(&id)
+            .expect("requested id present in the sorted selection");
+        builder.append_value(row as u32);
+    }
+    builder.finish()
+}
 
 #[cfg(test)]
 mod tests {
@@ -1272,6 +1321,21 @@ mod tests {
     }
 
     #[test]
+    fn row_selection_and_rank_back_honor_duplicates_and_gaps() {
+        // Caller order with a duplicate and out-of-order ids.
+        let ids = [7u32, 2, 7, 0];
+        let (sorted, selection) = row_selection_for_ids(&ids);
+        assert_eq!(sorted, vec![0, 2, 7]);
+        // select(0), skip(1), select(2), skip(4..7), select(7)
+        assert_eq!(selection.row_count(), 3, "one selected row per distinct id");
+
+        let indices = rank_back_indices(&ids, &sorted);
+        // Positions in `sorted`: 7→2, 2→1, 7→2, 0→0.
+        let got: Vec<u32> = (0..indices.len()).map(|i| indices.value(i)).collect();
+        assert_eq!(got, vec![2, 1, 2, 0]);
+    }
+
+    #[test]
     fn take_by_local_doc_ids_empty_returns_empty_batch() {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
@@ -1313,7 +1377,7 @@ mod tests {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let hits = r
-            .bm25_search("title", "rust", 5, BoolMode::Or)
+            .bm25_hits_async("title", "rust", 5, BoolMode::Or)
             .await
             .expect("BM25 search");
         // docs 0 and 2 contain "rust"; both should appear.
@@ -1336,7 +1400,7 @@ mod tests {
         let bytes = Bytes::from(b.finish().expect("finish builder"));
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let err = r
-            .bm25_search("nope", "x", 1, BoolMode::Or)
+            .bm25_hits_async("nope", "x", 1, BoolMode::Or)
             .await
             .expect_err("expected error");
         assert!(matches!(err, ReadError::MissingKv(_)));
@@ -1431,7 +1495,7 @@ mod tests {
         q[5] = 0.5;
         normalize(&mut q);
         let hits = r
-            .vector_search("emb", &q, 1, VectorSearchOptions::default())
+            .vector_hits_async("emb", &q, 1, VectorSearchOptions::default())
             .await
             .expect("vector search");
         assert!(!hits.is_empty());
@@ -1447,7 +1511,7 @@ mod tests {
         q[5] = 0.5;
         normalize(&mut q);
         let hits = r
-            .vector_search("emb", &q, 1, VectorSearchOptions::new().with_nprobe(4))
+            .vector_hits_async("emb", &q, 1, VectorSearchOptions::new().with_nprobe(4))
             .await
             .expect("vector search");
         assert_eq!(hits[0].0, 2);
@@ -1475,7 +1539,7 @@ mod tests {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let err = r
-            .bm25_search("nonexistent", "rust", 5, BoolMode::Or)
+            .bm25_hits_async("nonexistent", "rust", 5, BoolMode::Or)
             .await
             .expect_err("expected error");
         assert!(matches!(err, ReadError::Fts(_)));
