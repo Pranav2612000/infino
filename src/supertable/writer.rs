@@ -1236,9 +1236,16 @@ fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64
         if centroids_off < SUB_HEADER_SIZE || cluster_idx_end > subsection_len {
             return None;
         }
+        // Stage only [cluster_idx .. cluster_idx_end]. The fp32 centroids that
+        // precede it are read solely by the rare fallback per-segment `nprobe`
+        // path (segments lacking a manifest cluster summary), which range-GETs
+        // them from the superfile on demand — they remain on disk. The hot
+        // cluster-probe path reads only `cluster_idx`, so keeping centroids out
+        // of the open_blob makes the manifest-inline open footprint independent
+        // of `n_cent` (centroids are ~99% of it at high `n_cent`).
         ranges.push((
-            off + subsection_off as u64 + centroids_off as u64,
-            (cluster_idx_end - centroids_off) as u64,
+            off + subsection_off as u64 + cluster_idx_off as u64,
+            (cluster_idx_end - cluster_idx_off) as u64,
         ));
         if codec_meta_size > 0 {
             let meta_end = codec_meta_off.checked_add(codec_meta_size)?;
@@ -2560,6 +2567,54 @@ mod tests {
         // per-cluster counts sum to the segment's doc count.
         let total: u64 = vs.clusters.counts.iter().map(|&c| c as u64).sum();
         assert_eq!(total, seg.n_docs);
+    }
+
+    #[test]
+    fn open_blob_omits_fp32_centroids_keeps_cluster_idx() {
+        // `dim` is chosen so the fp32 centroid block (`n_cent * dim * 4`) is
+        // far larger than any structural open range (outer header, directory,
+        // sub-header, cluster_idx), making the exclusion unambiguous.
+        let dim = 64;
+        let st = Supertable::create(options_with_vector(dim)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, 8, dim)).expect("append");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        let seg = &r.manifest().superfiles[0];
+        let vs = seg.vector_summary.get("emb").expect("emb summary");
+        let n_cent = vs.clusters.n_cent as usize;
+        assert!(n_cent >= 1 && vs.clusters.dim as usize == dim);
+
+        let offsets = seg
+            .subsection_offsets
+            .as_ref()
+            .expect("subsection offsets captured at commit");
+        let centroids_bytes = (n_cent * dim * 4) as u64;
+        let cluster_idx_bytes =
+            (n_cent * crate::superfile::format::vec::CLUSTER_IDX_ENTRY_BYTES) as u64;
+
+        // No captured open range is centroid-sized: the fp32 centroids are not
+        // staged into the manifest open_blob (the cluster-probe hot path never
+        // reads them; the fallback nprobe path range-GETs them on demand).
+        assert!(
+            offsets
+                .vec_open_ranges
+                .iter()
+                .all(|&(_, len)| len < centroids_bytes),
+            "open_blob must not carry fp32 centroids; ranges={:?}, centroids={centroids_bytes} B",
+            offsets.vec_open_ranges,
+        );
+        // ...but it must still carry the small cluster_idx that the
+        // cluster-probe path reads zero-GET on cold open.
+        assert!(
+            offsets
+                .vec_open_ranges
+                .iter()
+                .any(|&(_, len)| len == cluster_idx_bytes),
+            "open_blob must carry cluster_idx ({cluster_idx_bytes} B); ranges={:?}",
+            offsets.vec_open_ranges,
+        );
     }
 
     // ---- rayon-shard parallelism -------------------------------------
