@@ -97,7 +97,7 @@ fn pack_partition(
     // re-compacting them gains nothing.
     let mut candidates: Vec<&SuperfileStats> = segs
         .into_iter()
-        .filter(|s| !s.sealed_by_other && s.size_bytes < min_output_bytes)
+        .filter(|s| !s.sealed_by_other && s.size_bytes < target_bytes)
         .collect();
 
     // Most-deleted first (reclaim space soonest), then smallest, then ID.
@@ -1281,61 +1281,71 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore]
     async fn compact_runs_multiple_compactions_on_separate_file_sets_in_same_job() {
         let dir = TempDir::new().expect("tempdir");
         let st = make_st(&dir);
 
-        // Batch A: ten superfiles with group-A terms (2 docs each = 20 docs total).
-        // 10 × ~1217 bytes ≈ 12 170 bytes > min_output_bytes → job emitted.
-        commit_titles(&st, &["alpha first", "alpha second"]);
-        commit_titles(&st, &["bravo first", "bravo second"]);
-        commit_titles(&st, &["charlie first", "charlie second"]);
-        commit_titles(&st, &["delta first", "delta second"]);
-        commit_titles(&st, &["echo first", "echo second"]);
-        commit_titles(&st, &["foxtrot first", "foxtrot second"]);
-        commit_titles(&st, &["golf first", "golf second"]);
-        commit_titles(&st, &["hotel first", "hotel second"]);
-        commit_titles(&st, &["india first", "india second"]);
-        commit_titles(&st, &["juliet first", "juliet second"]);
+        // Each superfile must be large enough that 30 combined overflow the 1 MiB
+        // target, forcing the selector to emit two jobs. Write 4096 batches per
+        // commit so each superfile holds 4096 × 2 = 8192 docs.
+        let commit_bulk = |titles: &[&str]| {
+            let mut w = st.writer().expect("writer");
+            for _ in 0..4096 {
+                w.append(&build_title_batch(titles)).expect("append");
+            }
+            w.commit().expect("commit");
+        };
 
-        // Batch B: ten more superfiles with group-B terms (2 docs each = 20 docs).
-        for _ in 0..4 {
-            commit_titles(&st, &["kilo first", "kilo second"]);
-            commit_titles(&st, &["lima first", "lima second"]);
-            commit_titles(&st, &["mike first", "mike second"]);
-            commit_titles(&st, &["november first", "november second"]);
-            commit_titles(&st, &["oscar first", "oscar second"]);
-            commit_titles(&st, &["papa first", "papa second"]);
-            commit_titles(&st, &["quebec first", "quebec second"]);
-            commit_titles(&st, &["romeo first", "romeo second"]);
-            commit_titles(&st, &["sierra first", "sierra second"]);
-            commit_titles(&st, &["tango first", "tango second"]);
+        // Batch A: ten superfiles; 10 × 8192 = 81920 docs total.
+        commit_bulk(&["alpha first", "alpha second"]);
+        commit_bulk(&["bravo first", "bravo second"]);
+        commit_bulk(&["charlie first", "charlie second"]);
+        commit_bulk(&["delta first", "delta second"]);
+        commit_bulk(&["echo first", "echo second"]);
+        commit_bulk(&["foxtrot first", "foxtrot second"]);
+        commit_bulk(&["golf first", "golf second"]);
+        commit_bulk(&["hotel first", "hotel second"]);
+        commit_bulk(&["india first", "india second"]);
+        commit_bulk(&["juliet first", "juliet second"]);
+
+        // Batch B: twenty superfiles (2 iterations × 10 terms); 20 × 8192 = 163840 docs total.
+        for _ in 0..2 {
+            commit_bulk(&["kilo first", "kilo second"]);
+            commit_bulk(&["lima first", "lima second"]);
+            commit_bulk(&["mike first", "mike second"]);
+            commit_bulk(&["november first", "november second"]);
+            commit_bulk(&["oscar first", "oscar second"]);
+            commit_bulk(&["papa first", "papa second"]);
+            commit_bulk(&["quebec first", "quebec second"]);
+            commit_bulk(&["romeo first", "romeo second"]);
+            commit_bulk(&["sierra first", "sierra second"]);
+            commit_bulk(&["tango first", "tango second"]);
         }
 
+        // 30 superfiles total; 81920 + 163840 = 245760 docs.
         let manifest_id_before_first_compact = st.manifest_id();
         st.compact(&small_compact_cfg())
             .await
             .expect("second compact");
 
-        // The manifest must have advanced past the ten batch-B commits.
+        // compact() must have run two jobs (one per file set → manifest +2).
         assert!(
             st.manifest_id() == manifest_id_before_first_compact + 2,
-            "second compact must have run a job on the batch-B superfiles"
+            "compact must have run two jobs, one per file set"
         );
 
-        // All 40 docs must be visible after both compaction rounds.
+        // All 245760 docs must be visible after compaction.
         let r = st.reader();
-        assert_eq!(r.n_docs_total(), 40, "all docs must be preserved");
+        assert_eq!(r.n_docs_total(), 245760, "all docs must be preserved");
         assert!(
             r.n_superfiles() == 2,
-            "overall superfile count must have decreased from original 20"
+            "overall superfile count must have decreased from original 30"
         );
 
-        // Manifest consistency: per-entry doc counts sum to 40.
+        // Manifest consistency: per-entry doc counts sum to 245760.
         let sfs = &r.manifest().superfiles;
         let total_from_manifest: u64 = sfs.iter().map(|s| s.n_docs).sum();
-        assert_eq!(total_from_manifest, 40);
+        assert_eq!(total_from_manifest, 245760);
 
         // ID range is monotonically ordered within each remaining superfile.
         for sf in sfs.iter() {
@@ -1344,11 +1354,10 @@ mod tests {
 
         drop(r);
 
-        // FTS: every batch-unique term must be searchable and return exactly 2 docs.
+        // FTS: batch-A terms committed once → 1 × 8192 = 8192 hits each.
         for term in &[
             "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
-            "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
-            "sierra", "tango",
+            "juliet",
         ] {
             let n: usize = st
                 .token_match("title", term, BoolMode::And, None)
@@ -1356,7 +1365,21 @@ mod tests {
                 .iter()
                 .map(|b| b.num_rows())
                 .sum();
-            assert_eq!(n, 2, "term '{term}' should match exactly 2 docs");
+            assert_eq!(n, 8192, "term '{term}' should match exactly 8192 docs");
+        }
+
+        // FTS: batch-B terms committed twice → 2 × 8192 = 16384 hits each.
+        for term in &[
+            "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra",
+            "tango",
+        ] {
+            let n: usize = st
+                .token_match("title", term, BoolMode::And, None)
+                .unwrap_or_else(|e| panic!("token_match for '{term}': {e}"))
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
+            assert_eq!(n, 16384, "term '{term}' should match exactly 16384 docs");
         }
     }
 }
