@@ -7,6 +7,8 @@ pub fn infino::BoolMode::clone(&self) -> infino::BoolMode
 impl core::cmp::Eq for infino::BoolMode
 impl core::cmp::PartialEq for infino::BoolMode
 pub fn infino::BoolMode::eq(&self, &infino::BoolMode) -> bool
+impl core::convert::From<&str> for infino::BoolMode
+pub fn infino::BoolMode::from(&str) -> Self
 impl core::fmt::Debug for infino::BoolMode
 pub fn infino::BoolMode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for infino::BoolMode

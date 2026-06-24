@@ -56,6 +56,16 @@ pub enum BoolMode {
     Or,
 }
 
+impl From<&str> for BoolMode {
+    fn from(s: &str) -> Self {
+        match s {
+            "and" => BoolMode::And,
+            "or" => BoolMode::Or,
+            _ => BoolMode::Or,
+        }
+    }
+}
+
 /// Multi-term OR algorithm selector for the bench harness's
 /// `search_with_algo_for_bench` entry point. Production code routes
 /// through `FtsReader::dispatch_multi_term_or`, which picks
