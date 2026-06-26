@@ -2,9 +2,11 @@ name: Publish Python package
 
 # Release of the `infino` Python package: validate the version, build one binary
 # wheel per platform/arch, then upload. A `v<version>` tag publishes to real
-# PyPI with the version derived from the tag (a coordinated release with the
-# crate + Node); a manual run (workflow_dispatch) chooses the version and the
-# PyPI (default) / TestPyPI target.
+# PyPI with the version derived from the tag — but ONLY for a coordinated
+# minor/major release (patch == 0, e.g. `v0.2.0`); a crate-only patch tag (e.g.
+# `v0.1.1`) is skipped, since patch is independent per package. A manual run
+# (workflow_dispatch) — the path for an independent Python patch — chooses the
+# version and the PyPI (default) / TestPyPI target.
 #
 # Two facts shape the whole pipeline:
 #   - abi3 (pyo3 `abi3-py39`) → a single wheel per platform/arch covers all
@@ -50,6 +52,11 @@ env:
 jobs:
   validate:
     name: Validate version
+    # Coordinated-release gate: on a tag push, run only when the tag is a
+    # minor/major (patch == 0, tag ends in `.0`). A crate-only patch tag skips
+    # the bindings (build + publish need this job, so they skip too). A manual
+    # run always proceeds (independent Python patch).
+    if: ${{ github.event_name == 'workflow_dispatch' || endsWith(github.ref_name, '.0') }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.check.outputs.version }}

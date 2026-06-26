@@ -4,12 +4,17 @@ name: Node publish
 # thin `infino` package plus its per-platform binary packages (`infino-<triple>`)
 # to npm.
 #
-# Triggered two ways: (1) a `v<version>` tag pushes a real publish as part of a
-# coordinated release (crate + Node + Python) — the version comes from
-# package.json and a guard asserts it matches the tag; (2) a manual run
-# (workflow_dispatch) defaults to a dry run — pack + validate, upload nothing —
-# re-run with dry_run unchecked to publish. A real run needs the NPM_TOKEN
-# secret, with publish rights to the packages under the infino-ai org.
+# Triggered two ways: (1) a `v<version>` tag — but ONLY for a coordinated
+# minor/major release (patch == 0, e.g. `v0.2.0`); a crate-only patch tag (e.g.
+# `v0.1.1`) skips the bindings, which patch independently. The version comes from
+# package.json and a guard asserts it matches the tag. (2) a manual run
+# (workflow_dispatch) — the path for an independent Node patch — defaults to a
+# dry run; re-run with dry_run unchecked to publish. A real run needs the
+# NPM_TOKEN secret, with publish rights to the packages under the infino-ai org.
+#
+# major.minor is locked in sync across crate/Node/Python (coordinated `vX.Y.0`
+# releases); patch is independent per package, so the crate's patch counter and
+# Node's never share a number — see docs/versioning.md.
 
 on:
   push:
@@ -30,6 +35,10 @@ env:
 jobs:
   build:
     name: Build addon (${{ matrix.target }})
+    # Coordinated-release gate: on a tag push, run only when the tag is a
+    # minor/major (patch == 0, tag ends in `.0`). A crate-only patch tag skips
+    # the bindings. A manual run always proceeds (independent Node patch).
+    if: ${{ github.event_name == 'workflow_dispatch' || endsWith(github.ref_name, '.0') }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -120,6 +129,7 @@ jobs:
   publish:
     name: Publish to npm
     needs: build
+    if: ${{ github.event_name == 'workflow_dispatch' || endsWith(github.ref_name, '.0') }}
     runs-on: ubuntu-latest
     # OIDC token for npm provenance — the "built from this repo at this commit"
     # attestation shown on npmjs.org. A real supply-chain trust signal at launch.

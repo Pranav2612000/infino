@@ -52,28 +52,32 @@ contract for how their versions relate.
 
 ## How to release
 
-For a **patch**, release only the package that needs it:
+A `v<version>` tag is the release trigger; what it publishes depends on whether
+it is a patch or a coordinated minor/major.
 
-- **Rust** — bump `version` in the root `Cargo.toml`, then push a matching
-  `v<version>` tag (e.g. `v0.1.1`). The `Publish crate` workflow
-  (`.github/workflows/crate-publish.yml`) asserts the tag matches `Cargo.toml`
-  and publishes to crates.io. The engine is the **only** artifact released by a
-  tag; a bare `v*` tag is therefore unambiguous. (You can also run the workflow
-  manually from the Actions tab — the default is a dry run.)
-- **Node** — bump `version` in `infino-node/package.json`, then run the
-  `Node publish` workflow (`.github/workflows/node-publish.yml`). `napi
-  prepublish` derives the per-platform package versions and rewrites the
-  `optionalDependencies` pins from that single field, so the version lives in
-  one place.
-- **Python** — bump `version` in `infino-python/Cargo.toml`, then run the
-  `publish-python` workflow.
+- **Crate patch** (`vX.Y.Z`, `Z > 0`, e.g. `v0.1.1`) — bump `version` in the root
+  `Cargo.toml`, then push the matching tag. The `Publish crate` workflow
+  (`.github/workflows/crate-publish.yml`) asserts the tag matches `Cargo.toml` and
+  publishes to crates.io. **The Node and Python workflows skip a patch tag** —
+  their coordinated-release gate fires only when `patch == 0` — so the crate
+  patches alone. (You can also run `Publish crate` manually from the Actions
+  tab — the default is a dry run.)
+- **Coordinated minor/major** (`vX.Y.0`, e.g. `v0.2.0`) — land the engine change,
+  **update the Node and Python binding code for any new or changed engine
+  surface**, bump the crate *and* both bindings (`infino-node/package.json`,
+  `infino-python/Cargo.toml`) to the same `X.Y.0`, then push the `vX.Y.0` tag. All
+  three publish workflows fire on it — crate → crates.io, Node → npm, Python →
+  PyPI — at `X.Y.0`. (Node's `napi prepublish` derives the per-platform package
+  versions and `optionalDependencies` pins from that single `package.json`
+  field.) The bindings must never ship a new minor before their code exposes that
+  minor's engine changes.
+- **Binding-only patch** (Node or Python, independent of the crate's patch) — bump
+  that binding's version and run its workflow **manually** (`Node publish` /
+  `publish-python`, `workflow_dispatch`). No tag; the crate is untouched.
 
-For a **minor** (feature or breaking change), do all three in the same release
-cycle so `major.minor` never drifts: land the engine change first, then **update
-the Node and Python binding code to cover any new or changed engine surface**,
-bump the crate and the two bindings to the matching `0.<minor>.0`, and publish
-all three. The bindings must never be released on a new minor before their code
-actually exposes that minor's engine changes.
+**Patch counters are independent per package and never shared**, so the crate's
+patch and a binding's patch can never collide on a registry — only `major.minor`
+is kept in sync across the three.
 
 ## Worked example
 
