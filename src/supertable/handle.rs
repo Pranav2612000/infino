@@ -281,7 +281,7 @@ impl Supertable {
     // catalog `Connection` calls it internally, tests/benches reach it via
     // `test-helpers`.
     test_visible! {
-    /// Open an existing persisted supertable.
+    /// Open a persisted supertable.
     ///
     /// Reads the pointer file at
     /// `<root>/_supertable/current` via the storage provider
@@ -291,8 +291,17 @@ impl Supertable {
     /// `Supertable` is ready to serve queries from the
     /// snapshot at the pointer's `manifest_id`.
     ///
+    /// A genuinely absent pointer is **not** an error: it means
+    /// nothing has been committed yet, so open returns an empty
+    /// supertable (`manifest_id == 0`). Uncommitted data is
+    /// invisible by design, so "no pointer" and "empty table" are
+    /// the same observable state. A *corrupt* pointer is a distinct
+    /// error (`ManifestLoadError::PointerParse`) and still fails, so
+    /// corruption is never silently swallowed.
+    ///
     /// Errors:
-    /// - [`OpenError::ManifestLoadError`] for manifest load failures.
+    /// - [`OpenError::ManifestLoadError`] for manifest load failures
+    ///   *other than* a missing pointer (parse / corruption / fetch).
     /// - [`OpenError::Build`] if `options.storage` is `None`
     ///   (open requires a storage backend).
     /// - [`OpenError::Storage`], [`OpenError::ManifestListParse`],

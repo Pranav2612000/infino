@@ -19,11 +19,12 @@
 //!
 //!   - The pointer file is missing or still references the
 //!     prior committed `manifest_id` → open returns the prior
-//!     state (or `PointerUnreadable` on a fresh supertable).
-//!     Any superfile / manifest-part / manifest-list bytes
-//!     written before the crash but never referenced by a
-//!     committed pointer are **orphans**: tolerated by
-//!     readers and GC'd by compaction.
+//!     state (or an empty table when no pointer was ever
+//!     committed — nothing was durably committed, so an empty
+//!     table is the correct recovered state). Any superfile /
+//!     manifest-part / manifest-list bytes written before the
+//!     crash but never referenced by a committed pointer are
+//!     **orphans**: tolerated by readers and GC'd by compaction.
 //!   - The pointer file has been atomically replaced with
 //!     the new version → open returns the new state. The
 //!     crash happened AFTER the visibility barrier; the
@@ -39,8 +40,8 @@
 //!
 //! | Test fn                                                      | Crash point                                | Expected post-crash open state                    |
 //! |--------------------------------------------------------------|---------------------------------------------|----------------------------------------------------|
-//! | `crash_post_superfile_no_prior_commit_yields_pointer_unreadable` | After 1st superfile PUT, before list/pointer | `OpenError::PointerUnreadable`                     |
-//! | `crash_post_list_no_prior_commit_yields_pointer_unreadable`    | After 1st list PUT, before pointer         | `OpenError::PointerUnreadable`                     |
+//! | `crash_post_superfile_no_prior_commit_opens_empty`           | After 1st superfile PUT, before list/pointer | empty table (`manifest_id == 0`), orphan superfile |
+//! | `crash_post_list_no_prior_commit_opens_empty`                | After 1st list PUT, before pointer         | empty table (`manifest_id == 0`), orphan list      |
 //! | `crash_post_superfile_on_second_commit_yields_v1`                | First commit succeeds; 2nd commit's superfile PUT triggers | `manifest_id == 1` (v_prev), orphan v2 superfile    |
 //! | `crash_post_list_on_second_commit_yields_v1`                   | First commit succeeds; 2nd commit's list PUT triggers   | `manifest_id == 1`, orphan v2 list + part         |
 //! | `crash_post_pointer_on_second_commit_yields_v2`                | First commit succeeds; 2nd commit's pointer PUT triggers AFTER it lands | `manifest_id == 2` (commit was durable)           |
@@ -66,7 +67,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use infino::{
     supertable::{
-        OpenError, Supertable,
+        Supertable,
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
     },
     test_helpers::{build_title_batch, default_supertable_options},
@@ -272,25 +273,30 @@ fn dispatch_child_if_set() -> Option<()> {
 }
 
 #[test]
-fn crash_post_superfile_no_prior_commit_yields_pointer_unreadable() {
+fn crash_post_superfile_no_prior_commit_opens_empty() {
     if dispatch_child_if_set().is_some() {
         return; // unreachable; child never returns
     }
     let dir = spawn_crash_child(
-        "crash_post_superfile_no_prior_commit_yields_pointer_unreadable",
+        "crash_post_superfile_no_prior_commit_opens_empty",
         KP_SEG_FIRST,
     );
 
     // Parent verifies. The crash fired after the first
     // superfile PUT, before any manifest writes. No pointer
-    // exists yet → open must return PointerUnreadable.
+    // exists → nothing was durably committed, so open yields an
+    // empty table (`manifest_id == 0`). Uncommitted data is
+    // invisible by design; "no pointer" and "empty table" are the
+    // same observable state.
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
-    let err = Supertable::open(default_supertable_options().with_storage(storage))
-        .expect_err("must reject post-crash state with no pointer");
-    assert!(
-        matches!(err, OpenError::ManifestLoadError(_)),
-        "expected PointerUnreadable, got {err:?}"
+    let st = Supertable::open(default_supertable_options().with_storage(storage))
+        .expect("post-crash state with no pointer opens as an empty table");
+    assert_eq!(st.manifest_id(), 0, "no commit landed → empty manifest");
+    assert_eq!(
+        st.reader().n_superfiles(),
+        0,
+        "the pre-crash superfile is an orphan; readers don't see it without a committed manifest"
     );
 
     // The orphan superfile file is present and ignored — the
@@ -307,23 +313,21 @@ fn crash_post_superfile_no_prior_commit_yields_pointer_unreadable() {
 }
 
 #[test]
-fn crash_post_list_no_prior_commit_yields_pointer_unreadable() {
+fn crash_post_list_no_prior_commit_opens_empty() {
     if dispatch_child_if_set().is_some() {
         return;
     }
-    let dir = spawn_crash_child(
-        "crash_post_list_no_prior_commit_yields_pointer_unreadable",
-        KP_LIST_FIRST,
-    );
+    let dir = spawn_crash_child("crash_post_list_no_prior_commit_opens_empty", KP_LIST_FIRST);
 
+    // Crash fired after the 1st manifest-list PUT, before the
+    // pointer. No pointer → nothing committed → open yields an
+    // empty table; the orphan list + superfile are ignored.
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
-    let err = Supertable::open(default_supertable_options().with_storage(storage))
-        .expect_err("must reject post-crash state with no pointer");
-    assert!(
-        matches!(err, OpenError::ManifestLoadError(_)),
-        "expected PointerUnreadable, got {err:?}"
-    );
+    let st = Supertable::open(default_supertable_options().with_storage(storage))
+        .expect("post-crash state with no pointer opens as an empty table");
+    assert_eq!(st.manifest_id(), 0, "no commit landed → empty manifest");
+    assert_eq!(st.reader().n_superfiles(), 0);
 
     // The orphan manifest is on disk but unreferenced.
     let manifest_dir = dir.join("manifest");
