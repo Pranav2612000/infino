@@ -880,6 +880,43 @@ mod tests {
     }
 
     #[test]
+    fn create_without_append_reopens_as_empty_table() {
+        // A table created but never appended to is still durably
+        // registered in the catalog. Reopening it in a fresh connection
+        // (i.e. after a program restart) must succeed and yield an empty
+        // table — not fail because no manifest pointer was ever written.
+        // The pointer is only written on the first commit, so `create`
+        // alone leaves the physical table with a catalog entry but no
+        // `_supertable/current`; open must tolerate that the same way
+        // `create` does when it probes and finds no pointer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        {
+            let conn = connect(&uri).expect("connect");
+            conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+                .expect("create");
+            // No append/commit: the manifest pointer is never written.
+        }
+
+        // Reopen in a fresh connection, simulating a program restart.
+        let conn = connect(&uri).expect("reconnect");
+        assert_eq!(conn.list_tables().expect("list"), vec!["docs".to_string()]);
+        let docs = conn
+            .open_table("docs")
+            .expect("open a created-but-empty table");
+        assert_eq!(
+            n_rows(
+                &docs
+                    .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+                    .expect("search")
+            ),
+            0,
+            "a created-but-empty table has no hits"
+        );
+    }
+
+    #[test]
     fn drop_with_purge_reclaims_the_storage_subtree() {
         /// Count regular files under `dir` whose path contains a
         /// component starting with `prefix` (the table's unique

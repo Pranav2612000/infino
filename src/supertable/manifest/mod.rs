@@ -307,6 +307,21 @@ impl ManifestSnapshot {
         self.get_cached_part_by_id(&part_id)
     }
 
+    /// Load the committed manifest from storage.
+    ///
+    /// Missing-pointer behaviour depends on `current_manifest`:
+    /// - **Fresh open** (`None`): a genuinely absent pointer means
+    ///   nothing has been committed, so an empty manifest
+    ///   (`manifest_id == 0`) is returned rather than an error —
+    ///   uncommitted data is invisible by design, so "no pointer" and
+    ///   "empty table" are the same observable state.
+    /// - **Refresh** (`Some`): an absent pointer is returned as
+    ///   [`ManifestLoadError::PointerNotFound`] so the caller can no-op
+    ///   and keep its current in-memory manifest — a missing pointer
+    ///   must never blank out live state.
+    ///
+    /// A *corrupt* pointer is a different error variant (`PointerParse`)
+    /// and always propagates, so corruption is never masked.
     pub(crate) async fn load(
         current_manifest: Option<Arc<Self>>,
         storage: Arc<dyn StorageProvider>,
@@ -315,10 +330,18 @@ impl ManifestSnapshot {
         // 1. Read the pointer file.
         let (pointer, _) = match read_pointer(storage.as_ref()).await? {
             Some(p) => p,
-            // No pointer yet means nobody has committed; our next
-            // attempt will write the initial pointer with
-            // expected_prev_etag = None.
-            None => return Err(ManifestLoadError::PointerNotFound),
+            // No pointer yet means nobody has committed. On a fresh open
+            // (no baseline manifest) that's an empty table, not an error;
+            // on a refresh we keep the signal so the caller preserves its
+            // current manifest instead of blanking it out.
+            None => {
+                return match options {
+                    Some(options) if current_manifest.is_none() => {
+                        Ok(Arc::new(Self::empty(options)))
+                    }
+                    _ => Err(ManifestLoadError::PointerNotFound),
+                };
+            }
         };
 
         if let Some(current_manifest) = &current_manifest
