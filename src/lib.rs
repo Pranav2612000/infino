@@ -128,6 +128,7 @@ mod catalog;
 mod error;
 mod memory;
 mod runtime_bridge;
+mod utils;
 
 // ---- Curated public surface ----
 
