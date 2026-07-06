@@ -452,6 +452,10 @@ impl Connection {
     /// assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(sql = sql))
+    )]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(sql, "running sql query");
 

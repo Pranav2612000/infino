@@ -123,6 +123,10 @@ impl SupertableReader {
     /// `pub(crate)` async kernel — the public surface is the sync
     /// [`SupertableReader::vector_search`], which drives this via the
     /// sync→async bridge.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(column = column, k = k, dim = query.len()))
+    )]
     pub(crate) async fn vector_search_async(
         &self,
         column: &str,
@@ -370,6 +374,10 @@ impl SupertableReader {
     ///
     /// `pub(crate)` async kernel — the public surface is the sync
     /// [`Self::vector_hits_filtered`].
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(column = column, k = k, dim = query.len()))
+    )]
     pub(crate) async fn vector_hits_filtered_async(
         &self,
         column: &str,
@@ -784,6 +792,10 @@ impl Supertable {
     /// assert!(rows.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(column = column, k = k, dim = query.len()))
+    )]
     pub fn vector_search(
         &self,
         column: &str,

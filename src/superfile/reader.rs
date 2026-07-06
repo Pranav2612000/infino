@@ -181,6 +181,7 @@ impl SuperfileReader {
     /// promotion can verify after the full superfile is materialized.
     ///
     /// [`open_lazy`]: SuperfileReader::open_lazy
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub async fn open_lazy_with(
         source: Arc<dyn LazyByteSource>,
         _opts: OpenOptions,
