@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "code-context": {
+      "command": "cx",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}
