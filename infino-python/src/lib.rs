@@ -129,7 +129,8 @@ fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
 // would just move the surface without simplifying the Python-facing signature.
 #[allow(clippy::too_many_arguments)]
 #[pyo3(signature = (uri, *, storage_options=None, cache_dir=None, cache_budget_bytes=None,
-                    connection_memory_budget_bytes=None, cold_fetch_mode=None, validate=None))]
+                    connection_memory_budget_bytes=None, cold_fetch_mode=None, validate=None,
+                    api_key=None))]
 fn connect(
     py: Python<'_>,
     uri: &str,
@@ -139,6 +140,7 @@ fn connect(
     connection_memory_budget_bytes: Option<u64>,
     cold_fetch_mode: Option<String>,
     validate: Option<bool>,
+    api_key: Option<String>,
 ) -> PyResult<Connection> {
     // Opening a connection can touch object storage; release the GIL so
     // other Python threads run during the (blocking) I/O.
@@ -169,6 +171,10 @@ fn connect(
         }
         if let Some(v) = validate {
             opts = opts.with_validate(v);
+            has_options = true;
+        }
+        if let Some(key) = api_key {
+            opts = opts.with_api_key(key);
             has_options = true;
         }
         // Preserve the plain `connect(uri)` path when no options are set.
@@ -246,6 +252,14 @@ struct Connection {
 
 #[pymethods]
 impl Connection {
+    /// Provision the database this connection targets. For a hosted target it
+    /// registers the database on the service (raises if it already exists); for
+    /// a local backend the catalog root is the database, so this is a no-op
+    /// success.
+    fn create_database(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.inner.create_database()).map_err(py_err)
+    }
+
     /// Create a table from a pyarrow `Schema` and an `IndexSpec`.
     fn create_table(
         &self,

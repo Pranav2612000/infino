@@ -225,6 +225,10 @@ pub struct ConnectOptions {
     /// Probe the object store at `connect` (default `false`). `true` fails
     /// fast on bad credentials instead of on first use.
     pub validate: Option<bool>,
+    /// API key for a hosted (`https://<host>/<db>`) connect target, sent as a
+    /// bearer credential. Ignored by local backends; falls back to the
+    /// `INFINO_API_KEY` environment variable when omitted.
+    pub api_key: Option<String>,
 }
 
 /// Tuning for `optimize`; all fields optional (omitted ⇒ engine default).
@@ -389,6 +393,9 @@ pub fn connect(uri: String, options: Option<ConnectOptions>) -> Result<Connectio
             if let Some(v) = o.validate {
                 opts = opts.with_validate(v);
             }
+            if let Some(key) = o.api_key {
+                opts = opts.with_api_key(key);
+            }
             infino::connect_with(&uri, opts)
         }
     }
@@ -411,6 +418,15 @@ pub struct Connection {
 
 #[napi]
 impl Connection {
+    /// Provision the database this connection targets. For a hosted target it
+    /// registers the database on the service (throws if it already exists); for
+    /// a local backend the catalog root is the database, so this is a no-op
+    /// success.
+    #[napi]
+    pub fn create_database(&self) -> Result<()> {
+        self.inner.create_database().map_err(map_err)
+    }
+
     /// Create a table from an Arrow `Schema` (sent as an IPC `Buffer` —
     /// an empty `apache-arrow` table built with the schema) and an
     /// `IndexSpec`.

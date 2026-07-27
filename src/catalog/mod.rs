@@ -16,7 +16,10 @@
 mod index_spec;
 mod manifest;
 mod options;
+#[cfg(feature = "remote")]
+mod remote;
 mod search_tvf;
+mod table;
 mod uri;
 
 use std::{
@@ -38,6 +41,7 @@ use manifest::{
     TableEntry, VectorEntry, commit_catalog, read_catalog, schema_from_ipc, schema_to_ipc,
 };
 pub use options::{ColdFetchMode, ConnectOptions};
+pub use table::Supertable;
 use tokio::runtime::Runtime;
 use tracing::{debug, info};
 use uri::{Backend, parse_uri};
@@ -58,7 +62,7 @@ use crate::{
         vector::{builder::VectorConfig, distance::Metric},
     },
     supertable::{
-        Supertable,
+        Supertable as SupertableHandle,
         options::{Consistency, SupertableOptions},
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
     },
@@ -99,6 +103,11 @@ pub fn connect_with(
     options: ConnectOptions,
 ) -> Result<Connection, InfinoError> {
     let backend = parse_uri(uri.as_ref())?;
+    // A hosted (remote) target forwards over the wire — it never touches the
+    // local storage path below.
+    if matches!(backend, Backend::Remote { .. }) {
+        return connect_remote(backend, options);
+    }
     let usage_meter = UsageMeter::new();
     let store = match &backend {
         Backend::Memory => CatalogStore::Memory(Mutex::new(HashMap::new())),
@@ -138,6 +147,46 @@ pub fn connect_with(
     })
 }
 
+/// Build a hosted (remote) connection from a `Backend::Remote` target. The API
+/// key comes from `ConnectOptions` or the `INFINO_API_KEY` env var.
+#[cfg(feature = "remote")]
+fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connection, InfinoError> {
+    let (base_url, database) = match &backend {
+        Backend::Remote { base_url, database } => (base_url.clone(), database.clone()),
+        _ => {
+            return Err(InfinoError::Backend(
+                "connect_remote requires a remote target".to_string(),
+            ));
+        }
+    };
+    let remote =
+        remote::RemoteCatalog::new(base_url, database, options.api_key().map(str::to_owned))?;
+    let connection_memory_budget = ConnectionMemoryBudget::from_budget_bytes(
+        options
+            .connection_memory_budget_bytes
+            .unwrap_or(DEFAULT_CONNECTION_BUDGET_BYTES),
+    );
+    debug!(backend = ?backend, "catalog connected (remote)");
+    Ok(Connection {
+        inner: Arc::new(ConnectionInner {
+            backend,
+            options,
+            store: CatalogStore::Remote(Arc::new(remote)),
+            connection_memory_budget,
+            usage_meter: UsageMeter::new(),
+        }),
+    })
+}
+
+/// Without the `remote` feature a hosted target cannot be served: report it
+/// clearly rather than silently falling through to the local path.
+#[cfg(not(feature = "remote"))]
+fn connect_remote(_backend: Backend, _options: ConnectOptions) -> Result<Connection, InfinoError> {
+    Err(InfinoError::Config(
+        "this build has no remote support; rebuild with the `remote` feature".to_string(),
+    ))
+}
+
 /// A catalog connection. Cheap to clone (one `Arc`); clones share the
 /// same catalog.
 #[derive(Clone)]
@@ -162,7 +211,7 @@ struct ConnectionInner {
 /// root storage under optimistic concurrency; `memory://` keeps it (and
 /// the tables themselves) in-process.
 enum CatalogStore {
-    Memory(Mutex<HashMap<String, Supertable>>),
+    Memory(Mutex<HashMap<String, SupertableHandle>>),
     /// Durable backend. `handles` is the warm cache (name → live `Supertable`);
     /// `building` is a per-name lock guarding the build or evict of an entry.
     /// Both, because the read must be lock-free but the build must be single:
@@ -184,7 +233,7 @@ enum CatalogStore {
         root: Arc<dyn StorageProvider>,
         /// Warm cache of live handles. Sharded so concurrent queries on one
         /// `Connection` don't serialize on a lock.
-        handles: DashMap<String, Supertable>,
+        handles: DashMap<String, SupertableHandle>,
         /// Per-name build/evict lock. Never removed once created: a concurrent
         /// opener may hold or await the `Arc`, so evicting it mid-use would let
         /// two builds proceed.
@@ -194,6 +243,11 @@ enum CatalogStore {
         /// one holds the `Arc`) later.
         building: DashMap<String, Arc<Mutex<()>>>,
     },
+    /// Hosted (remote) connection: catalog operations forward over the wire.
+    /// There is no local storage provider or handle cache — the endpoint owns
+    /// the tables.
+    #[cfg(feature = "remote")]
+    Remote(Arc<remote::RemoteCatalog>),
 }
 
 impl Connection {
@@ -214,6 +268,35 @@ impl Connection {
     #[cfg(any(test, feature = "test-helpers", feature = "metering"))]
     pub fn usage_meter(&self) -> Arc<UsageMeter> {
         Arc::clone(&self.inner.usage_meter)
+    }
+
+    /// Provision the database this connection targets.
+    ///
+    /// A connection is bound to a single database — the path segment of a
+    /// hosted URL (`https://host/<database>`), or the catalog root for a local
+    /// backend. This registers that database so tables can be created in it,
+    /// without a separate provisioning step outside the code.
+    ///
+    /// For a hosted connection it registers the database on the service and
+    /// fails with [`InfinoError::AlreadyExists`] if it is already registered.
+    /// For a local backend (`file://`, `s3://`, `memory://`, …) the catalog
+    /// root *is* the database and comes into being with the first table, so
+    /// this is a no-op success — kept on the surface so the same setup code
+    /// runs against either target.
+    ///
+    /// ```
+    /// # let db = infino::connect("memory://")?;
+    /// db.create_database()?; // no-op for a local backend
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn create_database(&self) -> Result<(), InfinoError> {
+        match &self.inner.store {
+            // A local catalog root is created lazily by the first table; there
+            // is no separate database to register.
+            CatalogStore::Memory(_) | CatalogStore::Storage { .. } => Ok(()),
+            #[cfg(feature = "remote")]
+            CatalogStore::Remote(c) => c.create_database(),
+        }
     }
 
     /// Create a new table named `name` with the given Arrow `schema` and
@@ -254,7 +337,7 @@ impl Connection {
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
                 .map_err(|e| e.with_context("create_table", Some(name)))?;
-                let handle = Supertable::create(opts)
+                let handle = SupertableHandle::create(opts)
                     .map_err(|e| InfinoError::from(e).with_context("create_table", Some(name)))?;
                 let mut map = map.lock().expect("catalog mutex poisoned");
                 if map.contains_key(name) {
@@ -263,7 +346,7 @@ impl Connection {
                 }
                 map.insert(name.to_string(), handle.clone());
                 info!(table = name, backend = "memory", "created table");
-                Ok(handle)
+                Ok(Supertable::from_local(handle))
             }
             CatalogStore::Storage {
                 root,
@@ -335,7 +418,7 @@ impl Connection {
                 // register the name. A losing racer that also created a
                 // (distinct) location just orphans its empty subtree; the
                 // catalog OCC below decides the single name winner.
-                let handle = Supertable::create(opts)
+                let handle = SupertableHandle::create(opts)
                     .map_err(|e| InfinoError::from(e).with_context("create_table", Some(name)))?;
 
                 // Gate the commit + memo insert: else a racing `open_table`
@@ -358,26 +441,18 @@ impl Connection {
                 handles.insert(name.to_string(), handle.clone());
 
                 info!(table = name, location = %location, "created table");
-                Ok(handle)
+                Ok(Supertable::from_local(handle))
             }
+            #[cfg(feature = "remote")]
+            CatalogStore::Remote(c) => c.create_table(name, schema, indexes),
         }
     }
 
-    /// Open an existing table by name. Fails with
-    /// [`InfinoError::NotFound`] if no such table is registered.
-    ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use infino::arrow_schema::{DataType, Field, Schema};
-    /// # use infino::{connect, IndexSpec};
-    /// # let db = connect("memory://")?;
-    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
-    /// # db.create_table("posts", schema, IndexSpec::new().fts("body"))?;
-    /// let posts = db.open_table("posts")?;
-    /// # let _ = posts;
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn open_table(&self, name: &str) -> Result<Supertable, InfinoError> {
+    /// Open the concrete engine handle for `name`, building and memoizing it on
+    /// first use. Internal: callers needing engine-only methods (`register_into`
+    /// for SQL, `reader` for the search TVFs) go through this; the public
+    /// [`open_table`](Self::open_table) wraps the result.
+    pub(crate) fn open_table_handle(&self, name: &str) -> Result<SupertableHandle, InfinoError> {
         debug!(table = name, "opening table");
         match &self.inner.store {
             CatalogStore::Memory(map) => map
@@ -474,13 +549,43 @@ impl Connection {
                 // short-circuits when unchanged), matching the old rebuild's
                 // freshness without its cost.
                 opts = opts.with_read_consistency(Consistency::Strong);
-                let handle = Supertable::open(opts)
+                let handle = SupertableHandle::open(opts)
                     .map_err(|e| InfinoError::from(e).with_context("open_table", Some(name)))?;
                 handles.insert(name.to_string(), handle.clone());
 
                 Ok(handle)
             }
+            // The local handle backs the local SQL / search-TVF paths, which a
+            // remote connection never takes (it forwards `query_sql`). Reaching
+            // here on a remote connection is an internal invariant violation.
+            #[cfg(feature = "remote")]
+            CatalogStore::Remote(_) => Err(InfinoError::Backend(
+                "internal: no local table handle for a remote connection".to_string(),
+            )
+            .with_context("open_table", Some(name))),
         }
+    }
+
+    /// Open an existing table by name. Fails with
+    /// [`InfinoError::NotFound`] if no such table is registered.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # db.create_table("posts", schema, IndexSpec::new().fts("body"))?;
+    /// let posts = db.open_table("posts")?;
+    /// # let _ = posts;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn open_table(&self, name: &str) -> Result<Supertable, InfinoError> {
+        #[cfg(feature = "remote")]
+        if let CatalogStore::Remote(c) = &self.inner.store {
+            return c.open_table(name);
+        }
+        Ok(Supertable::from_local(self.open_table_handle(name)?))
     }
 
     /// Remove a table from the catalog. **Idempotent**: dropping a table that
@@ -566,6 +671,8 @@ impl Connection {
                 }
                 Ok(())
             }
+            #[cfg(feature = "remote")]
+            CatalogStore::Remote(c) => c.drop_table(name, purge),
         }
     }
 
@@ -575,7 +682,20 @@ impl Connection {
     /// under-counted. Visible under `metering` for platform billing / Grafana.
     #[cfg(any(test, feature = "test-helpers", feature = "metering"))]
     pub fn table_storage_bytes(&self, name: &str) -> Result<u64, InfinoError> {
-        self.open_table(name)?
+        // `storage_bytes` is a local measurement of the on-storage superfile
+        // footprint; a hosted connection has no local storage to measure, so
+        // reject it there rather than reaching for a handle that doesn't exist.
+        #[cfg(feature = "remote")]
+        if matches!(self.inner.store, CatalogStore::Remote(_)) {
+            return Err(InfinoError::Backend(
+                "table_storage_bytes is a local measurement, not available over the remote transport"
+                    .to_string(),
+            )
+            .with_context("table_storage_bytes", Some(name)));
+        }
+        // The concrete engine handle carries `storage_bytes`; the public
+        // wrapper returned by `open_table` does not.
+        self.open_table_handle(name)?
             .storage_bytes()
             .map_err(|e| InfinoError::from(e).with_context("table_storage_bytes", Some(name)))
     }
@@ -605,6 +725,8 @@ impl Connection {
                 let (body, _etag) = bridge_sync_to_async(read_catalog(root.as_ref()))?;
                 Ok(body.tables.into_keys().collect())
             }
+            #[cfg(feature = "remote")]
+            CatalogStore::Remote(c) => c.list_tables(),
         }
     }
 
@@ -633,6 +755,13 @@ impl Connection {
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(sql, "running sql query");
 
+        // A hosted connection forwards the SQL to the endpoint; the local
+        // DataFusion path below runs only for local backends.
+        #[cfg(feature = "remote")]
+        if let CatalogStore::Remote(c) = &self.inner.store {
+            return c.query_sql(sql);
+        }
+
         // Gate SQL heap on the connection budget: DataFusion allocates the
         // working set (sort / aggregate / join), so its pool is the gate.
         let ctx = budgeted_session_context(&self.inner.connection_memory_budget)
@@ -651,13 +780,13 @@ impl Connection {
             .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
 
         let mut seen = HashSet::new();
-        let mut handles: Vec<Supertable> = Vec::new();
+        let mut handles: Vec<SupertableHandle> = Vec::new();
         for r in &refs {
             let name = r.table().to_string();
             if !seen.insert(name.clone()) {
                 continue;
             }
-            match self.open_table(&name) {
+            match self.open_table_handle(&name) {
                 Ok(table) => {
                     table.register_into(&ctx, &name).map_err(|e| {
                         InfinoError::Query(e.to_string()).with_context("query_sql", None)
@@ -790,6 +919,14 @@ fn backend_to_provider(
             GcsStorageProvider::new_with_prefix(bucket, prefix, &options.storage_options)?
                 .with_usage_meter(usage_meter),
         )),
+        // A remote (hosted) connection forwards operations over the wire and
+        // never opens a local storage provider; `connect_with` routes it away
+        // before reaching here.
+        Backend::Remote { .. } => {
+            return Err(InfinoError::Backend(
+                "remote backend has no storage provider".to_string(),
+            ));
+        }
     };
     Ok(provider)
 }
@@ -932,6 +1069,28 @@ mod tests {
     /// Total rows across the materialized search batches.
     fn n_rows(batches: &[RecordBatch]) -> usize {
         batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    /// `create_database` is a no-op success on a local backend (the catalog
+    /// root is the database), so the same "provision then create a table" setup
+    /// code that a hosted target needs runs unchanged against a durable local
+    /// one — it doesn't error, and a table created afterward is queryable.
+    #[test]
+    fn local_create_database_is_a_noop_then_table_works() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+
+        conn.create_database()
+            .expect("create_database is a no-op success for a local backend");
+        // Idempotent: a second call is still fine.
+        conn.create_database().expect("second create_database");
+
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table after create_database")
+            .append(&build_title_batch(&["fox"]))
+            .expect("append");
+        assert_eq!(count_rows(&conn, "docs"), 1);
     }
 
     #[test]
@@ -1244,7 +1403,7 @@ mod tests {
 
         reader.query_sql("SELECT title FROM docs").expect("scan q1");
         let cold_after_q1 = reader
-            .open_table("docs")
+            .open_table_handle("docs")
             .expect("open")
             .stats()
             .n_cold_fetches
@@ -1259,7 +1418,7 @@ mod tests {
         // again.
         reader.query_sql("SELECT title FROM docs").expect("scan q2");
         let cold_after_q2 = reader
-            .open_table("docs")
+            .open_table_handle("docs")
             .expect("open")
             .stats()
             .n_cold_fetches
@@ -1308,7 +1467,7 @@ mod tests {
         // One store built (single-flight) and one superfile, so exactly one
         // cold fetch despite 8 concurrent queries. More would mean rival stores.
         let cold = reader
-            .open_table("docs")
+            .open_table_handle("docs")
             .expect("open")
             .stats()
             .n_cold_fetches
@@ -1572,11 +1731,11 @@ mod tests {
 
         // Every table sees the one budget the connection minted, not a copy.
         assert!(Arc::ptr_eq(
-            &a.options().connection_memory_budget,
-            &b.options().connection_memory_budget
+            &a.local_handle().options().connection_memory_budget,
+            &b.local_handle().options().connection_memory_budget
         ));
         assert!(Arc::ptr_eq(
-            &a.options().connection_memory_budget,
+            &a.local_handle().options().connection_memory_budget,
             &conn.inner.connection_memory_budget
         ));
     }
@@ -1594,7 +1753,7 @@ mod tests {
         let reopened = conn.open_table("docs").expect("open");
 
         assert!(Arc::ptr_eq(
-            &reopened.options().connection_memory_budget,
+            &reopened.local_handle().options().connection_memory_budget,
             &conn.inner.connection_memory_budget
         ));
     }
