@@ -64,6 +64,7 @@ fn py_err(e: CoreError) -> PyErr {
         CoreError::AlreadyExists(m)
         | CoreError::Schema(m)
         | CoreError::Cardinality(m)
+        | CoreError::Config(m)
         | CoreError::Query(m) => PyValueError::new_err(m),
         CoreError::Io(m) | CoreError::Backend(m) => PyRuntimeError::new_err(m),
         // A connection-memory-budget refusal: recoverable, so raise the typed
@@ -186,7 +187,8 @@ fn connect(
 #[pyclass(name = "IndexSpec", skip_from_py_object)]
 #[derive(Clone, Default)]
 struct IndexSpec {
-    fts: Vec<String>,
+    /// `(column, analyzer)`; `analyzer` `None` means the default.
+    fts: Vec<(String, Option<String>)>,
     /// `(column, dim, n_cent, metric)`.
     vectors: Vec<(String, usize, usize, String)>,
 }
@@ -199,9 +201,13 @@ impl IndexSpec {
     }
 
     /// Mark `column` (a UTF-8 string column) as full-text indexed.
-    fn fts(&self, column: String) -> Self {
+    /// `analyzer` selects the tokenizer: `"ascii_lower"` (default —
+    /// ASCII split + lowercase, non-ASCII dropped) or `"standard"` (the
+    /// Unicode-aware UAX #29 tokenizer that keeps non-ASCII text).
+    #[pyo3(signature = (column, analyzer = None))]
+    fn fts(&self, column: String, analyzer: Option<String>) -> Self {
         let mut next = self.clone();
-        next.fts.push(column);
+        next.fts.push((column, analyzer));
         next
     }
 
@@ -219,8 +225,11 @@ impl IndexSpec {
     /// Lower to the core `IndexSpec` builder.
     fn to_rust(&self) -> PyResult<infino::IndexSpec> {
         let mut spec = infino::IndexSpec::new();
-        for column in &self.fts {
-            spec = spec.fts(column.clone());
+        for (column, analyzer) in &self.fts {
+            spec = match analyzer {
+                Some(a) => spec.fts_with_analyzer(column.clone(), a.clone()),
+                None => spec.fts(column.clone()),
+            };
         }
         for (column, dim, n_cent, metric) in &self.vectors {
             spec = spec.vector(column.clone(), *dim, *n_cent, metric_from_str(metric)?);
