@@ -199,6 +199,23 @@ impl SupertableInner {
         shared_io_runtime()
     }
 
+    /// Latch the purged observation when a commit's pointer fence finds the
+    /// pointer gone, so this handle reads as dead to
+    /// [`Supertable::pointer_vanished`] no matter which path noticed first.
+    ///
+    /// The read path's freshness probe is otherwise the only writer of that
+    /// latch, which leaves a handle that has only ever *written* permanently
+    /// stuck: the commit refuses correctly, but nothing marks the handle, so
+    /// the catalog keeps serving it from cache and every later commit fences
+    /// against a location a re-create has already replaced. Non-vanish errors
+    /// are left alone — contention and storage faults are recoverable, and
+    /// this latch never clears.
+    pub(super) fn note_commit_error(&self, err: &CommitError) {
+        if matches!(err, CommitError::PointerVanished) {
+            let _ = self.pointer_vanished.set(());
+        }
+    }
+
     /// The table's cached SQL schemas, built once from the immutable options.
     /// Cheap `Arc` clone on every call after the first.
     pub(super) fn sql_schemas(&self) -> Arc<SqlSchemas> {
@@ -5638,10 +5655,6 @@ mod tests {
             .with_storage(storage)
             .with_read_consistency(Consistency::Strong);
         let st = Supertable::create(options).expect("create storage-backed handle");
-        // `reader()` calls `ensure_fresh`, which under Strong drives a
-        // blocking `refresh` against the storage pointer. No pointer is
-        // published yet, so the pinned snapshot remains the empty
-        // manifest.
         let r = st.reader().expect("reader");
         assert_eq!(r.n_superfiles(), 0);
         // A direct refresh likewise reports no newer manifest.

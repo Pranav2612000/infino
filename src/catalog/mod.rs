@@ -1661,6 +1661,61 @@ mod tests {
         );
     }
 
+    /// The write-only twin of the read-path recovery. A handle that has never
+    /// served a read has never run a freshness probe, so the commit's pointer
+    /// fence is the only thing that can notice the purge — and unless that
+    /// observation latches, the catalog goes on serving the dead handle from
+    /// cache and every later append fences against a location a re-create has
+    /// already replaced. Correctly refusing forever is still broken.
+    #[test]
+    fn storage_appends_recover_after_a_peer_drop_and_recreate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect(&uri).expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["seeded"]))
+            .expect("append");
+
+        // The peer only ever writes — no query, so no freshness probe.
+        let peer_table = peer.open_table("docs").expect("peer opens the table");
+        peer_table
+            .append(&build_title_batch(&["peer row"]))
+            .expect("peer append before the drop");
+
+        writer.drop_table("docs", true).expect("drop_table");
+
+        let err = peer_table
+            .append(&build_title_batch(&["after the drop"]))
+            .expect_err("appending to a purged table must refuse");
+        assert!(
+            matches!(err, InfinoError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+
+        // The name comes back at a fresh location. Re-resolving through the
+        // connection must rebuild rather than hand back the dead handle.
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("re-create")
+            .append(&build_title_batch(&["new one"]))
+            .expect("append to the new generation");
+
+        peer.open_table("docs")
+            .expect("peer re-opens the re-created table")
+            .append(&build_title_batch(&["peer writes again"]))
+            .expect("a write-only peer must recover after the re-create");
+        assert_eq!(
+            count_rows(&writer, "docs"),
+            2,
+            "the new generation holds its own row plus the peer's"
+        );
+    }
+
     /// Drop-then-recreate through different connections: the name is back, but at
     /// a fresh location, so the peer must rebuild rather than serve the old rows.
     #[test]

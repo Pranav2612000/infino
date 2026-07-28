@@ -5670,7 +5670,8 @@ async fn stamp_slow_vector_state(
             old.with_slow_vector_state(published.uri, published.content_hash, published.centroids);
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
+            .inspect_err(|e| inner.note_commit_error(e))
+            .map_err(BuildError::from)?;
         match new_manifest
             .write(storage.as_ref(), prev_etag.as_deref(), &[])
             .await
@@ -5721,7 +5722,8 @@ async fn record_hidden_deleted_ids(
         let new_manifest = old.with_deleted_user_ids(bytes);
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
+            .inspect_err(|e| inner.note_commit_error(e))
+            .map_err(BuildError::from)?;
         match new_manifest
             .write(storage.as_ref(), prev_etag.as_deref(), &[])
             .await
@@ -5829,7 +5831,10 @@ pub(in crate::supertable) async fn persist_commit_async(
                     last_err = Some(SupertableCommitError::WriteContentionExhausted);
                     sleep(backoff_delay(attempt)).await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    inner.note_commit_error(&e);
+                    return Err(e);
+                }
             }
         }
         Err(last_err.unwrap_or(SupertableCommitError::WriteContentionExhausted))
@@ -6263,7 +6268,10 @@ pub(in crate::supertable) async fn stamp_tombstone_seqs(
                 sleep(backoff_delay(attempt)).await;
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                inner.note_commit_error(&e);
+                return Err(e);
+            }
         };
         match new_manifest
             .write(storage.as_ref(), prev_etag.as_deref(), &[])
