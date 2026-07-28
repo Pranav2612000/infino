@@ -1071,7 +1071,12 @@ fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, sync::Arc, thread};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        thread,
+    };
 
     use arrow_array::{Array, Int64Array, LargeStringArray, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -1451,7 +1456,7 @@ mod tests {
 
     /// Every `_supertable/current` pointer file under `root`, recursively — the
     /// on-storage evidence that a supertable exists.
-    fn pointer_files(root: &Path) -> Vec<std::path::PathBuf> {
+    fn pointer_files(root: &Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
         let Ok(entries) = fs::read_dir(root) else {
             return found;
@@ -1502,12 +1507,20 @@ mod tests {
             matches!(err, InfinoError::NotFound(_)),
             "expected NotFound, got {err:?}"
         );
+        // `query_sql` reports the planner's failure to resolve the relation,
+        // not our typed `NotFound` — an unregistrable name is skipped during
+        // registration (it may be a CTE or a TVF argument), so the refusal
+        // surfaces one layer up. The typed assertion is on `open_table` above;
+        // what matters here is that the message is a missing *table* and not a
+        // fetch of a purged superfile off the stale manifest, which is exactly
+        // how this failed before.
         let err = peer
             .query_sql("SELECT COUNT(*) FROM docs")
             .expect_err("the purged table must not be queryable");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("docs"),
-            "the error should name the missing table, got {err:?}"
+            msg.contains("docs") && !msg.contains(".sf.parquet"),
+            "expected a missing-table error naming docs, got {err:?}"
         );
     }
 
@@ -1628,6 +1641,14 @@ mod tests {
         let err = peer_table
             .append(&build_title_batch(&["after the drop"]))
             .expect_err("appending to a purged table must fail");
+        // The same answer the read path gives. It has to survive the commit →
+        // build → mutation-commit error hops the append path takes, or a caller
+        // sees an indistinguishable backend fault and retries — and every retry
+        // uploads another superfile before reaching the fence that refuses it.
+        assert!(
+            matches!(err, InfinoError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
 
         assert!(
             pointer_files(dir.path()).is_empty(),

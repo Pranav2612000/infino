@@ -2588,7 +2588,7 @@ async fn persist_superfile_publish_batch_async(
             list_metadata,
         )
         .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
+        .map_err(BuildError::from)?;
         inner.manifest.store(Arc::new(new_manifest));
         apply_pending_store_inserts(inner, batch.pending_store_inserts);
         // Already async — await the warm-cache fill directly. Do NOT call
@@ -3924,7 +3924,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             list_metadata,
         )
         .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
+        .map_err(BuildError::from)?;
         hidden_inner.manifest.store(Arc::new(new_manifest));
         apply_pending_store_inserts(&hidden_inner, pending_store_inserts);
         if !pending_cache_inserts.is_empty()
@@ -5409,7 +5409,7 @@ pub(in crate::supertable) async fn split_overflow_cell(
         list_metadata,
     )
     .await
-    .map_err(|e| BuildError::Store(e.to_string()))?;
+    .map_err(BuildError::from)?;
     inner.manifest.store(Arc::new(new_manifest));
     apply_pending_store_inserts(&inner, batch.pending_store_inserts);
 
@@ -6163,9 +6163,11 @@ pub(crate) async fn try_commit_attempt(
         }
     }
 
-    // 3. Read the prior pointer's etag for the CAS. Fresh
-    //    supertable → no pointer yet → None etag (initial
-    //    commit).
+    // 3. Read the prior pointer's etag for the CAS. Every storage-backed
+    //    table has a pointer by now — `create` publishes one before any
+    //    writer runs — so an absent pointer is not an initial commit but a
+    //    table dropped and purged under this handle, and the read refuses
+    //    rather than republishing one from stale state.
     let prev_etag = get_current_manifest_etag(&storage, current_manifest).await?;
 
     // 4. Parallel-issue (touched parts) + list PUTs, then

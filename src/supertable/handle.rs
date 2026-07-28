@@ -1837,7 +1837,10 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{builder::FtsConfig, vector::layout::VectorLayout},
         supertable::{
-            manifest::{SuperfileEntry, SuperfileUri},
+            manifest::{
+                SuperfileEntry, SuperfileUri,
+                commit::{POINTER_PATH, get_current_manifest_etag},
+            },
             options::Consistency,
             query::dispatch::open_reader,
         },
@@ -5644,5 +5647,75 @@ mod tests {
         // A direct refresh likewise reports no newer manifest.
         let advanced = bridge_sync_to_async(st.refresh()).expect("refresh against empty store");
         assert!(!advanced, "no commit yet ⇒ refresh finds nothing newer");
+    }
+
+    /// The typed shape of a deleted pointer on the read path, pinned at the
+    /// layer that produces it. Both the error and the latch matter: callers
+    /// above match the variant, and the catalog keys handle eviction on the
+    /// latch, so a refactor that reclassified either would break recovery
+    /// while every end-to-end assertion still passed.
+    #[test]
+    fn refresh_reports_pointer_vanished_once_the_pointer_is_deleted() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = opts()
+            .with_storage(Arc::clone(&storage))
+            .with_read_consistency(Consistency::Strong);
+        let st = Supertable::create(options).expect("create storage-backed handle");
+        assert!(!st.pointer_vanished(), "a live table has its pointer");
+
+        // Exactly what a purge leaves behind for a handle that stays open.
+        bridge_sync_to_async(storage.delete(POINTER_PATH)).expect("delete pointer");
+
+        let err = bridge_sync_to_async(st.refresh()).expect_err("refresh must refuse");
+        assert!(
+            matches!(
+                err,
+                OpenError::ManifestLoadError(ManifestLoadError::PointerVanished)
+            ),
+            "expected PointerVanished, got {err:?}"
+        );
+        assert!(
+            st.pointer_vanished(),
+            "the observation must latch, so the catalog can evict this handle"
+        );
+        // And it stays refused rather than being a one-shot side effect of the
+        // probe that discovered it.
+        for attempt in 0..2 {
+            let err = st.reader().expect_err("reader must refuse");
+            assert!(
+                matches!(err, ManifestLoadError::PointerVanished),
+                "attempt {attempt}: expected PointerVanished, got {err:?}"
+            );
+        }
+    }
+
+    /// The same condition on the commit path. `Ok(None)` here would read as
+    /// "initial commit" and republish a pointer from this handle's stale
+    /// manifest, so the variant — not just the failure — is the contract.
+    #[test]
+    fn get_current_manifest_etag_refuses_a_deleted_pointer() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = opts().with_storage(Arc::clone(&storage));
+        let st = Supertable::create(options).expect("create storage-backed handle");
+
+        // Capture the snapshot while the table is still whole: this is the
+        // stale state a commit would otherwise republish from.
+        let manifest = Arc::clone(st.reader().expect("reader").manifest());
+        let etag = bridge_sync_to_async(get_current_manifest_etag(&storage, Arc::clone(&manifest)))
+            .expect("a live pointer yields its etag");
+        assert!(etag.is_some(), "localfs reports etags");
+
+        bridge_sync_to_async(storage.delete(POINTER_PATH)).expect("delete pointer");
+
+        let err = bridge_sync_to_async(get_current_manifest_etag(&storage, manifest))
+            .expect_err("an absent pointer must not read as an initial commit");
+        assert!(
+            matches!(err, CommitError::PointerVanished),
+            "expected PointerVanished, got {err:?}"
+        );
     }
 }

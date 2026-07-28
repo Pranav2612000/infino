@@ -168,13 +168,25 @@ impl From<SupertableBuildError> for InfinoError {
         if let Some(msg) = e.over_budget() {
             return InfinoError::OverBudget(msg.to_string());
         }
+        // A commit that found its table dropped and purged is not a schema
+        // problem; it is the name no longer resolving. Same answer the read
+        // path gives, so a caller can match one condition, not three.
+        if matches!(e, SupertableBuildError::TableGone) {
+            return InfinoError::NotFound(e.to_string());
+        }
         InfinoError::Schema(e.to_string())
     }
 }
 
 impl From<SupertableCommitError> for InfinoError {
     fn from(e: SupertableCommitError) -> Self {
-        InfinoError::Backend(e.to_string())
+        let msg = e.to_string();
+        match e {
+            // Reached by commit paths that surface the typed error directly
+            // (the append path converts to `BuildError::TableGone` first).
+            SupertableCommitError::PointerVanished => InfinoError::NotFound(msg),
+            _ => InfinoError::Backend(msg),
+        }
     }
 }
 
@@ -206,6 +218,15 @@ impl From<MutationCommitError> for InfinoError {
     fn from(e: MutationCommitError) -> Self {
         if let Some(msg) = e.over_budget() {
             return InfinoError::OverBudget(msg.to_string());
+        }
+        // `Supertable::append` lands here, so this is the arm that decides what
+        // appending to a purged table reports. Narrow on purpose: every other
+        // append-flush failure keeps its existing `Backend` shape.
+        if matches!(
+            &e,
+            MutationCommitError::AppendFlush(SupertableBuildError::TableGone)
+        ) {
+            return InfinoError::NotFound(e.to_string());
         }
         InfinoError::Backend(e.to_string())
     }
