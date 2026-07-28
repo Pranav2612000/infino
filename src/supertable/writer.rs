@@ -1061,6 +1061,7 @@ impl SupertableWriter {
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
         let target_ids = supertable
             .reader()
+            .map_err(|_| MutationError::TableGone)?
             .scan_ids_matching(predicate)
             .map_err(MutationError::PredicateEval)?;
         let matched = target_ids.len();
@@ -1137,6 +1138,7 @@ impl SupertableWriter {
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
         let target_ids = supertable
             .reader()
+            .map_err(|_| MutationError::TableGone)?
             .scan_ids_matching(predicate)
             .map_err(MutationError::PredicateEval)?;
         let matched = target_ids.len();
@@ -6624,7 +6626,7 @@ mod tests {
             .expect("append visible entry");
         writer.commit().expect("commit visible entry");
         drop(writer);
-        let pending_entry = Arc::clone(&table.reader().manifest().superfiles[0]);
+        let pending_entry = Arc::clone(&table.reader().expect("reader").manifest().superfiles[0]);
         let sources = vec![DrainCheckpointSource {
             superfile_id: "source-id".into(),
             uri: "source-uri".into(),
@@ -6795,6 +6797,7 @@ mod tests {
         assert!(
             hidden
                 .reader()
+                .expect("reader")
                 .manifest()
                 .superfiles
                 .iter()
@@ -6909,7 +6912,7 @@ mod tests {
         .await
         .expect("splice drain across batches");
         assert!(
-            hidden.reader().n_superfiles() > 0,
+            hidden.reader().expect("reader").n_superfiles() > 0,
             "splice drain must populate the hidden cell index"
         );
         // The e_0 direction (one doc per batch) still resolves through the
@@ -6918,6 +6921,7 @@ mod tests {
         q[0] = 1.0;
         let hits = table
             .reader()
+            .expect("reader")
             .vector_hits(
                 "emb",
                 &q,
@@ -7096,7 +7100,7 @@ mod tests {
     }
 
     fn committed_reader(st: &Supertable) -> (Arc<SuperfileEntry>, Arc<SuperfileReader>) {
-        let entry = Arc::clone(&st.reader().manifest().superfiles[0]);
+        let entry = Arc::clone(&st.reader().expect("reader").manifest().superfiles[0]);
         let reader = st
             .options()
             .store
@@ -7169,7 +7173,7 @@ mod tests {
         );
 
         // Nothing was published, and a refused reservation commits nothing.
-        assert_eq!(st.reader().n_docs_total(), 0);
+        assert_eq!(st.reader().expect("reader").n_docs_total(), 0);
         assert!(st.options().connection_memory_budget.denials() >= 1);
         assert_eq!(st.options().connection_memory_budget.peak(), 0);
     }
@@ -7184,7 +7188,7 @@ mod tests {
 
         st.append(&build_simple_batch(0, 8))
             .expect("measured budget never refuses");
-        assert_eq!(st.reader().n_docs_total(), 8);
+        assert_eq!(st.reader().expect("reader").n_docs_total(), 8);
 
         let budget = &st.options().connection_memory_budget;
         assert_eq!(budget.denials(), 0);
@@ -7205,7 +7209,7 @@ mod tests {
 
         st.append(&build_simple_batch(0, 8))
             .expect("under-budget append runs under a bounded budget");
-        assert_eq!(st.reader().n_docs_total(), 8);
+        assert_eq!(st.reader().expect("reader").n_docs_total(), 8);
 
         let budget = &st.options().connection_memory_budget;
         assert_eq!(budget.denials(), 0);
@@ -7266,7 +7270,7 @@ mod tests {
             .append(&build_vector_batch(0, 8, dim))
             .expect_err("vector build over a 0-byte gate is refused");
         assert!(matches!(err, InfinoError::OverBudget(_)), "got {err:?}");
-        assert_eq!(st.reader().n_docs_total(), 0);
+        assert_eq!(st.reader().expect("reader").n_docs_total(), 0);
     }
 
     #[test]
@@ -7280,7 +7284,7 @@ mod tests {
 
         st.append(&build_vector_batch(0, 8, dim))
             .expect("measured vector ingest runs");
-        assert_eq!(st.reader().n_docs_total(), 8);
+        assert_eq!(st.reader().expect("reader").n_docs_total(), 8);
 
         let budget = &st.options().connection_memory_budget;
         assert_eq!(budget.denials(), 0);
@@ -7337,7 +7341,7 @@ mod tests {
         w.append(&build_simple_batch(0, 4)).expect("append");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         assert_eq!(r.manifest_id(), 1);
         assert_eq!(r.n_superfiles(), 1);
         assert_eq!(r.n_docs_total(), 4);
@@ -7349,7 +7353,7 @@ mod tests {
         let mut w = st.writer().expect("writer");
         w.commit().expect("commit-empty");
         assert_eq!(st.manifest_id(), 0, "no manifest swap on empty commit");
-        assert_eq!(st.reader().n_superfiles(), 0);
+        assert_eq!(st.reader().expect("reader").n_superfiles(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7362,7 +7366,7 @@ mod tests {
         w.append(&build_simple_batch(0, 4)).expect("append");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let superfile = &r.manifest().superfiles[0];
         let store = &st.options().store;
         let sf_reader = store.reader(&superfile.uri).expect("reader");
@@ -7384,7 +7388,7 @@ mod tests {
         w.append(&build_simple_batch(50, 2)).expect("b");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let seg = &r.manifest().superfiles[0];
         assert_eq!(seg.n_docs, 5);
         // _id values are auto-injected via the supertable's
@@ -7404,7 +7408,7 @@ mod tests {
         w.append(&build_simple_batch(0, 4)).expect("append");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let seg = &r.manifest().superfiles[0];
         let fts = seg
             .fts_summary
@@ -7485,7 +7489,7 @@ mod tests {
         w.append(&build_vector_batch(0, 8, dim)).expect("append");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let seg = &r.manifest().superfiles[0];
         let vs = seg
             .vector_summary
@@ -7534,7 +7538,11 @@ mod tests {
         )
         .expect("create");
         assert!(
-            !st.reader().options().vector_columns.is_empty(),
+            !st.reader()
+                .expect("reader")
+                .options()
+                .vector_columns
+                .is_empty(),
             "fixture must declare vector columns so commit takes the assign-pack path"
         );
         let mut w = st.writer().expect("writer");
@@ -7687,7 +7695,7 @@ mod tests {
             }
             w.commit().expect("commit");
 
-            let r = st.reader();
+            let r = st.reader().expect("reader");
             assert_eq!(
                 r.n_superfiles(),
                 n_threads,
@@ -7709,7 +7717,7 @@ mod tests {
         w.append(&build_simple_batch(1, 1)).expect("b");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         assert_eq!(r.n_superfiles(), 2);
         assert_eq!(r.n_docs_total(), 2);
     }
@@ -7736,7 +7744,7 @@ supertable:
         }
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         assert_eq!(
             r.n_superfiles(),
             4,
@@ -7831,7 +7839,7 @@ supertable:
         w.append(&build_simple_batch(20, 1)).expect("a3");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         assert_eq!(r.manifest_id(), 3);
         assert_eq!(r.n_superfiles(), 3);
         assert_eq!(r.n_docs_total(), 6);
@@ -7873,7 +7881,7 @@ supertable:
         w.append(&build_simple_batch(0, 8)).expect("append");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let seg = &r.manifest().superfiles[0];
         let store = &st.options().store;
         // Fetch the bytes back from the in-memory store.
@@ -7921,7 +7929,7 @@ supertable:
         );
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         assert_eq!(r.n_superfiles(), 1);
         assert_eq!(r.n_docs_total(), 8);
     }

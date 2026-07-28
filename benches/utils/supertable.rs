@@ -393,7 +393,7 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
 /// Visit committed superfiles through the flat eager view, or through manifest
 /// parts when the manifest is lazy and the flat view is empty.
 fn visit_manifest_superfiles(table: &Supertable, mut visit: impl FnMut(&SuperfileEntry)) {
-    let reader = table.reader();
+    let reader = table.reader().expect("reader");
     let manifest = reader.manifest();
     let flat_superfiles = manifest.get_all_superfiles();
     if !flat_superfiles.is_empty() {
@@ -452,7 +452,7 @@ fn slow_state_stored_bytes(table: &Supertable) -> Option<u64> {
 fn live_stored_bytes(consumer: &Supertable) -> Option<u64> {
     /// Relative prefix of superfile data objects under a table root.
     const DATA_PREFIX: &str = "data/";
-    let user_reader = consumer.reader();
+    let user_reader = consumer.reader().expect("reader");
     let user_manifest = user_reader.manifest();
     let listing = listed_objects_under(consumer, "")?;
     let bucket_total: u64 = listing.iter().map(|(_, size)| *size).sum();
@@ -500,7 +500,15 @@ fn listed_bytes_under(table: &Supertable, prefix: &str) -> Option<u64> {
 /// table's provider. Keys are provider-root-relative — the same
 /// convention as `SuperfileUri::storage_path`.
 fn listed_objects_under(table: &Supertable, prefix: &str) -> Option<Vec<(String, u64)>> {
-    let storage = Arc::clone(table.reader().manifest().options.storage.as_ref()?);
+    let storage = Arc::clone(
+        table
+            .reader()
+            .expect("reader")
+            .manifest()
+            .options
+            .storage
+            .as_ref()?,
+    );
     let prefix = prefix.to_owned();
     let objects = tiers::block_on(async move {
         storage
@@ -625,7 +633,7 @@ fn run_metered_optimize(
 ) -> CompactionStats {
     eprintln!(
         "[{label}] before optimize: {} superfiles",
-        consumer.reader().n_superfiles()
+        consumer.reader().expect("reader").n_superfiles()
     );
     eprintln!("[{label}] compacting (optimize)...");
     let before = meter.snapshot();
@@ -646,7 +654,7 @@ fn run_metered_optimize(
         rss::fmt_bytes(peak_rss),
         rss::fmt_bytes(rss_stats.peak_anon_rss_bytes),
         rss::fmt_bytes(rss_stats.peak_file_rss_bytes),
-        consumer.reader().n_superfiles(),
+        consumer.reader().expect("reader").n_superfiles(),
     );
     (wall_s, io, peak_rss, cpu_s)
 }
@@ -1573,7 +1581,7 @@ pub mod fts {
 
         if phases.warm || phases.cold {
             let (cache_dir, consumer) = open_consumer(Modality::Fts, &built);
-            let reader = consumer.reader();
+            let reader = consumer.reader().expect("reader");
             exec_fts::assert_correct(&reader, supertable::TEXT_COLUMN, n_docs, "supertable_fts");
             drop(consumer);
             drop(cache_dir);
@@ -1880,7 +1888,7 @@ pub mod fts {
             .expect("battery keeps its broad-OR representative");
         let query = rep.terms.join(" ");
         let mode = exec_fts::to_infino_mode(rep.mode);
-        let reader = consumer.reader();
+        let reader = consumer.reader().expect("reader");
         let hidden_uris: HashSet<_> = consumer
             .vector_index_table()
             .map(|hidden| {
@@ -1948,7 +1956,7 @@ pub mod fts {
         // up as anonymous ≈ file_backed after warm-up.
         crate::rss::log_rss_breakdown("supertable_fts before consumer open");
         let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
-        let reader = consumer.reader();
+        let reader = consumer.reader().expect("reader");
         // Prewarm + wait: run EVERY battery shape once so each opens its
         // pruned-in superfiles and spawns their background fills, then
         // wait_until_warm blocks until all are mmap-promoted. A single-shape
@@ -2076,6 +2084,7 @@ pub mod fts {
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
                     .reader()
+                    .expect("reader")
                     .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
                     .expect("metered cold bm25_search");
             },
@@ -2085,6 +2094,7 @@ pub mod fts {
                 let mode = exec_fts::to_infino_mode(q.mode);
                 let _ = consumer
                     .reader()
+                    .expect("reader")
                     .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
                     .expect("metered steady cold bm25_search");
             },
@@ -2094,6 +2104,7 @@ pub mod fts {
                 let mode = exec_fts::to_infino_mode(query.mode);
                 let _ = consumer
                     .reader()
+                    .expect("reader")
                     .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
                     .expect("metered repeat cold bm25_search");
             },
@@ -2131,6 +2142,7 @@ pub mod fts {
         ) -> usize {
             self.consumer
                 .reader()
+                .expect("reader")
                 .bm25_search(column, query, k, mode, None)
                 .expect("cold bm25_search")
                 .iter()
@@ -2147,6 +2159,7 @@ pub mod fts {
         ) -> usize {
             self.consumer
                 .reader()
+                .expect("reader")
                 .bm25_search(column, query, k, mode, Some(&["_id", column, "score"]))
                 .expect("cold bm25_search fetched")
                 .iter()
@@ -2161,7 +2174,10 @@ pub mod fts {
             k: usize,
             mode: infino::superfile::fts::reader::BoolMode,
         ) -> ((u64, u64), (u64, u64)) {
-            self.consumer.reader().bm25_payloads(column, query, k, mode)
+            self.consumer
+                .reader()
+                .expect("reader")
+                .bm25_payloads(column, query, k, mode)
         }
 
         fn count_matching(
@@ -2170,7 +2186,10 @@ pub mod fts {
             query: &str,
             mode: infino::superfile::fts::reader::BoolMode,
         ) -> u64 {
-            self.consumer.reader().count_matching(column, query, mode)
+            self.consumer
+                .reader()
+                .expect("reader")
+                .count_matching(column, query, mode)
         }
     }
 }
@@ -2314,7 +2333,7 @@ pub mod vector {
         nprobe: usize,
         rerank: usize,
     ) -> HitTierStats {
-        let reader = table.reader();
+        let reader = table.reader().expect("reader");
         let hidden_uris: HashSet<_> = table
             .vector_index_table()
             .map(|hidden| {
@@ -2398,7 +2417,7 @@ pub mod vector {
         id_to_dense: &HashMap<i128, u32>,
         hits: &[infino::supertable::query::SuperfileHit],
     ) -> Vec<(u32, f32)> {
-        let reader = st.reader();
+        let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         let mut contiguous_min_by_uri: HashMap<_, i128> = HashMap::new();
         for entry in manifest.get_all_superfiles() {
@@ -2898,6 +2917,7 @@ pub mod vector {
             sampled += 1;
             let batches = consumer
                 .reader()
+                .expect("reader")
                 .vector_search(
                     supertable::VEC_COLUMN,
                     &vectors[start..start + DIM],
@@ -2995,7 +3015,7 @@ pub mod vector {
             return "pre-drain";
         }
         let drained = hidden_manifest.get_drained_ranges();
-        let user_reader = consumer.reader();
+        let user_reader = consumer.reader().expect("reader");
         let user_manifest = user_reader.manifest();
         if user_manifest
             .get_all_superfiles()
@@ -3101,7 +3121,7 @@ pub mod vector {
             .vector_index_table()
             .expect("reset must recreate the hidden vector index");
         assert_eq!(
-            hidden.reader().n_superfiles(),
+            hidden.reader().expect("reader").n_superfiles(),
             0,
             "reset hidden index must reopen empty"
         );
@@ -3147,6 +3167,7 @@ pub mod vector {
                 }
                 let _ = consumer
                     .reader()
+                    .expect("reader")
                     .vector_search(
                         supertable::VEC_COLUMN,
                         query,
@@ -3167,6 +3188,7 @@ pub mod vector {
                 }
                 let _ = consumer
                     .reader()
+                    .expect("reader")
                     .vector_search(
                         supertable::VEC_COLUMN,
                         q,
@@ -3184,6 +3206,7 @@ pub mod vector {
             |(_cache, consumer)| {
                 let _ = consumer
                     .reader()
+                    .expect("reader")
                     .vector_search(
                         supertable::VEC_COLUMN,
                         query,
@@ -3229,7 +3252,7 @@ pub mod vector {
         include_warm: bool,
         include_cold: bool,
     ) -> RoutingStateStat {
-        let reader = consumer.reader();
+        let reader = consumer.reader().expect("reader");
         super::measure_routing_state_with(
             "supertable_vector",
             label,
@@ -3752,7 +3775,7 @@ pub mod vector {
             if phases.warm
                 && let Some(filtered_gt) = filtered_gt.as_ref()
             {
-                let consumer_reader = consumer.reader();
+                let consumer_reader = consumer.reader().expect("reader");
                 let mut allow_stable_ids: Vec<i128> = id_to_dense
                     .iter()
                     .filter_map(|(stable_id, dense_id)| {
@@ -3948,7 +3971,7 @@ pub mod vector {
                 // Post-drain, matching every other search number in this file.
                 drain_hidden_incoming(&combined_consumer);
                 let combined_ids = corpus::engine_id_to_dense(&combined_consumer, n_docs);
-                let combined_reader = combined_consumer.reader();
+                let combined_reader = combined_consumer.reader().expect("reader");
 
                 // Allow-set = the ENGINE's own `token_match` over the same
                 // column/term/mode the filter carries — the identical
@@ -4075,7 +4098,7 @@ pub mod vector {
                 // warm latency battery timed — so the ledger's warm GET/query
                 // and the compute ledger's warm CPU describe one path.
                 let warm_io = (phases.warm && !q_correct.is_empty()).then(|| {
-                    let reader = consumer.reader();
+                    let reader = consumer.reader().expect("reader");
                     // Untimed prewarm: fault each query's routed cells into the
                     // resident cache first, so the metered pass below reflects
                     // steady-state warm I/O (0 GET when the working set fits the
@@ -4797,7 +4820,7 @@ pub mod sql {
             .iter()
             .find(|q| q.name == "filter_category_count")
             .expect("battery keeps its filtered-count representative");
-        let reader = consumer.reader();
+        let reader = consumer.reader().expect("reader");
         super::measure_routing_state_with(
             "supertable_sql",
             label,

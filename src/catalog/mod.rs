@@ -1075,6 +1075,7 @@ mod tests {
 
     use arrow_array::{Array, Int64Array, LargeStringArray, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::{col, lit};
 
     use super::*;
     use crate::{
@@ -1507,6 +1508,89 @@ mod tests {
         assert!(
             err.to_string().contains("docs"),
             "the error should name the missing table, got {err:?}"
+        );
+    }
+
+    /// The purge seen from a table handle the caller is *holding*, rather than
+    /// re-resolving by name — and with a disk cache, which is what makes this
+    /// the sharpest case.
+    ///
+    /// Re-resolving recovers, because the catalog drops the dead handle and
+    /// rebuilds. A held handle has no name to re-resolve, and the freshness
+    /// probe inside it swallows errors by design, so nothing stops the read:
+    /// the pinned manifest still names the purged superfiles and the cache
+    /// still holds their bytes, so every search answers — correctly shaped,
+    /// from a table that no longer exists — for as long as the handle lives.
+    /// Storage never gets asked, so the deletion cannot surface on its own.
+    #[test]
+    fn storage_reads_on_a_purged_handle_refuse_instead_of_serving_cached_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect_with(&uri, ConnectOptions::new().with_cache_dir(cache.path()))
+            .expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+
+        // Read once through the held handle so the superfile bytes are resident
+        // in the peer's disk cache — the state that lets a purged table keep
+        // answering without ever touching storage again.
+        let peer_table = peer.open_table("docs").expect("peer opens the table");
+        assert_eq!(
+            n_rows(
+                &peer_table
+                    .bm25_search("title", "quick", TOP_K, BoolMode::Or, None)
+                    .expect("warm read")
+            ),
+            1,
+            "peer reads the seeded row, warming its cache"
+        );
+
+        writer.drop_table("docs", true).expect("drop_table");
+
+        // Every read verb, twice: the first trips the probe that discovers the
+        // purge, and the second proves the refusal is latched rather than a
+        // one-shot side effect of that discovery.
+        for attempt in 0..2 {
+            let err = peer_table
+                .bm25_search("title", "quick", TOP_K, BoolMode::Or, None)
+                .expect_err("bm25_search on a purged table must not return rows");
+            assert!(
+                matches!(err, InfinoError::NotFound(_)),
+                "attempt {attempt}: expected NotFound, got {err:?}"
+            );
+            for err in [
+                peer_table
+                    .token_match("title", "quick", BoolMode::Or, None)
+                    .expect_err("token_match must refuse"),
+                peer_table
+                    .exact_match("title", "the quick brown fox", None)
+                    .expect_err("exact_match must refuse"),
+                peer_table
+                    .count("title", "quick", BoolMode::Or)
+                    .expect_err("count must refuse"),
+            ] {
+                assert!(
+                    matches!(err, InfinoError::NotFound(_)),
+                    "attempt {attempt}: expected NotFound, got {err:?}"
+                );
+            }
+        }
+
+        // Mutations refuse at predicate resolution, before writing any WAL
+        // state, and report the same missing table rather than a backend fault.
+        let err = peer_table
+            .delete(col("_id").eq(lit(1_i64)))
+            .expect_err("delete on a purged table must refuse");
+        assert!(
+            matches!(err, InfinoError::NotFound(_)),
+            "expected NotFound, got {err:?}"
         );
     }
 

@@ -1352,7 +1352,7 @@ impl Supertable {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(column, k, mode = ?mode, "bm25_search");
-        self.reader()
+        self.reader()?
             .bm25_search(column, query, k, mode, projection)
             .map_err(InfinoError::from)
             .map_err(|e| e.with_context("bm25_search", None))
@@ -1382,7 +1382,7 @@ impl Supertable {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(column, mode = ?mode, "token_match");
-        let reader = self.reader();
+        let reader = self.reader()?;
         let hits = reader
             .token_match(column, query, mode)
             .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
@@ -1413,7 +1413,7 @@ impl Supertable {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(column, "exact_match");
-        let reader = self.reader();
+        let reader = self.reader()?;
         let hits = reader
             .exact_match(column, value)
             .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
@@ -1464,7 +1464,7 @@ impl Supertable {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
-        self.reader()
+        self.reader()?
             .count(column, query, mode)
             .map_err(InfinoError::from)
             .map_err(|e| e.with_context("count", None))
@@ -1595,7 +1595,7 @@ mod tests {
         w.append(&build_batch(3, &["beta gamma"])).expect("append");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let hits = r
             .bm25_hits("title", "alpha -beta", 10, BoolMode::Or)
             .expect("negation search");
@@ -1624,7 +1624,7 @@ mod tests {
         w.append(&build_batch(3, &["gamma three"])).expect("append");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let hits = r
             .bm25_hits("title", "alpha -delta", 10, BoolMode::And)
             .expect("negation search");
@@ -1638,7 +1638,7 @@ mod tests {
         w.append(&build_batch(0, &["alpha beta"])).expect("append");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let res = r.bm25_hits("title", "-alpha", 10, BoolMode::Or);
         assert!(res.is_err(), "negation-only must error; got {res:?}");
     }
@@ -1653,7 +1653,7 @@ mod tests {
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["alpha beta"])).expect("append");
         w.commit().expect("commit");
-        let r = st.reader();
+        let r = st.reader().expect("reader");
 
         for mode in [BoolMode::Or, BoolMode::And] {
             assert!(
@@ -1679,7 +1679,7 @@ mod tests {
     #[test]
     fn bm25_search_empty_supertable_returns_empty_without_store_calls() {
         let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let hits = r
             .bm25_hits("title", "rust", 5, BoolMode::Or)
             .expect("query");
@@ -1692,7 +1692,7 @@ mod tests {
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust async"])).expect("append");
         w.commit().expect("commit");
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let hits = r
             .bm25_hits("title", "rust", 0, BoolMode::Or)
             .expect("query");
@@ -1714,7 +1714,7 @@ mod tests {
         ))
         .expect("append");
         w.commit().expect("commit");
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let hits = r
             .bm25_hits("title", "rust", 4, BoolMode::Or)
             .expect("query");
@@ -1735,7 +1735,7 @@ mod tests {
         w.append(&build_batch(10, &["rust runtime"])).expect("a2");
         w.commit().expect("c2");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         assert_eq!(r.n_superfiles(), 2);
         let hits = r
             .bm25_hits("title", "rust", 5, BoolMode::Or)
@@ -1786,7 +1786,7 @@ mod tests {
                 .expect("append");
             w.commit().expect("commit");
         }
-        assert_eq!(st.reader().n_superfiles(), 3);
+        assert_eq!(st.reader().expect("reader").n_superfiles(), 3);
 
         let oracle = build_oracle_superfile(&titles);
         // Single-superfile `SuperfileReader` oracle: async-only search,
@@ -1799,7 +1799,7 @@ mod tests {
         let oracle_set: HashSet<u32> = oracle_hits.iter().map(|(d, _)| *d).collect();
         assert_eq!(oracle_set, [0u32, 4, 8].iter().copied().collect());
 
-        let st_reader = st.reader();
+        let st_reader = st.reader().expect("reader");
         let st_hits = st_reader
             .bm25_hits("title", "nimblefox", 5, BoolMode::Or)
             .expect("supertable query");
@@ -1847,7 +1847,7 @@ mod tests {
         let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5)).expect("oracle");
         let oracle_globals: HashSet<u32> = oracle_hits.iter().map(|(d, _)| *d).collect();
 
-        let st_reader = st.reader();
+        let st_reader = st.reader().expect("reader");
         let st_hits = st_reader
             .bm25_search_prefix("title", "rust", 5)
             .expect("supertable query");
@@ -1877,7 +1877,7 @@ mod tests {
         w.append(&build_batch(0, &["rust async"])).expect("append");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let hits = r.bm25_search_prefix("title", "zzzz", 10).expect("query");
         assert!(hits.is_empty());
     }
@@ -1893,7 +1893,7 @@ mod tests {
             .expect("append");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let hits = r.bm25_search_prefix("title", "RUST", 5).expect("query");
         assert_eq!(hits.len(), 1);
     }
@@ -1905,7 +1905,7 @@ mod tests {
         w.append(&build_batch(0, &["rust"])).expect("append");
         w.commit().expect("commit");
 
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let err = r
             .bm25_hits("missing_column", "rust", 5, BoolMode::Or)
             .expect_err("expected error");
@@ -1922,7 +1922,7 @@ mod tests {
                 .expect("a");
             w.commit().expect("c");
         }
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let hits = r
             .bm25_hits("title", "rust", 2, BoolMode::Or)
             .expect("query");
@@ -1986,7 +1986,7 @@ mod tests {
     #[test]
     fn reader_token_match_and_exact_match_hits() {
         let st = seeded_three_doc_supertable();
-        let r = st.reader();
+        let r = st.reader().expect("reader");
 
         // token_match And requires every token to be present.
         let any = r.token_match("title", "quick", BoolMode::And).expect("tm");
@@ -2005,7 +2005,7 @@ mod tests {
     #[test]
     fn token_match_empty_query_short_circuits() {
         let st = seeded_three_doc_supertable();
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         // A query that tokenizes to nothing returns empty without
         // touching the store.
         let hits = r
@@ -2074,7 +2074,7 @@ mod tests {
     #[test]
     fn phrase_query_end_to_end() {
         let st = seeded_phrase_supertable();
-        let r = st.reader();
+        let r = st.reader().expect("reader");
 
         // Ranked: exactly the adjacent-in-order docs across both
         // superfiles.
@@ -2110,7 +2110,7 @@ mod tests {
     #[test]
     fn phrase_on_positionless_table_errors() {
         let st = seeded_clause_supertable();
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let err = r
             .bm25_hits("title", r#""climate change""#, 10, BoolMode::Or)
             .expect_err("typed error expected");
@@ -2138,7 +2138,7 @@ mod tests {
     #[test]
     fn must_should_match_set_and_count_across_superfiles() {
         let st = seeded_clause_supertable();
-        let r = st.reader();
+        let r = st.reader().expect("reader");
 
         // 3 docs contain `climate`; `policy` is scoring-only and must
         // not pull in "policy analysis quarterly".
@@ -2171,7 +2171,7 @@ mod tests {
     #[test]
     fn must_should_token_match_matches_musts_only() {
         let st = seeded_clause_supertable();
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         // Unranked matching has no scores for the should to raise —
         // the match set is exactly the must set.
         let tm = r
@@ -2183,7 +2183,7 @@ mod tests {
     #[test]
     fn must_should_with_negation_across_superfiles() {
         let st = seeded_clause_supertable();
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         // Negation still excludes: drop the summit doc from the
         // climate must set.
         let hits = r
@@ -2199,7 +2199,7 @@ mod tests {
     #[test]
     fn absent_must_prunes_every_superfile() {
         let st = seeded_clause_supertable();
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         // The must term exists nowhere: bloom-prune (or the empty
         // intersection) yields no hits despite the common should.
         let hits = r
@@ -2215,7 +2215,7 @@ mod tests {
     #[test]
     fn token_match_no_match_returns_empty() {
         let st = seeded_three_doc_supertable();
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         let hits = r
             .token_match("title", "nonexistentterm", BoolMode::Or)
             .expect("tm");
@@ -2386,7 +2386,7 @@ mod tests {
         );
 
         // Cross-check every shape against token_match cardinality.
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         for (q, mode) in [
             ("alpha beta", BoolMode::Or),
             ("gamma delta", BoolMode::Or),
@@ -2437,7 +2437,7 @@ mod tests {
         ))
         .expect("append");
         w.commit().expect("commit");
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         for (q, mode) in [
             ("alpha", BoolMode::Or),
             ("alpha delta", BoolMode::Or),
@@ -2539,7 +2539,7 @@ mod tests {
         ))
         .expect("append");
         w.commit().expect("commit");
-        let r = st.reader();
+        let r = st.reader().expect("reader");
         for (q, mode) in [
             ("alpha -beta", BoolMode::Or),
             ("alpha gamma -delta", BoolMode::Or),

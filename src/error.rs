@@ -29,6 +29,7 @@ use crate::{
             BuildError as SupertableBuildError, CommitError as SupertableCommitError, OpenError,
             QueryError,
         },
+        manifest::ManifestLoadError,
         mutations::{CommitError as MutationCommitError, MutationError},
     },
 };
@@ -134,6 +135,19 @@ impl From<QueryError> for InfinoError {
     }
 }
 
+impl From<ManifestLoadError> for InfinoError {
+    fn from(e: ManifestLoadError) -> Self {
+        let msg = e.to_string();
+        match e {
+            // The table this handle was reading has been dropped and purged, so
+            // the name it was opened under no longer resolves to anything —
+            // `NotFound`, not a backend fault, is what a caller must react to.
+            ManifestLoadError::PointerVanished => InfinoError::NotFound(msg),
+            _ => InfinoError::Backend(msg),
+        }
+    }
+}
+
 impl From<SuperfileReadError> for InfinoError {
     fn from(e: SuperfileReadError) -> Self {
         if let Some(msg) = e.over_budget() {
@@ -181,6 +195,8 @@ impl From<MutationError> for InfinoError {
             MutationError::CardinalityMismatch { .. }
             | MutationError::MatchCountExceedsCap { .. } => InfinoError::Cardinality(msg),
             MutationError::SchemaMismatch(_) => InfinoError::Schema(msg),
+            // Matches the read path: a purged table's name resolves to nothing.
+            MutationError::TableGone => InfinoError::NotFound(msg),
             _ => InfinoError::Backend(msg),
         }
     }
