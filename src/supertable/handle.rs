@@ -173,6 +173,10 @@ pub(super) struct SupertableInner {
     /// (which rewrite the pointer without capturing its new etag) —
     /// the next probe then takes the full-read path and re-seeds it.
     pub(super) last_pointer_etag: Mutex<Option<String>>,
+    /// Set once this handle's pointer is seen deleted — its table was dropped
+    /// and purged elsewhere. Latched: the handle can only be discarded, and
+    /// `Connection::open_table` checks this before serving it from cache.
+    pub(super) pointer_vanished: OnceLock<()>,
     /// Cached SQL schemas, built once from the immutable `options` (lock-free
     /// lazy init). A pure function of the schema, so no snapshot invalidation
     /// (unlike `sql_session_cache`). See [`SqlSchemas`].
@@ -473,7 +477,19 @@ impl Supertable {
             .await
             .map_err(OpenError::ManifestLoadError)?;
         let (pointer, meta) = match probe {
-            PointerProbe::Absent | PointerProbe::NotModified => return Ok(false),
+            // Absent means the pointer was deleted — the table was
+            // dropped and purged. It is never "not committed yet": this handle
+            // exists, and every path that builds one over storage has a
+            // pointer by then (`open` fails with `PointerNotFound` without
+            // one; `create` publishes an empty manifest first). A handle with
+            // no storage never reaches here — `refresh` requires it above.
+            PointerProbe::Absent => {
+                let _ = self.inner.pointer_vanished.set(());
+                return Err(OpenError::ManifestLoadError(
+                    ManifestLoadError::PointerVanished,
+                ));
+            }
+            PointerProbe::NotModified => return Ok(false),
             PointerProbe::Read(pointer, meta) => (pointer, meta),
         };
         *self
@@ -619,6 +635,13 @@ impl Supertable {
         {
             debug!(error = %e, "manifest refresh failed; serving current snapshot");
         }
+    }
+
+    /// Whether this handle's table was dropped and purged elsewhere, seen as
+    /// its pointer disappearing during a freshness check. [`Self::ensure_fresh`]
+    /// swallows errors by design, so this latch is how that fact escapes.
+    pub(crate) fn pointer_vanished(&self) -> bool {
+        self.inner.pointer_vanished.get().is_some()
     }
 
     test_visible! {
@@ -1365,6 +1388,7 @@ async fn build_handle(
         hidden_index_open_error: std::sync::OnceLock::new(),
         last_pointer_check: Mutex::new(None),
         last_pointer_etag: Mutex::new(None),
+        pointer_vanished: OnceLock::new(),
         hidden_deleted_cache: Mutex::new(None),
         sql_schemas: OnceLock::new(),
     });

@@ -194,6 +194,11 @@ pub enum CommitError {
     /// loop later is non-breaking.
     #[error("write contention exhausted retries")]
     WriteContentionExhausted,
+
+    /// The pointer this commit would have fenced against is gone: the table
+    /// was dropped and purged while this handle stayed open. Not retryable.
+    #[error("manifest pointer was deleted while this handle was open")]
+    PointerVanished,
 }
 
 #[derive(Debug, Error)]

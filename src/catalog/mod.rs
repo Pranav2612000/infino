@@ -469,9 +469,11 @@ impl Connection {
                 handles,
                 building,
             } => {
-                // Warm path: lock-free sharded lookup, no serialization.
-                if let Some(handle) = handles.get(name) {
-                    return Ok(handle.clone());
+                // Warm path: lock-free sharded lookup, no serialization. A
+                // handle purged elsewhere is dropped here, so the cold path
+                // re-resolves it against the catalog.
+                if let Some(handle) = live_handle(handles, name) {
+                    return Ok(handle);
                 }
 
                 // Cold path: build once under the gate. Blocks here if a
@@ -481,8 +483,8 @@ impl Connection {
                 let _built = gate.lock().expect("catalog build gate poisoned");
 
                 // A peer may have built it while we waited on the gate.
-                if let Some(handle) = handles.get(name) {
-                    return Ok(handle.clone());
+                if let Some(handle) = live_handle(handles, name) {
+                    return Ok(handle);
                 }
 
                 let (body, _etag) = bridge_sync_to_async(read_catalog(root.as_ref()))
@@ -971,6 +973,22 @@ fn build_disk_cache(
     Ok(Some(cache))
 }
 
+/// The cached handle for `name`, or `None` (after evicting it) if its table was
+/// dropped and purged elsewhere — `handles` is per-process, so such a drop never
+/// reaches it. The `Ref` is dropped before `remove`, which would else deadlock.
+fn live_handle(
+    handles: &DashMap<String, SupertableHandle>,
+    name: &str,
+) -> Option<SupertableHandle> {
+    let entry = handles.get(name)?;
+    if !entry.pointer_vanished() {
+        return Some(entry.clone());
+    }
+    drop(entry);
+    handles.remove(name);
+    None
+}
+
 /// The per-name single-flight gate, created on first use. Returned as an owned
 /// `Arc` (not a `DashMap` reference) so the caller locks it *after* the map
 /// access returns, never holding a shard across the build's blocking I/O.
@@ -1061,6 +1079,7 @@ mod tests {
     use super::*;
     use crate::{
         BoolMode,
+        supertable::manifest::commit::POINTER_PATH,
         test_helpers::{build_title_batch, schema_id_title},
     };
 
@@ -1427,6 +1446,232 @@ mod tests {
             cold_after_q2, cold_after_q1,
             "second query must reuse the warm disk cache, not cold-fetch again"
         );
+    }
+
+    /// Every `_supertable/current` pointer file under `root`, recursively — the
+    /// on-storage evidence that a supertable exists.
+    fn pointer_files(root: &Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = fs::read_dir(root) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(pointer_files(&path));
+            } else if path.ends_with(POINTER_PATH) {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    /// Two connections over one storage root, the shape of a database served by
+    /// more than one process. One drops and purges a table; the other has it warm
+    /// in its per-process handle cache, which the drop never reaches, and must
+    /// stop serving it rather than answer from deleted superfiles forever.
+    #[test]
+    fn storage_purged_table_is_not_served_from_a_peer_connections_warm_handle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect(&uri).expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+
+        // Warm the peer's handle cache, and confirm it really is serving.
+        assert_eq!(count_rows(&peer, "docs"), 1, "peer reads the seeded row");
+
+        writer.drop_table("docs", true).expect("drop_table");
+
+        // The next freshness probe discovers the deletion, and it runs inside
+        // the query path after the cached handle was taken — so this call is the
+        // trigger and recovery lands on the one after it.
+        let _ = peer.query_sql("SELECT COUNT(*) FROM docs");
+
+        let err = peer
+            .open_table("docs")
+            .expect_err("the purged table must not open");
+        assert!(
+            matches!(err, InfinoError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+        let err = peer
+            .query_sql("SELECT COUNT(*) FROM docs")
+            .expect_err("the purged table must not be queryable");
+        assert!(
+            err.to_string().contains("docs"),
+            "the error should name the missing table, got {err:?}"
+        );
+    }
+
+    /// The same stale handle, written to rather than read from. A commit fences
+    /// on the pointer's etag, and an absent pointer used to mean "initial
+    /// commit" — republishing one from the stale manifest and resurrecting the
+    /// table under a name the catalog no longer lists. Hence the assertion on
+    /// storage state, not just on the error.
+    #[test]
+    fn storage_append_on_a_purged_handle_refuses_and_republishes_no_pointer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect(&uri).expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+
+        // Write once through the peer, so its handle carries real manifest state.
+        let peer_table = peer.open_table("docs").expect("peer opens the table");
+        peer_table
+            .append(&build_title_batch(&["peer row"]))
+            .expect("peer append before the drop");
+
+        writer.drop_table("docs", true).expect("drop_table");
+        assert!(
+            pointer_files(dir.path()).is_empty(),
+            "the purge should leave no pointer behind"
+        );
+
+        let err = peer_table
+            .append(&build_title_batch(&["after the drop"]))
+            .expect_err("appending to a purged table must fail");
+
+        assert!(
+            pointer_files(dir.path()).is_empty(),
+            "the refused append must not republish a pointer (resurrecting the \
+             dropped table as unreachable, unreclaimable data): {err:?}"
+        );
+        assert!(
+            writer.list_tables().expect("list").is_empty(),
+            "the table stays dropped"
+        );
+    }
+
+    /// Drop-then-recreate through different connections: the name is back, but at
+    /// a fresh location, so the peer must rebuild rather than serve the old rows.
+    #[test]
+    fn storage_recreated_table_after_a_peer_drop_reads_the_new_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect(&uri).expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["old one", "old two", "old three"]))
+            .expect("append");
+        assert_eq!(count_rows(&peer, "docs"), 3, "peer warms on the old table");
+
+        writer.drop_table("docs", true).expect("drop_table");
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("re-create")
+            .append(&build_title_batch(&["new one"]))
+            .expect("append to the new generation");
+
+        // Trip the peer's freshness probe (see the read-path test above).
+        let _ = peer.query_sql("SELECT COUNT(*) FROM docs");
+        assert_eq!(
+            count_rows(&peer, "docs"),
+            1,
+            "peer must rebuild against the re-created table, not serve the \
+             dropped generation's rows"
+        );
+    }
+
+    /// The same purge, against a peer handle that has never served a read.
+    ///
+    /// Freshness is discovered by re-probing the pointer, and the probe carries
+    /// the etag of the last one read — which only a previous probe sets. So a
+    /// handle built but not yet queried has no etag, and neither does one on a
+    /// backend that omits them. Keying "did we have a pointer?" on that etag
+    /// therefore reads this deletion as "nothing newer to load", and since the
+    /// miss also leaves the etag unset, every later probe repeats it: the
+    /// handle serves the purged table off its in-memory manifest for as long
+    /// as the process lives, and a re-create never reaches it either. The
+    /// pointer's absence is what makes it fatal — not our record of it.
+    #[test]
+    fn storage_purged_table_is_not_served_from_a_handle_that_never_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let writer = connect(&uri).expect("connect writer");
+        let peer = connect(&uri).expect("connect peer");
+
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["old one", "old two", "old three"]))
+            .expect("append");
+
+        // Warm the peer's handle cache *without* querying through it, so no
+        // freshness probe has run and no pointer etag has been recorded.
+        peer.open_table("docs").expect("peer opens the table");
+
+        writer.drop_table("docs", true).expect("drop_table");
+
+        // Trip the probe (it runs inside the query path, after the cached
+        // handle has been taken — so recovery lands on the call after it).
+        let _ = peer.query_sql("SELECT COUNT(*) FROM docs");
+
+        let err = peer
+            .query_sql("SELECT COUNT(*) FROM docs")
+            .expect_err("the purged table must not be queryable");
+        assert!(
+            !err.to_string().contains(".sf.parquet"),
+            "the peer must report the table gone, not fail fetching a purged \
+             superfile off its stale manifest: {err:?}"
+        );
+
+        // And the handle is genuinely replaced, not just poisoned: a re-create
+        // under the same name is visible to this connection.
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("re-create")
+            .append(&build_title_batch(&["new one"]))
+            .expect("append to the new generation");
+        assert_eq!(
+            count_rows(&peer, "docs"),
+            1,
+            "peer must rebuild against the re-created table"
+        );
+    }
+
+    /// The premise the read-path check rests on: `create` publishes a pointer
+    /// before any writer runs, so a table with nothing appended to it still has
+    /// one and reads as empty. That is what makes an *absent* pointer
+    /// unambiguous — never "not committed yet", always "deleted under us".
+    #[test]
+    fn storage_table_with_no_appends_still_reads_as_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let conn = connect(&uri).expect("connect");
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+
+        assert_eq!(
+            count_rows(&conn, "docs"),
+            0,
+            "an unwritten table reads empty"
+        );
+        conn.open_table("docs")
+            .expect("an unwritten table still opens");
+
+        // And from a second connection, which builds its handle from scratch.
+        let peer = connect(&uri).expect("connect peer");
+        assert_eq!(count_rows(&peer, "docs"), 0);
     }
 
     /// A server holds one `Connection` and fans out concurrent queries. Many
