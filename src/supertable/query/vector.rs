@@ -1317,17 +1317,27 @@ impl SupertableReader {
         if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
             let cell_routing = if hidden_vector_index {
                 let base = hidden_routing.expect("hidden manifest carries routing");
-                if filtered && options.nprobe.is_some() {
-                    // Explicit caller `nprobe` on a FILTERED query pins the
-                    // hidden cell sweep — the width dial calibration and
-                    // the bench sweep turn (depth stays at the filtered
-                    // default so the sweep isolates width). Unfiltered
-                    // hidden routing keeps ignoring caller nprobe
-                    // (persisted params own it).
+                if options.nprobe.is_some() && (filtered || options.widen_unfiltered_hidden_cells) {
+                    // Explicit caller `nprobe` pins the hidden cell sweep. FILTERED
+                    // queries always honor it (the width-dial calibration and the
+                    // filtered sweep). UNFILTERED hidden queries honor it only when
+                    // `widen_unfiltered_hidden_cells` is set — a diagnostic whose
+                    // setter is `#[cfg(feature = "test-helpers")]`, so it is
+                    // unreachable from the production public API and used only by
+                    // the recall breadth-sweep bench. In production the flag is
+                    // always `false`, so an explicit `nprobe` on an unfiltered
+                    // hidden query keeps the persisted p=1 routing (the `else` arms
+                    // below) — `with_nprobe` does not change serving behavior.
+                    // Filtered queries additionally lift per-cell fine depth to the
+                    // filtered floor; unfiltered keeps the persisted fine depth.
                     CellRoutingParams {
                         nprobe_min: nprobe.max(1),
                         nprobe_max: nprobe.max(1),
-                        fine_nprobe: base.fine_nprobe.max(FILTERED_HIDDEN_FINE_NPROBE),
+                        fine_nprobe: if filtered {
+                            base.fine_nprobe.max(FILTERED_HIDDEN_FINE_NPROBE)
+                        } else {
+                            base.fine_nprobe
+                        },
                         ..base
                     }
                 } else if filtered {
