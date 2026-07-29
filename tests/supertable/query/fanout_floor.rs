@@ -49,7 +49,7 @@ use infino::{
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
-        fts::reader::BoolMode,
+        fts::reader::{Bm25Stats, BoolMode},
     },
     supertable::{
         Supertable, SupertableOptions,
@@ -385,7 +385,14 @@ fn fanout_floor_decomposition() {
         // arithmetic `_id` resolve, no Parquet involvement.
         let (ids_p50, ids_flt) = time_p50(|| {
             let b = reader
-                .bm25_search("title", term, K, BoolMode::Or, None)
+                .bm25_search(
+                    "title",
+                    term,
+                    K,
+                    BoolMode::Or,
+                    Bm25Stats::PerSuperfile,
+                    None,
+                )
                 .expect("bm25_search");
             std::hint::black_box(b);
         });
@@ -399,6 +406,7 @@ fn fanout_floor_decomposition() {
                     term,
                     K,
                     BoolMode::Or,
+                    Bm25Stats::PerSuperfile,
                     Some(&["_id", "title", "score"]),
                 )
                 .expect("bm25_search");

@@ -47,7 +47,7 @@ use infino::{
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::{FtsConfig, VectorConfig},
-        fts::reader::BoolMode,
+        fts::reader::{Bm25Stats, BoolMode},
         vector::{distance::Metric, rerank_codec::RerankCodec},
     },
     supertable::{Supertable, SupertableOptions},
@@ -330,7 +330,14 @@ async fn reader_loop(
         let _ = black_box(
             st.reader()
                 .expect("reader")
-                .bm25_search(QUERY_FIELD, QUERY_TERM, TOP_K, BoolMode::Or, None)
+                .bm25_search(
+                    QUERY_FIELD,
+                    QUERY_TERM,
+                    TOP_K,
+                    BoolMode::Or,
+                    Bm25Stats::PerSuperfile,
+                    None,
+                )
                 .expect("bm25_search"),
         );
         if phase_start.elapsed() > warmup {

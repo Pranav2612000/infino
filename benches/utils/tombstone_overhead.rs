@@ -47,7 +47,7 @@ use arrow_array::RecordBatch;
 use chrono::Utc;
 use infino::{
     storage::{LocalFsStorageProvider, StorageProvider},
-    superfile::fts::reader::BoolMode,
+    superfile::fts::reader::{Bm25Stats, BoolMode},
     supertable::{
         Supertable,
         wal::{
@@ -245,7 +245,14 @@ fn measure_fts(st: &Supertable) -> Duration {
     let warm = st
         .reader()
         .expect("reader")
-        .bm25_search("title", QUERY_TERM, TOP_K, BoolMode::Or, None)
+        .bm25_search(
+            "title",
+            QUERY_TERM,
+            TOP_K,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+            None,
+        )
         .expect("fts");
     black_box(warm);
     let mut samples = Vec::with_capacity(ITERS);
@@ -259,6 +266,7 @@ fn measure_fts(st: &Supertable) -> Duration {
                 black_box(QUERY_TERM),
                 black_box(TOP_K),
                 BoolMode::Or,
+                Bm25Stats::PerSuperfile,
                 None,
             )
             .expect("fts");

@@ -14,7 +14,7 @@ use arrow_array::Array;
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
     storage::{LocalFsStorageProvider, StorageProvider},
-    superfile::fts::reader::BoolMode,
+    superfile::fts::reader::{Bm25Stats, BoolMode},
     supertable::{
         Supertable,
         mutations::MutationError,
@@ -125,7 +125,14 @@ async fn writer_delete_tombstones_matching_rows() {
     let hits = st
         .reader()
         .expect("reader")
-        .bm25_search("title", "bravo", FTS_TOP_K, BoolMode::Or, None)
+        .bm25_search(
+            "title",
+            "bravo",
+            FTS_TOP_K,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+            None,
+        )
         .expect("fts");
     let n_rows: usize = hits.iter().map(|b| b.num_rows()).sum();
     assert_eq!(n_rows, 0, "expected zero hits for tombstoned token");
@@ -201,7 +208,14 @@ async fn delete_is_visible_to_other_handles_on_next_query() {
     let n_rows: usize = reader_handle
         .reader()
         .expect("reader")
-        .bm25_search("title", "bravo", FTS_TOP_K, BoolMode::Or, None)
+        .bm25_search(
+            "title",
+            "bravo",
+            FTS_TOP_K,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+            None,
+        )
         .expect("pre-delete fts")
         .iter()
         .map(|b| b.num_rows())
@@ -223,7 +237,14 @@ async fn delete_is_visible_to_other_handles_on_next_query() {
     let n_rows: usize = reader_handle
         .reader()
         .expect("reader")
-        .bm25_search("title", "bravo", FTS_TOP_K, BoolMode::Or, None)
+        .bm25_search(
+            "title",
+            "bravo",
+            FTS_TOP_K,
+            BoolMode::Or,
+            Bm25Stats::PerSuperfile,
+            None,
+        )
         .expect("post-delete fts")
         .iter()
         .map(|b| b.num_rows())

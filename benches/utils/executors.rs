@@ -779,11 +779,18 @@ pub mod fts {
 
     impl FtsRead for SupertableReader {
         fn bm25_rows(&self, column: &str, query: &str, k: usize, mode: InfinoBoolMode) -> usize {
-            self.bm25_search(column, query, k, mode, None)
-                .expect("supertable bm25_search")
-                .iter()
-                .map(|b| b.num_rows())
-                .sum()
+            self.bm25_search(
+                column,
+                query,
+                k,
+                mode,
+                infino::Bm25Stats::PerSuperfile,
+                None,
+            )
+            .expect("supertable bm25_search")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum()
         }
 
         fn bm25_rows_fetched(
@@ -793,11 +800,18 @@ pub mod fts {
             k: usize,
             mode: InfinoBoolMode,
         ) -> usize {
-            self.bm25_search(column, query, k, mode, Some(&["_id", column, "score"]))
-                .expect("supertable bm25_search fetched")
-                .iter()
-                .map(|b| b.num_rows())
-                .sum()
+            self.bm25_search(
+                column,
+                query,
+                k,
+                mode,
+                infino::Bm25Stats::PerSuperfile,
+                Some(&["_id", column, "score"]),
+            )
+            .expect("supertable bm25_search fetched")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum()
         }
 
         fn bm25_payloads(
@@ -808,10 +822,24 @@ pub mod fts {
             mode: InfinoBoolMode,
         ) -> ((u64, u64), (u64, u64)) {
             let search = self
-                .bm25_search(column, query, k, mode, None)
+                .bm25_search(
+                    column,
+                    query,
+                    k,
+                    mode,
+                    infino::Bm25Stats::PerSuperfile,
+                    None,
+                )
                 .expect("supertable bm25_search payload");
             let fetched = self
-                .bm25_search(column, query, k, mode, Some(&["_id", column, "score"]))
+                .bm25_search(
+                    column,
+                    query,
+                    k,
+                    mode,
+                    infino::Bm25Stats::PerSuperfile,
+                    Some(&["_id", column, "score"]),
+                )
                 .expect("supertable bm25_search fetched payload");
             (payload_bytes(&search), payload_bytes(&fetched))
         }
