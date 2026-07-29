@@ -37,7 +37,7 @@ pub mod term_range;
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     f32::consts::PI,
     fmt,
     ops::Deref,
@@ -363,6 +363,7 @@ impl ManifestSnapshot {
             Vec::new(),
             vector_index_storage_prefix.clone(),
             BTreeMap::new(),
+            BTreeMap::new(),
         );
         let loader = options.storage.as_ref().map(|storage| {
             Arc::new(ManifestPartLoader::new_with_cache(
@@ -397,6 +398,7 @@ impl ManifestSnapshot {
         parts: Vec<ManifestPartEntry>,
         vector_index_storage_prefix: Option<String>,
         tombstone_seqs: BTreeMap<Uuid, u64>,
+        superseded_cells: BTreeMap<Uuid, BTreeSet<u32>>,
     ) -> Manifest {
         Manifest {
             format_version: LIST_FORMAT_VERSION.into(),
@@ -432,6 +434,7 @@ impl ManifestSnapshot {
             slow_vector_state_centroids: None,
             parts,
             tombstone_seqs,
+            superseded_cells,
         }
     }
 
@@ -1351,11 +1354,52 @@ impl ManifestSnapshot {
         }
     }
 
+    /// Successor snapshot with `additions` merged (union per superfile) into
+    /// the superseded-cell map. Used to stamp a cell split's parents in the
+    /// same OCC commit as the child superfiles, so the marker lands atomically
+    /// with the membership that makes it meaningful. In-process-only manifests
+    /// (no persisted list) have nothing to stamp and pass through unchanged.
+    pub fn with_superseded_cells_added(&self, additions: &BTreeMap<Uuid, BTreeSet<u32>>) -> Self {
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            for (superfile_id, cells) in additions {
+                list.superseded_cells
+                    .entry(*superfile_id)
+                    .or_default()
+                    .extend(cells.iter().copied());
+            }
+            list
+        });
+        Self {
+            superfile_list: SuperfileList {
+                manifest_id: self.manifest_id,
+                options: Arc::clone(&self.options),
+                superfiles: self.superfiles.clone(),
+                vector_index_storage_prefix: self.vector_index_storage_prefix.clone(),
+            },
+            list: new_list.or_else(|| self.list.clone()),
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+        }
+    }
+
     /// The persisted list's per-superfile tombstone-seq map. `None`
     /// for in-process-only manifests (no persisted list ⇒ no sidecars
     /// can exist).
     pub fn get_tombstone_seqs(&self) -> Option<&BTreeMap<Uuid, u64>> {
         self.list.as_ref().map(|l| &l.tombstone_seqs)
+    }
+
+    /// The persisted list's per-superfile superseded-cell map: for each
+    /// superfile, the set of cell ids whose on-disk blocks are dead
+    /// (replaced in place by a cell split). Readers exclude these cells
+    /// from routing so their stale blocks are never selected or fetched.
+    /// `None` for in-process-only manifests (no persisted list).
+    pub fn get_superseded_cells(&self) -> Option<&BTreeMap<Uuid, BTreeSet<u32>>> {
+        self.list.as_ref().map(|l| &l.superseded_cells)
     }
 
     /// Build a successor manifest identical to `self` except that every
@@ -1737,6 +1781,12 @@ impl ManifestSnapshot {
             .map(|list| list.tombstone_seqs.clone())
             .unwrap_or_default();
         tombstone_seqs.retain(|id, _| !ids_to_remove.contains(id));
+        let mut superseded_cells = self
+            .list
+            .as_ref()
+            .map(|list| list.superseded_cells.clone())
+            .unwrap_or_default();
+        superseded_cells.retain(|id, _| !ids_to_remove.contains(id));
 
         let opts_hash = options_hash::compute_options_hash(opts.as_ref(), &strategy);
         let vector_columns: Vec<list::VectorColumnInfo> = opts
@@ -1756,6 +1806,7 @@ impl ManifestSnapshot {
             // the user manifest.
             drained_ranges: self.get_drained_ranges(),
             tombstone_seqs,
+            superseded_cells,
             format_version: LIST_FORMAT_VERSION.into(),
             manifest_id: self.get_next_manifest_id(),
             options_hash: opts_hash,
@@ -4297,6 +4348,7 @@ mod tests {
                 drained_ranges: Default::default(),
                 global_vector_index: None,
                 tombstone_seqs: Default::default(),
+                superseded_cells: Default::default(),
                 format_version: LIST_FORMAT_VERSION.into(),
                 manifest_id: 1,
                 options_hash: ContentHash([0u8; 32]),
@@ -4601,6 +4653,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),
@@ -4777,6 +4830,7 @@ mod tests {
                 drained_ranges: Default::default(),
                 global_vector_index: None,
                 tombstone_seqs: Default::default(),
+                superseded_cells: Default::default(),
                 format_version: list::FORMAT_VERSION.into(),
                 manifest_id: 0,
                 options_hash: ContentHash([0u8; 32]),
@@ -4884,6 +4938,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
@@ -5008,6 +5063,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
@@ -5216,6 +5272,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
@@ -5474,6 +5531,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -5624,6 +5682,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -5832,6 +5891,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -5932,6 +5992,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -6059,6 +6120,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -6176,6 +6238,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -6309,6 +6372,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -6452,6 +6516,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -6609,6 +6674,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -6828,6 +6894,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -6925,6 +6992,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -7038,6 +7106,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -7174,6 +7243,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -7305,6 +7375,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -7393,6 +7464,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -7499,6 +7571,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -7628,6 +7701,7 @@ mod tests {
             drained_ranges: Default::default(),
             global_vector_index: None,
             tombstone_seqs: Default::default(),
+            superseded_cells: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),

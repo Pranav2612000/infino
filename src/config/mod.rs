@@ -246,13 +246,12 @@ pub const DEFAULT_GC_SAFETY_GAP: Duration = Duration::from_secs(86_400);
 
 // Vector-tuning defaults. Kept equal to the historical inline
 // literals so folding these knobs into config preserves behavior.
-/// Default overflow threshold before a merged cell superfile is split. STOPGAP:
-/// Max docs in a global cell before compaction splits it in two. Set high: a
-/// cell this size serves well on its own (the per-cell fine IVF prunes within
-/// it), so the grid stays coarse and split-free at <= 10M (cells stay ~156K at
-/// 64 cells even at 10M). The split engages only at 100M/1B to bound cell size;
-/// lower this if higher-scale recall needs a finer grid.
+/// Default cell-split doc cap; must equal config.yaml `cell_split_doc_cap` (see
+/// there for the rationale behind the large 500K value).
 const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 500_000;
+/// Default modality-split threshold; `0.0` = off. Must equal config.yaml
+/// `cell_split_modality_d` (see there for the working value and why it ships on).
+const DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D: f64 = 8.0;
 /// Default k-means training points per centroid for per-cell sub-builds.
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
 /// Default per-cell fine-probe floor: the minimum fine IVF clusters probed
@@ -360,6 +359,11 @@ pub struct VectorSettings {
     /// Doc count above which a merged cell superfile is split into two
     /// sub-cells during hidden-index maintenance.
     pub cell_split_doc_cap: u64,
+    /// Ashman-D threshold that triggers a modality-driven cell split. `0.0`
+    /// keeps the plain `cell_split_doc_cap` trigger; `> 0` splits a cell whose
+    /// tentative two-means partition is bimodal by at least this D (with
+    /// `cell_split_doc_cap` demoted to a hard ceiling).
+    pub cell_split_modality_d: f64,
     /// How user-superfile clusters align to the global cell grid.
     pub user_centroids: CentroidAlignment,
     /// User superfiles the hidden-index drain materializes per batch
@@ -410,6 +414,7 @@ impl Default for VectorSettings {
             rerank_codec: RerankCodec::default(),
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
+            cell_split_modality_d: DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D,
             user_centroids: CentroidAlignment::Local,
             drain_batch_superfiles: DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES,
             drain_replica_target_factor: DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR,

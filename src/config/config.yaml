@@ -157,14 +157,43 @@ vector:
   # Doc count above which a merged cell superfile is split into two
   # sub-cells during hidden-index maintenance.
   #
-  # Max docs in a global cell before compaction splits it into two. A cell this
-  # size serves fine on its own (bench: ~500K docs/cell → recall 0.994, ~17 MiB
-  # per query, since the per-cell fine IVF prunes within the cell), so the cap is
-  # set high to keep the grid coarse and split-free at ≤10M (at 64 cells, cells
-  # stay ~156K even at 10M). The split only engages at 100M/1B, where it bounds
-  # cell size so build/query cost stays flat; lower this if higher-scale recall
-  # needs a finer grid.
+  # Max docs in a global cell before it is split (hard ceiling). With the
+  # modality trigger on by default (cell_split_modality_d > 0) this cap is the
+  # upper backstop; set cell_split_modality_d = 0 to make the cap the sole
+  # trigger.
+  #
+  # 500K, deliberately large. A brief experiment lowered this to 40K (≈ the size
+  # 256 cells reach at 10M) on the theory that cells must be kept small — that was
+  # wrong. On a synthetic multi-modal stress corpus at nprobe=1, native no-split
+  # cells at 100M/256 (~390K docs/cell) hold ~0.98 recall@10 — stable, not
+  # decaying — so the split is NOT needed to keep recall from cratering at these
+  # sizes; forcing a split down to 40K instead over-fragments the grid under
+  # streaming (cell count runs away → boundary loss → recall craters). The large
+  # cap therefore makes the default path native-ish: it splits only genuinely
+  # huge cells (100M/256 = 390K < 500K → no split; ~1B/256 = 3.9M → splits).
+  # ~0.98 here is the nprobe=1 floor on this stress corpus, not a target — to lift
+  # it, raise fine_nprobe_pct (within-cell depth) or enable cell_split_modality_d
+  # (finer grid, ~0.99 measured). Lower this cap only if a measured within-cell
+  # ceiling shows up at some large docs/cell.
   cell_split_doc_cap: 500000
+
+  # Ashman-D threshold for a modality-driven split. Spread measured on the axis
+  # between a tentative two-means partition's centroids (so it isn't diluted by
+  # the ~1023 dimensions the split doesn't separate). A k=2 split of a single mode
+  # scores ~3 (half-normal baseline); two separated modes score in the
+  # tens-to-hundreds. With this > 0, cell_split_doc_cap becomes a hard ceiling and
+  # cells track natural cluster boundaries: the recursion counts modes K, a cell
+  # with K > MODALITY_MODES_PER_CELL (=4) splits into ceil(K/4) children, and the
+  # executor self-tunes k up for route fidelity.
+  #
+  # 8.0 (ON) is the default. The modality split lifts nprobe=1 recall above the
+  # fixed 256-cell grid's ~0.98 floor where the grid is too coarse — most clearly
+  # at small scale (~0.998 vs ~0.94 at 100K, ~0.997 vs ~0.962 at 1M) and slightly
+  # ahead at scale (0.991 vs 0.983 at 10M). The finer grid (~14x the cells) adds
+  # per-cell drain generations, but compaction consolidates them
+  # (compaction_min_fill_percent = 0), so post-compact cold GET stays bounded.
+  # Set 0.0 to fall back to the fixed-grid path (cap trigger only).
+  cell_split_modality_d: 8.0
 
   # How user-superfile clusters align to the global cell grid:
   #   local  — per-superfile k-means (default).
@@ -223,10 +252,11 @@ vector:
   #
   # 0 disables the byte floor, so a cell consolidates on fragment count alone
   # (the >= 2 merge floor): drain generations collapse and post-compact cold
-  # GET stays at the post-drain level. This is safe now that the post-compaction
-  # cell split is disabled (see cell_split_doc_cap) — merging no longer triggers
-  # the broken split path. Contrast the user table, which keeps an 80% floor to
-  # amortize writes on its transient data.
+  # GET stays at the post-drain level. Safe because the cell split is now the
+  # in-place append-child split (validated), so a merge that pushes a cell over
+  # the cap (or into multimodality with the trigger on) splits it correctly
+  # rather than hitting the old broken post-merge split path. Contrast the user
+  # table, which keeps an 80% floor to amortize writes on its transient data.
   compaction_target_mb: 2048
   compaction_min_fill_percent: 0
   compaction_max_memory_mb: 4096

@@ -12,12 +12,17 @@
 //!   3. Compaction merges multiple small IVF superfiles per cell toward one packed
 //!      base via the standard `merge_superfiles` path.
 //!   4. Locally refresh touched cell centroids and counts.
-//!   5. Split overflow cells (Sq8+ε k-means, N→N+1 centroids).
-//!   6. Reassign vectors in the split neighborhood (P−1, P, P₂, P+1).
-//!   7. Redrive reassigned rows through the incoming staging region; route
-//!      them into per-cell IVF superfiles (same path as commit ingest).
+//!   5. Split overflow cells in place: partition an over-cap cell into K
+//!      children (Sq8+ε capacitated k-means; K self-tuned upward from
+//!      ⌈rows/cap⌉ until each child's rows route to it at nprobe=1),
+//!      append the K children as one packed superfile (child 0 keeps the cell
+//!      id, the rest appended), and mark the parent cell superseded in the
+//!      manifest — no rewrite, no removal at split time.
+//!   6. Readers, per-cell counts, merges, and split selection all skip the
+//!      superseded parent; its blocks are logically dead.
+//!   7. Compaction later reclaims the superseded parent's dead blocks.
 //!
-//! Split/reassign stays on stored Sq8+ε bytes. Row assignment dequantizes
+//! Split stays on stored Sq8+ε bytes. Row assignment dequantizes
 //! manifest centroids and rows to fp32 before [`distance`]; rows are
 //! re-spliced with [`encode_encoded_rows`], never decoded to full fp32 corpora.
 
@@ -28,9 +33,9 @@ use crate::{
     superfile::vector::{
         cell_posting::{
             EncodedCellRow, dequantize_sq8_residual_into, manifest_centroid_components_from_row,
-            medoid_index_by,
         },
         distance::{Metric, distance, nearest_k_centroids_transposed, relative_score_window},
+        kmeans::{kmeans, kmeans_pp},
     },
     supertable::manifest::{
         ClusterCentroids, RABITQ_ADMIT_CELL_SHORTLIST_FRACTION, RABITQ_ADMIT_CELL_SHORTLIST_MIN,
@@ -38,7 +43,7 @@ use crate::{
     },
 };
 
-/// Overflow threshold for cell split (OPANN step 7). Sourced from
+/// Overflow threshold for cell split. Sourced from
 /// `vector.cell_split_doc_cap`.
 pub(crate) fn cell_split_doc_cap() -> u64 {
     config::global().vector.cell_split_doc_cap
@@ -47,6 +52,44 @@ pub(crate) fn cell_split_doc_cap() -> u64 {
 /// True when a merged cell superfile should be split into two sub-cells.
 pub(crate) fn split_overflow_needed(n_docs: u64) -> bool {
     n_docs > cell_split_doc_cap()
+}
+
+/// Ashman-D threshold that triggers a modality-driven split, or `0.0` when the
+/// plain [`cell_split_doc_cap`] trigger is in force. Sourced from
+/// `vector.cell_split_modality_d`.
+pub(crate) fn cell_split_modality_d() -> f64 {
+    config::global().vector.cell_split_modality_d
+}
+
+/// Target number of *whole* modes grouped per cell for the modality trigger. A
+/// cell holding `<= R` modes is healthy and left whole; one holding more splits
+/// into `ceil(K/R)` children of ~R whole modes each. Grouping (R>1), not
+/// one-mode-per-cell, because 1-mode/cell routes *worst* at nprobe=1 (measured
+/// 0.967 vs 0.996 at 4/cell) — tight one-mode centroids mis-route boundary
+/// queries. The `<= R` stop bounds the grid: children settle at `<= R` modes and
+/// aren't re-split, so the cell count converges rather than running away.
+const MODALITY_MODES_PER_CELL: usize = 4;
+
+/// Smallest cell (in live rows) the modality recursion will split — a pure
+/// sliver-guard tied to the fine-IVF granularity (a child needs ~≥2 fine
+/// clusters at `kmeans_pts_per_centroid`≈64 to be viable), NOT a mode-isolation
+/// bar. It must sit *below* the natural mode size at every scale, or the
+/// recursion can't reach one-mode leaves: e.g. at a 200k drain (mode ≈195 docs)
+/// a floor of 512 stops recursion at ~390-doc 2-mode leaves, which then grow
+/// past 512 and re-split every batch → runaway over-fragmentation (200k×5 →
+/// 1759 cells / 0.758). At 128 the D-stop (unimodal) governs instead, so the
+/// recursion isolates one-mode leaves at any scale. Larger scales are
+/// unaffected (their modes ≫ any small floor; the D-stop fires first).
+pub(crate) const MODALITY_MIN_CELL_DOCS: u64 = 128;
+
+/// True when a cell is a *candidate* for the modality-driven split — either it
+/// overflows the hard cap, or the modality trigger is on and the cell is large
+/// enough to test. The actual split decision (Ashman D) is made in
+/// [`crate::supertable::writer::split_overflow_cell`], where the rows are
+/// resident; this only gates which cells that decision runs on.
+pub(crate) fn split_candidate(n_docs: u64) -> bool {
+    split_overflow_needed(n_docs)
+        || (cell_split_modality_d() > 0.0 && n_docs >= MODALITY_MIN_CELL_DOCS)
 }
 
 /// Append-only count bookkeeping for touched cells.
@@ -85,6 +128,32 @@ pub(crate) const REPLICA_CLOSURE_MAX_REPLICAS: usize = 3;
 /// cell, not only the single second-nearest.
 pub(crate) const REPLICA_CLOSURE_DISTANCE_RATIO: f32 = 1.2;
 
+/// K-means sample size for the cell-split planner: `clusters × this`, floored
+/// at [`SPLIT_KMEANS_SAMPLE_MIN`]. Centroids train on a strided sample of the
+/// cell, then the full cell is assigned under `metric`.
+const SPLIT_KMEANS_SAMPLE_PER_CLUSTER: usize = 2048;
+/// Lower bound on the split planner's k-means training sample.
+const SPLIT_KMEANS_SAMPLE_MIN: usize = 4096;
+/// Lloyd iterations for the split planner's k-means — short, since it trains on
+/// a sample and the per-child pack re-trains fine centroids downstream.
+const SPLIT_KMEANS_ITERS: usize = 10;
+/// Fixed XOR mixed into the split cell id to seed the split's k-means, keeping
+/// its PRNG stream distinct from other per-cell seeds.
+const SPLIT_KMEANS_SEED_XOR: u64 = 0x5157_5f4b_4d45_414e;
+/// Route-fidelity target for the self-tuning split: the fraction of rows that
+/// must land in their NEAREST sub-centroid (== query routing) for a split to be
+/// accepted. Below this, a cell can't be cleanly partitioned at the current `k`
+/// (its natural groups are bigger than the per-child capacity, forcing docs off
+/// their nearest centroid → nprobe=1 misses), so the planner tries a larger `k`.
+const SPLIT_ROUTE_FIDELITY_TARGET: f64 = 0.97;
+/// Multiplicative step when the self-tuning split raises `k` to chase route
+/// fidelity (more, smaller children → each holds fewer whole groups → less
+/// capacity-forced displacement).
+const SPLIT_SELF_TUNE_K_STEP: f64 = 1.5;
+/// Cap on how far the self-tuning split may raise `k` above the cap-minimum
+/// `⌈rows/cap⌉`. Bounds the extra children (and the retry cost) when even a fine
+/// split can't reach the fidelity target (near-degenerate / one-giant-blob).
+const SPLIT_SELF_TUNE_K_MAX_FACTOR: usize = 4;
 /// Primary cell assignment plus the row's replica-candidate cells.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct BoundaryAssignment {
@@ -95,27 +164,6 @@ pub(crate) struct BoundaryAssignment {
     /// the boundary and therefore a better replication candidate. Fixed-size
     /// (`None`-padded) so the per-row hot assign path stays allocation-free.
     pub replicas: [Option<(u32, f32)>; REPLICA_CLOSURE_MAX_REPLICAS],
-}
-
-fn score_row_against_cell(
-    clusters: &ClusterCentroids,
-    metric: Metric,
-    cell: usize,
-    row: &EncodedCellRow,
-) -> f32 {
-    let dim = clusters.dim as usize;
-    let mut row_fp = vec![0f32; dim];
-    dequantize_sq8_residual_into(
-        &row.scale,
-        &row.offset,
-        &row.codes,
-        &row.residuals,
-        row.rerank_codec
-            .residual_divisor()
-            .expect("encoded row uses residual-family codec"),
-        &mut row_fp,
-    );
-    distance(metric, &row_fp, clusters.centroid(cell))
 }
 
 fn boundary_margin(
@@ -263,95 +311,6 @@ fn boundary_from_ranked(
     BoundaryAssignment { primary, replicas }
 }
 
-/// One-cluster [`ClusterCentroids`] prototype from a Sq8+ε row (split k-means seeds).
-fn centroid_prototype_from_row(
-    template: &ClusterCentroids,
-    row: &EncodedCellRow,
-) -> ClusterCentroids {
-    let dim = template.dim as usize;
-    let fp32 = manifest_centroid_components_from_row(row, dim);
-    ClusterCentroids::from_fp32(1, template.dim, &fp32, vec![1])
-}
-
-fn fp32_distance_between_rows(metric: Metric, a: &EncodedCellRow, b: &EncodedCellRow) -> f32 {
-    debug_assert_eq!(a.rerank_codec, b.rerank_codec);
-    let dim = a.scale.len();
-    let mut af = vec![0f32; dim];
-    let mut bf = vec![0f32; dim];
-    let divisor = a
-        .rerank_codec
-        .residual_divisor()
-        .expect("encoded row uses residual-family codec");
-    dequantize_sq8_residual_into(
-        &a.scale,
-        &a.offset,
-        &a.codes,
-        &a.residuals,
-        divisor,
-        &mut af,
-    );
-    dequantize_sq8_residual_into(
-        &b.scale,
-        &b.offset,
-        &b.codes,
-        &b.residuals,
-        divisor,
-        &mut bf,
-    );
-    distance(metric, &af, &bf)
-}
-
-/// Medoid index under fp32 dequant + [`distance`] row↔row (discrete k-means
-/// centroid update).
-fn medoid_index(metric: Metric, shard: &[&EncodedCellRow]) -> usize {
-    medoid_index_by(shard, |a, b| fp32_distance_between_rows(metric, a, b))
-}
-
-/// 2-way Lloyd k-means on Sq8+ε overflow rows. Returns manifest centroid
-/// components (dim each) for the two sub-cells.
-/// Plan a binary split of `split_cell`: returns the two sub-cell centroids and,
-/// aligned to `rows`, a `0/1` assignment of each row to sub-cell 0 / sub-cell 1
-/// (reconciled with the empty-shard fixups, so it exactly matches the two
-/// shards the centroids were derived from). The caller routes the cell's
-/// materialized rows into the two sub-cells by this assignment.
-/// The two diameter endpoints of `split_cell`'s rows: `seed1` is the row
-/// farthest from the cell's existing centroid (an extreme edge point); `seed0`
-/// is the row farthest from `seed1` (the opposite edge). The `seed0 → seed1`
-/// line is the axis the split bisects along. Picking closest-to-centroid vs
-/// farthest instead would seed a radius (center + edge), peeling a thin shell
-/// off the dense core.
-fn pick_split_seeds(
-    rows: &[&EncodedCellRow],
-    clusters: &ClusterCentroids,
-    split_cell: usize,
-    metric: Metric,
-) -> (usize, usize) {
-    let seed1 = rows
-        .iter()
-        .copied()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| {
-            score_row_against_cell(clusters, metric, split_cell, a)
-                .partial_cmp(&score_row_against_cell(clusters, metric, split_cell, b))
-                .unwrap_or(Ordering::Equal)
-        })
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    let cent1 = centroid_prototype_from_row(clusters, rows[seed1]);
-    let seed0 = rows
-        .iter()
-        .copied()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| {
-            score_row_against_cell(&cent1, metric, 0, a)
-                .partial_cmp(&score_row_against_cell(&cent1, metric, 0, b))
-                .unwrap_or(Ordering::Equal)
-        })
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    (seed0, seed1)
-}
-
 /// Dequantize one Sq8+ε residual row to fp32.
 fn dequantize_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
     let mut out = vec![0f32; dim];
@@ -368,6 +327,378 @@ fn dequantize_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
     out
 }
 
+/// Ashman D of a two-means partition, measured on the 1-D projection onto the
+/// inter-centroid axis. A k=2 split of a single coherent mode is not free: along
+/// the split axis each half is a half-normal, so a unimodal cell sits at a
+/// baseline `D ~= 2.6-3.1` (means +/-0.8 sigma over within-std ~0.6 sigma), NOT
+/// near zero. A cell spanning two cleanly separated modes scores far higher —
+/// the inter-mode gap dwarfs the within-mode spread, so D runs into the tens or
+/// hundreds. The operating threshold must therefore sit *above* the unimodal
+/// baseline (~4-5 leaves ample margin); a threshold near 2 would split every
+/// cell. The projection is what makes this work in high dimension: spread is
+/// measured only along the inter-centroid axis, not diluted by the `dim - 1`
+/// directions the split does not separate (the failure mode of a raw
+/// variance/inertia ratio). `points` is a flat `m * dim` buffer, `cents` is
+/// `2 * dim`; the axis length cancels in D, so the raw projection `p · (c1 - c0)`
+/// suffices. `0.0` for a degenerate partition (identical centroids or one empty
+/// side); `f32::INFINITY` for zero within-side spread (perfectly separated).
+fn ashman_d(points: &[f32], dim: usize, cents: &[f32]) -> f64 {
+    let m = points.len() / dim;
+    if m < 2 || dim == 0 || cents.len() < 2 * dim {
+        return 0.0;
+    }
+    let mut axis = vec![0f32; dim];
+    let mut norm2 = 0f64;
+    for j in 0..dim {
+        let d = cents[dim + j] - cents[j];
+        axis[j] = d;
+        norm2 += f64::from(d) * f64::from(d);
+    }
+    if norm2 <= 1e-12 {
+        return 0.0;
+    }
+    let project =
+        |v: &[f32]| -> f64 { (0..dim).map(|j| f64::from(v[j]) * f64::from(axis[j])).sum() };
+    // Split the projection at the midpoint between the two centroid feet, and
+    // accumulate per-side mean/variance of the projection coordinate.
+    let mid = 0.5 * (project(&cents[..dim]) + project(&cents[dim..2 * dim]));
+    let mut cnt = [0f64; 2];
+    let mut sum = [0f64; 2];
+    let mut sumsq = [0f64; 2];
+    for i in 0..m {
+        let p = project(&points[i * dim..(i + 1) * dim]);
+        let s = usize::from(p >= mid);
+        cnt[s] += 1.0;
+        sum[s] += p;
+        sumsq[s] += p * p;
+    }
+    if cnt[0] < 1.0 || cnt[1] < 1.0 {
+        return 0.0;
+    }
+    let mean = [sum[0] / cnt[0], sum[1] / cnt[1]];
+    let var = [
+        (sumsq[0] / cnt[0] - mean[0] * mean[0]).max(0.0),
+        (sumsq[1] / cnt[1] - mean[1] * mean[1]).max(0.0),
+    ];
+    let denom = (var[0] + var[1]).sqrt();
+    if denom <= 0.0 {
+        return f64::INFINITY;
+    }
+    std::f64::consts::SQRT_2 * (mean[1] - mean[0]).abs() / denom
+}
+
+/// Max recursion depth of the in-memory k-finder — bounds k to `2^depth`.
+const MODALITY_MAX_DEPTH: usize = 6;
+
+/// Per-branch seed perturbations mixed into the child recursion seeds so the
+/// left and right sub-groups draw *decorrelated* strided samples (an unperturbed
+/// seed would resample the same strides on both sides).
+const MODALITY_RECURSE_SEED_LEFT: u64 = 0x1111;
+const MODALITY_RECURSE_SEED_RIGHT: u64 = 0x2222;
+
+/// Decode a cell's encoded rows to one flat `n * dim` fp32 buffer, once, so the
+/// in-memory recursion re-clusters on fp32 without re-dequantizing per level.
+/// The old cross-pass cascade re-materialized and re-decoded every cell at every
+/// level; this decodes each cell exactly once.
+fn decode_rows(rows: &[&EncodedCellRow], dim: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(rows.len() * dim);
+    for &row in rows {
+        out.extend_from_slice(&dequantize_row(row, dim));
+    }
+    out
+}
+
+/// Reliable mode count by recursive binary bisection of a cell's rows, entirely
+/// in memory. At each node: take a fresh strided sample of *this sub-group's*
+/// rows (a fresh sample of the real sub-group, NOT a shrinking sub-slice — that
+/// noise is what made earlier in-memory counters over-fragment), two-means +
+/// [`ashman_d`]; below `threshold` the node is one mode (leaf), else partition
+/// the sub-group by nearest centroid and recurse both sides. Leaf count = k.
+/// `idx` indexes rows into `decoded`. This is the same validated per-cut test as
+/// the cross-pass binary cascade (→ the reliable k), but without the per-level
+/// Blob re-reads.
+fn recursive_binary_k(
+    decoded: &[f32],
+    dim: usize,
+    idx: &[usize],
+    seed: u64,
+    threshold: f64,
+    depth: usize,
+) -> usize {
+    let m = idx.len();
+    if (m as u64) < MODALITY_MIN_CELL_DOCS || depth == 0 {
+        return 1;
+    }
+    let sample_n = m.min((2 * SPLIT_KMEANS_SAMPLE_PER_CLUSTER).max(SPLIT_KMEANS_SAMPLE_MIN));
+    let mut sample = Vec::with_capacity(sample_n * dim);
+    for s in 0..sample_n {
+        let i = idx[s * m / sample_n];
+        sample.extend_from_slice(&decoded[i * dim..(i + 1) * dim]);
+    }
+    let cents = kmeans(&sample, dim, 2, SPLIT_KMEANS_ITERS, seed);
+    if cents.len() < 2 * dim || ashman_d(&sample, dim, &cents) < threshold {
+        return 1;
+    }
+    let (c0, c1) = (&cents[..dim], &cents[dim..2 * dim]);
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for &i in idx {
+        let v = &decoded[i * dim..(i + 1) * dim];
+        if distance(Metric::L2Sq, v, c0) <= distance(Metric::L2Sq, v, c1) {
+            left.push(i);
+        } else {
+            right.push(i);
+        }
+    }
+    if left.is_empty() || right.is_empty() {
+        return 1;
+    }
+    let seed_l = seed ^ MODALITY_RECURSE_SEED_LEFT;
+    let seed_r = seed ^ MODALITY_RECURSE_SEED_RIGHT;
+    recursive_binary_k(decoded, dim, &left, seed_l, threshold, depth - 1)
+        + recursive_binary_k(decoded, dim, &right, seed_r, threshold, depth - 1)
+}
+
+/// The split plan for a candidate cell given its resident `rows`:
+/// `Some((k, self_tune))` — split into `k` children — or `None` to leave it
+/// whole. Over the hard `cell_split_doc_cap` a cell splits into the cap-derived
+/// `k` with the executor self-tuning `k` up for route fidelity (the backstop
+/// path). Otherwise, when the modality trigger is on (`cell_split_modality_d >
+/// 0`), an **in-memory recursive binary** finds the reliable mode count `k` (one
+/// materialize, no cross-pass cascade — see [`recursive_binary_k`]); a cell with
+/// `<= R` modes is left whole, one with more splits into `g = ceil(K/R)` children
+/// with the executor self-tuning `k` up from `g` for route fidelity. The count
+/// must come from the recursion on rows — every up-front / summary estimate
+/// over-counts on real embeddings (recursive-Ashman-on-centroids 6692 / 0.344 vs
+/// validated binary-on-rows 1025 / 0.996). With the trigger off (default) this is
+/// the plain over-cap check.
+pub(crate) fn cell_split_plan(
+    rows: &[&EncodedCellRow],
+    dim: usize,
+    split_cell: u32,
+    modality_d: f64,
+) -> Option<(usize, bool)> {
+    let n_docs = rows.len() as u64;
+    let cap = cell_split_doc_cap().max(1) as usize;
+    let k_by_cap = rows.len().div_ceil(cap).max(2);
+    let threshold = modality_d;
+    // Modality trigger off (default): the caller's over-cap gate is the sole
+    // split trigger, so a cell that reaches here is a confirmed split — partition
+    // into the cap-derived k (the executor self-tunes k upward for route
+    // fidelity). A just-over-cap cell splits 2-way; a bulk overflow into more.
+    if threshold <= 0.0 {
+        return Some((k_by_cap, true));
+    }
+    // Modality trigger on: a hard-cap overflow still always splits; below the
+    // cap, split only a genuinely multimodal cell (Ashman D below), leaving a
+    // unimodal cell whole (`None`).
+    if split_overflow_needed(n_docs) {
+        return Some((k_by_cap, true));
+    }
+    if n_docs < MODALITY_MIN_CELL_DOCS {
+        return None;
+    }
+    let seed = (split_cell as u64) ^ SPLIT_KMEANS_SEED_XOR;
+    let decoded = decode_rows(rows, dim);
+    let idx: Vec<usize> = (0..rows.len()).collect();
+    // In-memory recursive binary finds the reliable mode count K (materialize once, no
+    // cross-pass cascade). The count must come from the ROWS — every summary estimate
+    // over-counts on real embeddings, incl. recursing on the fine centroids
+    // (6692 cells / 0.344) vs the validated binary-on-rows (1025 / 0.996), because
+    // averaged centroids shed within-mode noise and read as extra modes.
+    let k = recursive_binary_k(&decoded, dim, &idx, seed, threshold, MODALITY_MAX_DEPTH);
+    // Whole-mode grouping: split only when the cell holds MORE than R whole modes, into
+    // ceil(K/R) children of ~R modes each (never one-mode-per-cell). A cell already at
+    // `<= R` modes is healthy and left whole — the stop that keeps the grid from running
+    // away under streaming. `self_tune = true`: the executor raises k from this start
+    // toward route fidelity, so a grouped child whose centroid mis-routes its modes gets
+    // sub-split until assign == route.
+    let r = MODALITY_MODES_PER_CELL;
+    if k <= r {
+        return None;
+    }
+    let g = k.div_ceil(r).max(2);
+    Some((g, true))
+}
+
+/// One capacitated split attempt at a fixed `k`: greedy-k-means++ (random at
+/// `k = 2`) centroids on a strided sample, then a capacity-bounded
+/// nearest-centroid assignment (`cap_target` rows per child, spilling the
+/// overflow to the next-nearest). Returns the `k * dim` centroids, the per-row
+/// child assignment, and the **route fidelity** — the fraction of rows placed in
+/// their NEAREST child, which predicts nprobe=1 recall (a doc in its nearest
+/// cell is found at nprobe=1; a spilled one is not). The self-tuning
+/// [`plan_sq8_split_kway`] calls this across a ladder of `k`.
+fn capacitated_split_at_k(
+    rows: &[&EncodedCellRow],
+    split_cell: u32,
+    dim: usize,
+    metric: Metric,
+    k: usize,
+    cap_target: usize,
+) -> (Vec<f32>, Vec<u32>, f64) {
+    let n = rows.len();
+    let mut assign = vec![0u32; n];
+    let sample_n = n.min((k * SPLIT_KMEANS_SAMPLE_PER_CLUSTER).max(SPLIT_KMEANS_SAMPLE_MIN));
+    let mut sample = Vec::with_capacity(sample_n * dim);
+    for s in 0..sample_n {
+        let idx = s * n / sample_n;
+        sample.extend_from_slice(&dequantize_row(rows[idx], dim));
+    }
+    let seed = (split_cell as u64) ^ SPLIT_KMEANS_SEED_XOR;
+    let cents = if k > 2 {
+        kmeans_pp(&sample, dim, k, SPLIT_KMEANS_ITERS, seed)
+    } else {
+        kmeans(&sample, dim, k, SPLIT_KMEANS_ITERS, seed)
+    };
+    if cents.len() < k * dim {
+        return (cents, assign, 0.0);
+    }
+    // Per-row distances to every centroid; track the uncapped nearest (for route
+    // fidelity) and the nearest-vs-next margin (fill order — strongest preference
+    // first, so a full child bumps the rows that least mind their next-nearest).
+    let mut row_dists = vec![0f32; n * k];
+    let mut nearest = vec![0u32; n];
+    let mut order: Vec<(usize, f32)> = Vec::with_capacity(n);
+    for (i, row) in rows.iter().copied().enumerate() {
+        let rv = dequantize_row(row, dim);
+        let base = i * k;
+        let (mut best, mut second, mut best_c) = (f32::INFINITY, f32::INFINITY, 0usize);
+        for c in 0..k {
+            let d = distance(metric, &rv, &cents[c * dim..(c + 1) * dim]);
+            row_dists[base + c] = d;
+            if d < best {
+                second = best;
+                best = d;
+                best_c = c;
+            } else if d < second {
+                second = d;
+            }
+        }
+        nearest[i] = best_c as u32;
+        order.push((i, second - best));
+    }
+    order.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    let mut counts = vec![0usize; k];
+    for (i, _) in order {
+        let base = i * k;
+        let mut best_c = usize::MAX;
+        let mut best_d = f32::INFINITY;
+        for c in 0..k {
+            if counts[c] < cap_target && row_dists[base + c] < best_d {
+                best_d = row_dists[base + c];
+                best_c = c;
+            }
+        }
+        if best_c == usize::MAX {
+            best_c = (0..k)
+                .min_by(|&a, &b| {
+                    row_dists[base + a]
+                        .partial_cmp(&row_dists[base + b])
+                        .unwrap_or(Ordering::Equal)
+                })
+                .unwrap_or(0);
+        }
+        assign[i] = best_c as u32;
+        counts[best_c] += 1;
+    }
+    let faithful = (0..n).filter(|&i| assign[i] == nearest[i]).count();
+    (cents, assign, faithful as f64 / n as f64)
+}
+
+/// Split `split_cell` into sub-cells via capacitated k-means with self-tuned k.
+/// Returns `k' * dim` centroid components and a `0..k'` per-row assignment
+/// aligned to `rows`. Starts at the passed cap-minimum `k = ⌈rows/cap⌉` and
+/// raises k (more, smaller children) until the capacitated assignment reaches
+/// the route-fidelity target — so a cell whose natural groups exceed one child's
+/// capacity is cut into enough children that each holds ~whole groups
+/// (`assign == route`, nprobe=1 recall) instead of scattering the overflow. The
+/// child count `k'` may exceed `k`; the caller derives it from the centroid
+/// length. Deterministic single path — capacitated always populates ≥2 children
+/// for `rows ≥ 2`, so there is no fallback.
+pub(crate) fn plan_sq8_split_kway(
+    rows: &[&EncodedCellRow],
+    clusters: &ClusterCentroids,
+    split_cell: u32,
+    metric: Metric,
+    k: usize,
+    self_tune: bool,
+) -> (Vec<f32>, Vec<u32>) {
+    let dim = clusters.dim as usize;
+    let k = k.max(2).min(rows.len().max(2));
+    if rows.len() < 2 {
+        // Caller guards on MIN_ROWS_TO_SPLIT_CELL; stay defensive against a
+        // degenerate one-row input.
+        let c = manifest_centroid_components_from_row(rows[0], dim);
+        let mut cents = Vec::with_capacity(k * dim);
+        for _ in 0..k {
+            cents.extend_from_slice(&c);
+        }
+        return (cents, vec![0u32; rows.len()]);
+    }
+
+    // Self-tuning k. `cap_target` is the cap-minimum child size (≈ the doc cap);
+    // start at the passed `k = ⌈rows/cap⌉` and, while route fidelity is below
+    // target, raise k (more, smaller children — each holds fewer whole groups, so
+    // the capacitated assignment spills fewer rows off their nearest centroid).
+    // Keep the highest-fidelity attempt. Larger k yields children well under
+    // `cap_target` that fit without bumping, so `assign == route` and nprobe=1
+    // recall is preserved even when a coarse cell packs many natural groups.
+    let n = rows.len();
+    let cap_target = n.div_ceil(k).max(1);
+    // `self_tune = false` pins the split to exactly `k` (the caller already
+    // knows the right child count — e.g. the recursive mode count); `true`
+    // raises `k` toward the route-fidelity target for the cap-derived backstop.
+    let k_max = if self_tune {
+        k.saturating_mul(SPLIT_SELF_TUNE_K_MAX_FACTOR).min(n).max(k)
+    } else {
+        k
+    };
+    let mut best: Option<(f64, Vec<f32>, Vec<u32>)> = None;
+    let mut k_try = k;
+    loop {
+        let (cents, cand, rf) =
+            capacitated_split_at_k(rows, split_cell, dim, metric, k_try, cap_target);
+        if best.as_ref().is_none_or(|b| rf > b.0) {
+            best = Some((rf, cents, cand));
+        }
+        if rf >= SPLIT_ROUTE_FIDELITY_TARGET || k_try >= k_max {
+            break;
+        }
+        k_try = ((k_try as f64 * SPLIT_SELF_TUNE_K_STEP).ceil() as usize)
+            .max(k_try + 1)
+            .min(k_max);
+    }
+    let (rf, cents, cand) = best.expect("self-tune loop sets best on the first iteration");
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        // Per-split trace: the cap-derived starting k, the k the self-tune
+        // settled on, the achieved route fidelity, and the child-size spread
+        // (min/max) — the levers that explain a split's nprobe=1 recall.
+        let k_final = (cents.len() / dim).max(1);
+        let mut sizes = vec![0usize; k_final];
+        for &c in &cand {
+            sizes[c as usize] += 1;
+        }
+        tracing::debug!(
+            cell = split_cell,
+            rows = n,
+            cap_target,
+            k_start = k,
+            k_final,
+            route_fidelity = rf,
+            child_min = sizes.iter().copied().min().unwrap_or(0),
+            child_max = sizes.iter().copied().max().unwrap_or(0),
+            "cell split planned"
+        );
+    }
+    (cents, cand)
+}
+
+/// Two-centroid (`k = 2`) test-only wrapper over [`plan_sq8_split_kway`],
+/// returning the two-centroid / `u8`-assignment shape the split unit tests
+/// were written against. The production split path calls
+/// [`plan_sq8_split_kway`] directly.
+#[cfg(test)]
 pub(crate) fn plan_sq8_split(
     rows: &[&EncodedCellRow],
     clusters: &ClusterCentroids,
@@ -375,94 +706,62 @@ pub(crate) fn plan_sq8_split(
     metric: Metric,
 ) -> (Vec<f32>, Vec<f32>, Vec<u8>) {
     let dim = clusters.dim as usize;
-    let p = split_cell as usize;
-    let mut assign = vec![0u8; rows.len()];
-    if rows.len() < 2 {
-        // Caller guards on MIN_ROWS_TO_SPLIT_CELL; stay defensive so a degenerate
-        // input can't panic in medoid_index on an empty shard.
-        let c = manifest_centroid_components_from_row(rows[0], dim);
-        return (c.clone(), c, assign);
-    }
-
-    // Bisect along a DIAMETER of the cell: project every row onto the `seed0 →
-    // seed1` axis and split at the MEDIAN. This makes the two sub-cells equal-
-    // sized (±1) regardless of density, so any cell up to 2× the cap converges
-    // in a single pass. A nearest-seed (k-means) assignment instead lets the
-    // dense bulk fall to whichever seed it is closer to — lopsided in high
-    // dimensions, where the two farthest points are outliers and the bulk favors
-    // one — leaving sub-cells over-cap that re-split for several passes. The flat
-    // median cut costs no recall: per-sub-cell fine re-clustering downstream
-    // restores intra-cell routing.
-    let (seed0, seed1) = pick_split_seeds(rows, clusters, p, metric);
-    let v0 = dequantize_row(rows[seed0], dim);
-    let v1 = dequantize_row(rows[seed1], dim);
-    let axis: Vec<f32> = (0..dim).map(|d| v1[d] - v0[d]).collect();
-
-    let mut proj: Vec<(usize, f32)> = rows
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(i, row)| {
-            let rv = dequantize_row(row, dim);
-            let s: f32 = (0..dim).map(|d| rv[d] * axis[d]).sum();
-            (i, s)
-        })
-        .collect();
-    proj.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    let mid = rows.len() / 2;
-    for (rank, (i, _)) in proj.iter().enumerate() {
-        assign[*i] = u8::from(rank >= mid);
-    }
-
-    // Shards borrow the input rows (no payload clone) — the split extracts up
-    // to a full over-cap cell (≈2× the ~500K cap), so cloning every row's
-    // Sq8+ε bytes here would double the biggest cell's resident footprint.
-    let mut shard0: Vec<&EncodedCellRow> = Vec::new();
-    let mut shard1: Vec<&EncodedCellRow> = Vec::new();
-    for (i, row) in rows.iter().copied().enumerate() {
-        if assign[i] == 0 {
-            shard0.push(row);
-        } else {
-            shard1.push(row);
-        }
-    }
-
-    let m0 = medoid_index(metric, &shard0);
-    let m1 = medoid_index(metric, &shard1);
-    (
-        manifest_centroid_components_from_row(shard0[m0], dim),
-        manifest_centroid_components_from_row(shard1[m1], dim),
-        assign,
-    )
+    let (cents, assign) = plan_sq8_split_kway(rows, clusters, split_cell, metric, 2, true);
+    let c0 = cents[..dim].to_vec();
+    let c1 = cents[dim..2 * dim].to_vec();
+    (c0, c1, assign.iter().map(|&a| a as u8).collect())
 }
 
-/// Replace cell `cell_id`'s centroid and append a second sub-cell at `n_cent`.
-pub(crate) fn insert_split_centroid(
+/// Replace cell `cell_id`'s centroid with sub-cell 0 and append sub-cells
+/// `1..k` as fresh cells at the end of the grid. Returns the grown grid and the
+/// `k` sub-cell ids (index 0 == the reused `cell_id`; the rest are the new
+/// ids), aligned to `sub_centroids` (`k * dim` fp32).
+pub(crate) fn insert_split_centroids(
     base: &ClusterCentroids,
     cell_id: u32,
     sub_centroids: &[f32],
-) -> (ClusterCentroids, u32) {
+    k: usize,
+) -> (ClusterCentroids, Vec<u32>) {
     let dim = base.dim as usize;
     let p = cell_id as usize;
     let old_n = base.n_cent as usize;
-    let new_cell_id = base.n_cent;
-    let new_n = old_n + 1;
+    let new_n = old_n + (k - 1);
 
     let mut fp32 = vec![0f32; new_n * dim];
     for c in 0..old_n {
         fp32[c * dim..(c + 1) * dim].copy_from_slice(base.centroid(c));
     }
+    // Sub-cell 0 reuses the split cell's slot; 1..k append.
     fp32[p * dim..(p + 1) * dim].copy_from_slice(&sub_centroids[..dim]);
-    fp32[old_n * dim..new_n * dim].copy_from_slice(&sub_centroids[dim..2 * dim]);
+    let mut ids = vec![cell_id];
+    for j in 1..k {
+        let new_id = old_n + (j - 1);
+        fp32[new_id * dim..(new_id + 1) * dim]
+            .copy_from_slice(&sub_centroids[j * dim..(j + 1) * dim]);
+        ids.push(new_id as u32);
+    }
 
-    // Counts must have one entry per cell: grow to `new_n` so the split cell and
-    // the new sub-cell both have a slot. Cloning `base.counts` alone leaves it at
-    // `old_n`, which silently passes in-memory but truncates the wire encoding
-    // (counts and centroids are adjacent) → the grid fails to reopen from storage.
+    // Counts must have one entry per cell: grow to `new_n` so every sub-cell has
+    // a slot. Cloning `base.counts` alone leaves it at `old_n`, which silently
+    // passes in-memory but truncates the wire encoding (counts and centroids are
+    // adjacent) → the grid fails to reopen from storage.
     let mut counts = base.counts.clone();
     counts.resize(new_n, 0);
     let updated = ClusterCentroids::from_fp32(new_n as u32, base.dim, &fp32, counts);
-    (updated, new_cell_id)
+    (updated, ids)
+}
+
+/// Binary variant (`k = 2`): replace `cell_id`'s centroid and append one new
+/// sub-cell. Test-only wrapper preserving the single-new-id shape the unit
+/// tests use; the production split path calls [`insert_split_centroids`].
+#[cfg(test)]
+pub(crate) fn insert_split_centroid(
+    base: &ClusterCentroids,
+    cell_id: u32,
+    sub_centroids: &[f32],
+) -> (ClusterCentroids, u32) {
+    let (updated, ids) = insert_split_centroids(base, cell_id, sub_centroids, 2);
+    (updated, ids[1])
 }
 
 #[cfg(test)]
@@ -495,6 +794,44 @@ mod tests {
             ids.push(i);
             for d in 0..dim {
                 vecs.push(offset + i as f32 * 0.01 + d as f32 * 0.001);
+            }
+        }
+        let blob =
+            encode_blob(Metric::L2Sq, dim, &ids, &vecs, RerankCodec::Sq8Residual).expect("encode");
+        let stable_ids: Vec<i128> = (0..n).map(|i| i as i128).collect();
+        load_encoded_rows_from_blob(&blob, &stable_ids, None).expect("load")
+    }
+
+    /// Prod-faithful cell: `n_blobs` gaussian centers in general position
+    /// (each `N(0, 1)`), each with `per_blob` normalized points `center + N(0,
+    /// sigma)`. Mirrors a 100M coarse cell — ~16 data centers, tight balls,
+    /// unit-normalized, full embedding dim — which is where high-dim k-means
+    /// fragility (distance concentration + collided seeds) actually shows up,
+    /// unlike the tight colinear `synth_rows` blobs.
+    fn synth_gaussian_cell(
+        dim: usize,
+        n_blobs: usize,
+        per_blob: usize,
+        sigma: f32,
+        seed: u64,
+    ) -> Vec<EncodedCellRow> {
+        use rand::{SeedableRng, rngs::StdRng};
+        use rand_distr::{Distribution, Normal};
+        let mut rng = StdRng::seed_from_u64(seed);
+        let unit = Normal::new(0.0f32, 1.0).expect("unit normal");
+        let noise = Normal::new(0.0f32, sigma).expect("noise normal");
+        let n = n_blobs * per_blob;
+        let mut ids = Vec::with_capacity(n);
+        let mut vecs = Vec::with_capacity(n * dim);
+        for _ in 0..n_blobs {
+            let center: Vec<f32> = (0..dim).map(|_| unit.sample(&mut rng)).collect();
+            for _ in 0..per_blob {
+                let mut v: Vec<f32> = (0..dim)
+                    .map(|d| center[d] + noise.sample(&mut rng))
+                    .collect();
+                crate::superfile::vector::distance::normalize(&mut v);
+                ids.push(ids.len() as u32);
+                vecs.extend_from_slice(&v);
             }
         }
         let blob =
@@ -654,6 +991,59 @@ mod tests {
     }
 
     #[test]
+    fn modality_primitives_separate_and_count_k() {
+        let dim = 64usize;
+        let threshold = 4.0;
+        // Ashman D of the cell's strongest two-means seam, on a strided sample.
+        let d_sample = |rows: &[EncodedCellRow], seed: u64| -> f64 {
+            let refs: Vec<&EncodedCellRow> = rows.iter().collect();
+            let decoded = decode_rows(&refs, dim);
+            let c = kmeans(&decoded, dim, 2, SPLIT_KMEANS_ITERS, seed);
+            ashman_d(&decoded, dim, &c)
+        };
+        // The in-memory recursive binary mode count.
+        let k_of = |rows: &[EncodedCellRow], seed: u64| -> usize {
+            let refs: Vec<&EncodedCellRow> = rows.iter().collect();
+            let decoded = decode_rows(&refs, dim);
+            let idx: Vec<usize> = (0..rows.len()).collect();
+            recursive_binary_k(&decoded, dim, &idx, seed, threshold, MODALITY_MAX_DEPTH)
+        };
+        // A k=2 split of a single isotropic gaussian is not a no-op: along the
+        // split axis each half is a half-normal, so Ashman D sits near the
+        // unimodal baseline (~2.6-3.1). The recursive counter returns 1.
+        for (sigma, seed) in [(0.1f32, 11u64), (0.03, 13)] {
+            let uni = synth_gaussian_cell(dim, 1, 1000, sigma, seed);
+            let d = d_sample(&uni, 0);
+            assert!(
+                (2.0..4.0).contains(&d),
+                "unimodal (sigma {sigma}) D should sit near the ~3 baseline, got {d}"
+            );
+            assert_eq!(
+                k_of(&uni, 0),
+                1,
+                "unimodal cell -> k = 1, got {}",
+                k_of(&uni, 0)
+            );
+        }
+        // Two well-separated modes score far above the baseline (~3 vs hundreds).
+        let bi = synth_gaussian_cell(dim, 2, 700, 0.02, 12);
+        assert!(
+            d_sample(&bi, 0) > 100.0,
+            "separated modes should score far above the baseline, got {}",
+            d_sample(&bi, 0)
+        );
+        // Three well-separated modes: the recursive counter recovers k = 3,
+        // stopping each branch at the unimodal D threshold (not over-fragmenting).
+        let tri = synth_gaussian_cell(dim, 3, 700, 0.02, 21);
+        assert_eq!(
+            k_of(&tri, 0),
+            3,
+            "three separated modes -> k = 3, got {}",
+            k_of(&tri, 0)
+        );
+    }
+
+    #[test]
     fn plan_sq8_split_separates_two_blobs() {
         let dim = 4usize;
         let mut rows = synth_rows(dim, 10, 0.0);
@@ -696,44 +1086,134 @@ mod tests {
         assert_eq!(after, before);
     }
 
-    #[test]
-    fn pick_split_seeds_returns_diameter_endpoints() {
-        let dim = 4usize;
-        // 20 rows evenly spaced along a line (row i ≈ 0.01·i per dim), centroid
-        // pinned at the line's middle. The two farthest-apart rows are the
-        // endpoints (0 and 19) — NOT the middle row a closest-to-centroid seed
-        // would pick — so the returned pair must be {0, 19}.
-        let rows = synth_rows(dim, 20, 0.0);
-        let mid = vec![0.095f32, 0.096, 0.097, 0.098];
-        let clusters = ClusterCentroids::from_fp32(1, dim as u32, &mid, vec![rows.len() as u32]);
+    /// Split `n_blobs` equal gaussian blobs `k`-ways and assert every child
+    /// lands under `2× mean` with no empty sub-cell (the balance invariant the
+    /// split loop needs to converge). Prints the distribution so a run shows how
+    /// close to the `⌈n_blobs/k⌉`-blob optimum the seeding got.
+    fn assert_kway_split_balanced(
+        dim: usize,
+        n_blobs: usize,
+        per_blob: usize,
+        k: usize,
+        seed: u64,
+    ) {
+        let rows = synth_gaussian_cell(dim, n_blobs, per_blob, 0.05, seed);
+        let n = rows.len();
+        let clusters = synth_centroids(1, dim as u32);
         let refs: Vec<&EncodedCellRow> = rows.iter().collect();
-        let (seed0, seed1) = pick_split_seeds(&refs, &clusters, 0, Metric::L2Sq);
-        let mut ends = [seed0, seed1];
-        ends.sort_unstable();
+        let (cents, assign) = plan_sq8_split_kway(&refs, &clusters, 0, Metric::L2Sq, k, true);
+        // The planner self-tunes k UPWARD for route fidelity, so the child count
+        // is the returned centroid count, not the requested `k`.
+        let kk = (cents.len() / dim).max(1);
+        let mut counts = vec![0usize; kk];
+        for &a in &assign {
+            counts[a as usize] += 1;
+        }
+        let mean = n / kk;
+        let max_child = *counts.iter().max().expect("kk >= 1");
+        let empty = counts.iter().filter(|&&c| c == 0).count();
+        // Route-fidelity: fraction of rows in their NEAREST centroid's child —
+        // the ms-scale predictor of nprobe=1 recall (a doc at its nearest cell is
+        // found at nprobe=1; a spilled one is not). A naive geometric split would
+        // score ≈ 1/kk; capacitated + self-tuned k must stay high.
+        let route_faithful = assign
+            .iter()
+            .enumerate()
+            .filter(|&(i, &a)| {
+                let rv = dequantize_row(refs[i], dim);
+                let nearest = (0..kk)
+                    .min_by(|&x, &y| {
+                        distance(Metric::L2Sq, &rv, &cents[x * dim..(x + 1) * dim])
+                            .partial_cmp(&distance(
+                                Metric::L2Sq,
+                                &rv,
+                                &cents[y * dim..(y + 1) * dim],
+                            ))
+                            .unwrap_or(Ordering::Equal)
+                    })
+                    .unwrap_or(0);
+                a as usize == nearest
+            })
+            .count();
+        let route_frac = route_faithful as f64 / n as f64;
+        let mut sorted = counts.clone();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        eprintln!(
+            "[split-test] blobs={n_blobs} n={n} k_req={k} k_used={kk} mean={mean} max={max_child} \
+             empty={empty} route_fidelity={route_frac:.3} cells(desc)={sorted:?}",
+        );
         assert_eq!(
-            ends,
-            [0, rows.len() - 1],
-            "seeds must be the diameter endpoints, got {ends:?}"
+            empty, 0,
+            "no empty sub-cells; blobs={n_blobs} kk={kk} got {counts:?}"
+        );
+        // Every child ≤ the cap_target (`⌈n/k_req⌉`, the cap-minimum size the
+        // planner holds fixed while raising k), plus rounding slack.
+        assert!(
+            max_child <= n.div_ceil(k) + 1,
+            "over cap_target (blobs={n_blobs} k_req={k} k_used={kk}): max {max_child} vs {} \
+             got {counts:?}",
+            n.div_ceil(k),
+        );
+        // The whole point of self-tuning: raise k until rows sit in their nearest
+        // child. Bar set below the 0.97 self-tune target (which achieved runs
+        // hover just above) with margin for k-means's ULP-level non-determinism,
+        // but well above the ~0.77 fixed-k capacitated / ~1/k naive-geometric
+        // regimes it must never regress to.
+        assert!(
+            route_frac >= 0.95,
+            "low route-fidelity {route_frac:.3} (blobs={n_blobs} k_req={k} k_used={kk}) — \
+             self-tuning must raise k until most rows are in their nearest child"
         );
     }
 
+    /// K-way k-means split must stay balanced when the cell holds MANY more
+    /// equal-mass blobs than `k` — the 100M regime. A coarse cell spans
+    /// `4096 data clusters / 256 grid cells ≈ 16` centers and splits
+    /// `k = ⌈rows/cap⌉ ≈ 10`; the grid is uneven, so worst-case cells span more
+    /// (~2× the mean → ~32 centers, k≈20). Plain random / single-D² seeding
+    /// collides in high dim and piles several blobs onto one child, stalling the
+    /// split loop (observed: 256→647 cells, 170k median at 100M). Greedy
+    /// k-means++ must land every child under `2× mean` with no empty sub-cell,
+    /// across the whole blobs:k regime. (The existing median test uses
+    /// `use_kmeans = false` and never exercises this path.)
     #[test]
-    fn plan_sq8_split_median_cut_balances_skewed_cell() {
-        let dim = 4usize;
-        // A dense core (16 rows near origin) plus a far sparse tail (4 rows). A
-        // nearest-seed split would peel the 4 tail rows off (16/4); the median cut
-        // splits by count regardless of density, so the halves come out ~10/10.
-        let mut rows = synth_rows(dim, 16, 0.0);
-        rows.extend(synth_rows(dim, 4, 50.0));
-        let clusters =
-            ClusterCentroids::from_fp32(1, dim as u32, &vec![0.0f32; dim], vec![rows.len() as u32]);
+    fn plan_sq8_split_kway_kmeans_balances_many_equal_blobs() {
+        let dim = 1024usize; // prod embedding dim (where distance concentration bites)
+        // First-split average: 16 centers, k=10.
+        assert_kway_split_balanced(dim, 16, 100, 10, 42);
+        // Worst-case uneven cell: ~2× the centers, proportionally larger k — the
+        // harder seeding regime (more clusters, greedy trials grow only as ln k).
+        assert_kway_split_balanced(dim, 32, 100, 20, 7);
+        assert_kway_split_balanced(dim, 64, 60, 40, 101);
+    }
+
+    /// Self-tuning must RAISE k above the passed cap-minimum when a cell packs
+    /// more groups than that k can hold cleanly: passing k=2 on a 16-group cell
+    /// should return more than 2 children (each holding ~whole groups) rather
+    /// than a lopsided binary cut.
+    #[test]
+    fn plan_sq8_split_kway_self_tunes_k_upward() {
+        let dim = 1024usize;
+        let rows = synth_gaussian_cell(dim, 16, 100, 0.05, 42);
+        let clusters = synth_centroids(1, dim as u32);
         let refs: Vec<&EncodedCellRow> = rows.iter().collect();
-        let (_c0, _c1, assign) = plan_sq8_split(&refs, &clusters, 0, Metric::L2Sq);
-        let ones = assign.iter().filter(|&&a| a == 1).count();
-        let zeros = assign.len() - ones;
+        let (cents, assign) = plan_sq8_split_kway(&refs, &clusters, 0, Metric::L2Sq, 2, true);
+        let kk = cents.len() / dim;
+        let populated = {
+            let mut seen = vec![false; kk.max(1)];
+            for &a in &assign {
+                seen[a as usize] = true;
+            }
+            seen.iter().filter(|&&s| s).count()
+        };
+        eprintln!("[self-tune] k_req=2 k_used={kk} populated={populated}");
         assert!(
-            (ones as i64 - zeros as i64).abs() <= 1,
-            "median cut must balance the split, got {zeros} vs {ones}"
+            kk > 2,
+            "self-tuning must raise k above 2 on a 16-group cell, got {kk}"
+        );
+        assert!(
+            populated >= 2,
+            "at least 2 sub-cells populated, got {populated}"
         );
     }
 }
