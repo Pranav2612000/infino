@@ -32,7 +32,7 @@ use std::{collections::HashMap, sync::OnceLock};
 use crate::{
     executors::{ColdTiming, fts::FtsQueryStat, sql::QuerySets, vector::RecallRow},
     markdown::{fmt_count, fmt_time},
-    report::{Better, Block, Cell, Report, Section, metric, text},
+    report::{Better, Block, Cell, Report, Section, context, metric, text},
     rss::fmt_bytes,
     storage_meter::{ObjectStoreMeter, background_fill_meter, merge_background_fill},
 };
@@ -78,6 +78,18 @@ const SUMMARY_READ_WARM_FRACTION: f64 = 0.95;
 /// metering must record the exact measured hold time and put any padding
 /// in the PRICE, never in the reported quantity.
 const QUERY_RAM_HOLD_FUDGE: f64 = 2.0;
+/// Average hours in a calendar month (365.25 days × 24 h ÷ 12). Used only by
+/// the provisioned-occupancy block to price a whole reserved node per month —
+/// the marginal model never bills calendar hours (residency stays inside each
+/// query's RAM-hold leg).
+const HOURS_PER_MONTH: f64 = 730.5;
+/// Default replication factor for the provisioned-occupancy framing: an
+/// R-way HA placement where each replica keeps its own independent local
+/// cache, so NVMe and RAM occupancy multiply by R rather than being shared.
+/// The bench itself measures ONE node — the per-replica column is the
+/// measured basis and the ×R column applies this multiplier visibly.
+/// Override via `INFINO_BENCH_COST_REPLICAS`.
+const DEFAULT_OCCUPANCY_REPLICAS: u32 = 2;
 
 /// The instance the model prices against. Default is a portable cloud SKU
 /// with local NVMe; override via `INFINO_BENCH_COST_*` env vars.
@@ -144,6 +156,28 @@ impl Instance {
     /// Fraction of the instance's RAM a resident set occupies.
     fn ram_share(&self, resident_bytes: u64) -> f64 {
         resident_bytes as f64 / BYTES_PER_GIB / self.ram_gib
+    }
+
+    /// Whole-node dollars for one calendar month — the reserved-capacity
+    /// rate the provisioned-occupancy block prices shares against.
+    fn usd_per_month(&self) -> f64 {
+        self.usd_per_hour * HOURS_PER_MONTH
+    }
+
+    /// Fraction of the instance's local NVMe a cache footprint occupies.
+    /// NVMe capacity is quoted in decimal GB (matching cloud SKU listings).
+    fn nvme_share(&self, bytes: u64) -> f64 {
+        bytes as f64 / BYTES_PER_GB / self.nvme_gb
+    }
+
+    /// Fraction of the node's CPU an assumed monthly query load keeps busy:
+    /// queries/month × billed vCPU·s per query ÷ the node's total vCPU·s in
+    /// a month. "Billed" vCPU·s is `per_query_vcpu_seconds` — the binding of
+    /// measured CPU and the RAM-hold leg — so the occupancy view and the
+    /// marginal model reconcile on the same per-query quantity.
+    fn cpu_share_at_load(&self, billed_vcpu_s_per_query: f64, queries_per_month: f64) -> f64 {
+        queries_per_month * billed_vcpu_s_per_query
+            / (f64::from(self.vcpu.max(1)) * HOURS_PER_MONTH * SECS_PER_HOUR)
     }
 
     /// RAM-hold leg for a one-time phase, in aggregate vCPU-seconds: `wall ×
@@ -387,6 +421,13 @@ pub struct StorePhases {
     /// on the same shared consumer — filtered vs unfiltered GET/query.
     pub filtered_query: Option<ObjectStoreMeter>,
     pub filtered_query_iters: u64,
+    /// Settled local NVMe disk-cache footprint (`DiskCacheStore` current
+    /// bytes) sampled on the shared consumer after the steady-state serving
+    /// battery. Includes the hidden vector-index table — it shares the same
+    /// cache root and budget. Feeds the provisioned-occupancy NVMe rows;
+    /// `None` (e.g. an in-memory cell with no disk cache) omits them,
+    /// never guesses.
+    pub disk_cache_bytes: Option<u64>,
 }
 
 /// Everything one cell (one tier × modality) needs to be priced.
@@ -466,6 +507,32 @@ fn usd_per_million(per_unit: f64) -> String {
     format!("{}/1M", usd(per_unit * PER_MILLION))
 }
 
+/// A capacity share as a percentage, with adaptive precision below 0.1% so
+/// a tiny CPU share (e.g. 0.06%) never collapses to a meaningless "0.0%" —
+/// same rationale as [`usd`].
+fn fmt_share(share: f64) -> String {
+    let pct = share * 100.0;
+    if pct == 0.0 {
+        return "0%".into();
+    }
+    if pct >= 0.1 {
+        return format!("{pct:.1}%");
+    }
+    let decimals = ((-pct.log10()).ceil() as usize + 1).min(9);
+    format!("{pct:.decimals$}%")
+}
+
+/// The binding provisioned resource: the largest MEASURED share with its
+/// label. Unmeasured shares are skipped, never treated as 0 (a missing
+/// measurement must not "lose" the max and misname the binding resource);
+/// `None` only when nothing was measured.
+fn binding_share(shares: &[(&'static str, Option<f64>)]) -> Option<(&'static str, f64)> {
+    shares
+        .iter()
+        .filter_map(|(label, share)| share.map(|s| (*label, s)))
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+}
+
 /// Per-query cost with both scales visible — prevents comparing $/open to $/1M.
 fn usd_per_query_both_scales(per_query: f64) -> String {
     format!("{}/query ({})", usd(per_query), usd_per_million(per_query))
@@ -514,6 +581,33 @@ fn storage_months() -> f64 {
             .and_then(|x| x.parse().ok())
             .unwrap_or(DEFAULT_STORAGE_MONTHS)
     })
+}
+
+/// Replication factor for the provisioned-occupancy block. Zero or garbage
+/// falls back to the default — R=0 would print a $0 keep-warm bill, which is
+/// never a measurement.
+fn parse_replicas(raw: Option<&str>) -> u32 {
+    raw.and_then(|s| s.parse::<u32>().ok())
+        .filter(|&r| r > 0)
+        .unwrap_or(DEFAULT_OCCUPANCY_REPLICAS)
+}
+
+/// R for the occupancy block, env-overridable like [`storage_months`] (a
+/// deployment-topology knob, not an instance attribute, so it is read here
+/// and not in `Instance::from_env`).
+fn occupancy_replicas() -> u32 {
+    static REPLICAS: OnceLock<u32> = OnceLock::new();
+    *REPLICAS
+        .get_or_init(|| parse_replicas(std::env::var("INFINO_BENCH_COST_REPLICAS").ok().as_deref()))
+}
+
+/// The tenant's composed serving cost per month: marginal work (storage +
+/// blended reads + writes + maintenance, egress excluded as pass-through)
+/// plus the keep-warm floor (idle-retained NVMe × R) that buys the blend's
+/// warm-hit rate. `None` floor (NVMe cache unmeasured) yields `None` — the
+/// composed number is withheld rather than silently missing its floor.
+fn serving_cogs_month(marginal_ex_egress: f64, idle_floor_total: Option<f64>) -> Option<f64> {
+    idle_floor_total.map(|floor| marginal_ex_egress + floor)
 }
 
 /// Network egress rate ($/GB out), env-overridable like [`storage_months`]
@@ -812,8 +906,17 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     // first-cold latency, which must be labeled "first-cold", never "steady").
     let cold_second_io = c.store.cold_second_query;
     enum SteadyColdPrice {
-        Full { per_q: f64, wall_s: f64 },
-        RequestsOnly { usd: f64 },
+        Full {
+            per_q: f64,
+            wall_s: f64,
+            /// Billed compute of the steady cold query (max of measured CPU
+            /// and the RAM-hold leg, no request dollars) — the quantity the
+            /// occupancy block's CPU share is built from.
+            vcpu_s: f64,
+        },
+        RequestsOnly {
+            usd: f64,
+        },
         None,
     }
     let steady_cold_price = match (
@@ -826,6 +929,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         (Some(io), Some(cpu), Some(window)) => SteadyColdPrice::Full {
             per_q: inst.per_query_usd(cpu, window, c.resident_anon_bytes) + request_usd(&io),
             wall_s: window,
+            vcpu_s: inst.per_query_vcpu_seconds(cpu, window, c.resident_anon_bytes),
         },
         (Some(io), _, _) => SteadyColdPrice::RequestsOnly {
             usd: request_usd(&io),
@@ -919,7 +1023,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         && let Some(q) = anchor_cold
     {
         match &steady_cold_price {
-            SteadyColdPrice::Full { per_q, wall_s } => {
+            SteadyColdPrice::Full { per_q, wall_s, .. } => {
                 let io = cold_second_io.expect("Full variant implies cold_second_io");
                 rate_rows.push(vec![
                     text("Cold query (CPU + requests, steady)"),
@@ -1612,6 +1716,13 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     let mut monthly_bulk_shapes: Vec<(String, f64, u64)> = Vec::new();
     let mut steady_warm: Option<(String, f64)> = None;
     let mut steady_cold: Option<(String, f64)> = None;
+    // Billed compute (vCPU·s) of the same steady warm/cold queries the dollar
+    // figures above are built from — set at the same branches, blended the
+    // same way — so the occupancy block's CPU share prices exactly the load
+    // the monthly read line bills (the dollar figures can't stand in: the
+    // cold side folds in GET request dollars, which are not compute).
+    let mut steady_warm_vcpu_s: Option<f64> = None;
+    let mut steady_cold_vcpu_s: Option<f64> = None;
     if let Some(groups) = c.serving_groups {
         // Per-group serving priced from the full query battery — the SAME
         // measurement the per-shape search table reports, so the two tables
@@ -1630,20 +1741,23 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             .last()
             .map(|s| s.serving_resident_bytes(c.resident_anon_bytes))
             .unwrap_or(c.resident_anon_bytes);
-        // Each returns (p50_seconds, per_query_usd, payload_bytes). Payload
-        // is the returned result size (cache-independent), the egress quantity.
-        let warm_per_q = |name: &str| -> Option<(f64, f64, u64)> {
+        // Each returns (p50_seconds, per_query_usd, billed_vcpu_s,
+        // payload_bytes). Payload is the returned result size
+        // (cache-independent), the egress quantity; billed vCPU·s is the
+        // compute-only quantity behind the dollars (no request leg).
+        let warm_per_q = |name: &str| -> Option<(f64, f64, f64, u64)> {
             c.warm.iter().find(|w| w.name == name).and_then(|w| {
                 w.cpu_s.map(|cpu| {
                     (
                         w.p50_s,
                         inst.per_query_usd(cpu, w.p50_s, resident),
+                        inst.per_query_vcpu_seconds(cpu, w.p50_s, resident),
                         w.payload_bytes,
                     )
                 })
             })
         };
-        let cold_per_q = |name: &str| -> Option<(f64, f64, u64)> {
+        let cold_per_q = |name: &str| -> Option<(f64, f64, f64, u64)> {
             let cq = c.cold?.iter().find(|q| q.name == name)?;
             let cpu = cq.search_cpu_s?;
             // Cold holds the resident set for ~its warm window (bytes local);
@@ -1656,42 +1770,53 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             let warm = c.warm.iter().find(|w| w.name == name)?;
             let per_q = inst.per_query_usd(cpu, warm.p50_s, resident)
                 + cq.search_get_count as f64 * USD_PER_GET;
-            Some((cq.search_s, per_q, warm.payload_bytes))
+            Some((
+                cq.search_s,
+                per_q,
+                inst.per_query_vcpu_seconds(cpu, warm.p50_s, resident),
+                warm.payload_bytes,
+            ))
         };
         let mut all_warm_usd: Vec<f64> = Vec::new();
         let mut all_cold_usd: Vec<f64> = Vec::new();
+        let mut all_warm_vcpu_s: Vec<f64> = Vec::new();
+        let mut all_cold_vcpu_s: Vec<f64> = Vec::new();
         // Family row: p50 / payload / egress are the family means; the final
         // per-query dollars are the FULL serve cost — compute + requests +
         // egress on the returned bytes — so the row is the complete unit cost
         // of that query class.
-        let group_row =
-            |rows: &mut Vec<Vec<Cell>>, label: &str, kind: &str, samples: &[(f64, f64, u64)]| {
-                if samples.is_empty() {
-                    return;
-                }
-                let n = samples.len() as f64;
-                let mean_p50 = samples.iter().map(|(p, _, _)| p).sum::<f64>() / n;
-                let mean_usd = samples.iter().map(|(_, u, _)| u).sum::<f64>() / n;
-                let mean_payload = samples.iter().map(|(_, _, b)| *b).sum::<u64>() as f64 / n;
-                let egress = egress_usd(mean_payload);
-                let total = mean_usd + egress;
-                let qpu = 1.0 / total.max(f64::MIN_POSITIVE);
-                rows.push(vec![
-                    text(format!(
-                        "{label} — {kind} (mean of {} shapes)",
-                        samples.len()
-                    )),
-                    text(fmt_time(mean_p50 * 1e9)),
-                    text(fmt_bytes(mean_payload as u64)),
-                    text(usd(egress * PER_MILLION)),
-                    metric(qpu, format!("{qpu:.0}"), Better::Higher),
-                    speed_per_usd_cell(total, mean_p50),
-                    metric(total * PER_MILLION, usd(total * PER_MILLION), Better::Lower),
-                ]);
-            };
+        let group_row = |rows: &mut Vec<Vec<Cell>>,
+                         label: &str,
+                         kind: &str,
+                         samples: &[(f64, f64, f64, u64)]| {
+            if samples.is_empty() {
+                return;
+            }
+            let n = samples.len() as f64;
+            let mean_p50 = samples.iter().map(|(p, _, _, _)| p).sum::<f64>() / n;
+            let mean_usd = samples.iter().map(|(_, u, _, _)| u).sum::<f64>() / n;
+            let mean_payload = samples.iter().map(|(_, _, _, b)| *b).sum::<u64>() as f64 / n;
+            let egress = egress_usd(mean_payload);
+            let total = mean_usd + egress;
+            let qpu = 1.0 / total.max(f64::MIN_POSITIVE);
+            rows.push(vec![
+                text(format!(
+                    "{label} — {kind} (mean of {} shapes)",
+                    samples.len()
+                )),
+                text(fmt_time(mean_p50 * 1e9)),
+                text(fmt_bytes(mean_payload as u64)),
+                text(usd(egress * PER_MILLION)),
+                metric(qpu, format!("{qpu:.0}"), Better::Higher),
+                speed_per_usd_cell(total, mean_p50),
+                metric(total * PER_MILLION, usd(total * PER_MILLION), Better::Lower),
+            ]);
+        };
         for (label, names) in groups {
-            let warms: Vec<(f64, f64, u64)> = names.iter().filter_map(|n| warm_per_q(n)).collect();
-            let colds: Vec<(f64, f64, u64)> = names.iter().filter_map(|n| cold_per_q(n)).collect();
+            let warms: Vec<(f64, f64, f64, u64)> =
+                names.iter().filter_map(|n| warm_per_q(n)).collect();
+            let colds: Vec<(f64, f64, f64, u64)> =
+                names.iter().filter_map(|n| cold_per_q(n)).collect();
             // BOUNDED shapes only feed the per-query monthly rates. A bulk
             // shape's result scales with the match set, so averaging it into a
             // per-query rate asserts that every query returns a full-corpus
@@ -1700,13 +1825,15 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             // (see the bulk rate lines in the monthly summary).
             if is_bulk_group(label) {
                 monthly_bulk_shapes.extend(names.iter().filter_map(|n| {
-                    let (_, warm_usd, payload) = warm_per_q(n)?;
+                    let (_, warm_usd, _, payload) = warm_per_q(n)?;
                     Some((n.to_string(), warm_usd, payload))
                 }));
             } else {
-                all_warm_usd.extend(warms.iter().map(|(_, u, _)| *u));
-                all_cold_usd.extend(colds.iter().map(|(_, u, _)| *u));
-                monthly_bounded_payloads.extend(warms.iter().map(|(_, _, b)| *b));
+                all_warm_usd.extend(warms.iter().map(|(_, u, _, _)| *u));
+                all_cold_usd.extend(colds.iter().map(|(_, u, _, _)| *u));
+                all_warm_vcpu_s.extend(warms.iter().map(|(_, _, v, _)| *v));
+                all_cold_vcpu_s.extend(colds.iter().map(|(_, _, v, _)| *v));
+                monthly_bounded_payloads.extend(warms.iter().map(|(_, _, _, b)| *b));
             }
             group_row(&mut serving_rows, label, "warm", &warms);
             group_row(&mut serving_rows, label, "cold", &colds);
@@ -1718,6 +1845,14 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         if !all_cold_usd.is_empty() {
             let mean = all_cold_usd.iter().sum::<f64>() / all_cold_usd.len() as f64;
             steady_cold = Some(("cold (bounded-result mean)".to_string(), mean));
+        }
+        if !all_warm_vcpu_s.is_empty() {
+            steady_warm_vcpu_s =
+                Some(all_warm_vcpu_s.iter().sum::<f64>() / all_warm_vcpu_s.len() as f64);
+        }
+        if !all_cold_vcpu_s.is_empty() {
+            steady_cold_vcpu_s =
+                Some(all_cold_vcpu_s.iter().sum::<f64>() / all_cold_vcpu_s.len() as f64);
         }
     } else if query_states.is_empty() {
         serving_rows.extend(c.warm.iter().filter_map(|w| {
@@ -1752,6 +1887,8 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         {
             let per_q = inst.per_query_usd(*cpu, *p50_s, c.resident_anon_bytes);
             steady_warm = Some((format!("warm ({name})"), per_q));
+            steady_warm_vcpu_s =
+                Some(inst.per_query_vcpu_seconds(*cpu, *p50_s, c.resident_anon_bytes));
         }
         if let Some(q) = anchor_cold {
             let payload = c
@@ -1762,7 +1899,11 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 .unwrap_or(0);
             let egress = egress_usd(payload as f64);
             match &steady_cold_price {
-                SteadyColdPrice::Full { per_q, wall_s } => {
+                SteadyColdPrice::Full {
+                    per_q,
+                    wall_s,
+                    vcpu_s,
+                } => {
                     let total = per_q + egress;
                     let queries_per_usd = 1.0 / total.max(f64::MIN_POSITIVE);
                     serving_rows.push(vec![
@@ -1779,6 +1920,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                         metric(total * PER_MILLION, usd(total * PER_MILLION), Better::Lower),
                     ]);
                     steady_cold = Some((format!("cold ({})", q.name), *per_q));
+                    steady_cold_vcpu_s = Some(*vcpu_s);
                 }
                 SteadyColdPrice::RequestsOnly { usd: req_usd } => {
                     // No steady wall-clock sample exists here — the first-cold
@@ -1864,6 +2006,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                     row.push(metric(p50_s * 1e9, fmt_time(p50_s * 1e9), Better::Lower));
                     row.push(text(format!("{}/1M", usd(total * PER_MILLION))));
                     steady_warm = Some((format!("warm — {label}"), per_q));
+                    steady_warm_vcpu_s = Some(inst.per_query_vcpu_seconds(cpu_s, p50_s, ram_bytes));
                 }
                 _ => row.extend([text("—"), text("—")]),
             }
@@ -1886,6 +2029,8 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                     if state.io.cold_second.is_none() {
                         steady_cold =
                             Some((format!("cold — {label} ({} GET)", io.get_count), per_q));
+                        steady_cold_vcpu_s =
+                            Some(inst.per_query_vcpu_seconds(cpu_s, warm_window, ram_bytes));
                     }
                 }
                 _ => row.push(text("—")),
@@ -1913,6 +2058,8 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                         format!("cold steady — {label} ({} GET)", io.get_count),
                         per_q,
                     ));
+                    steady_cold_vcpu_s =
+                        Some(inst.per_query_vcpu_seconds(cpu_s, warm_window, ram_bytes));
                 }
                 _ => row.extend([text("—"), text("—")]),
             }
@@ -2331,6 +2478,198 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         rows: summary_rows,
     };
 
+    // ---- Block 6: provisioned occupancy (informational) ----
+    // The keep-warm framing the marginal summary above deliberately excludes:
+    // what holding this tenant's capacity costs when it is RESERVED between
+    // queries rather than billed per query served. Models a process-per-
+    // database serving platform with scale-to-zero — an idle tenant keeps
+    // only its local NVMe cache (worker reaped: no RAM, no CPU); an active
+    // tenant's node share is bounded by its largest resource share. Never
+    // added to the marginal Total: the two framings answer different
+    // questions (cost of work performed vs cost of capacity held), and which
+    // applies is the operator's keep-warm policy. Every row is measured — an
+    // unmeasured resource is omitted, never guessed at 0.
+    let replicas = occupancy_replicas();
+    let node_month = inst.usd_per_month();
+    // Same resident-set basis the serving table and the per-query RAM-hold
+    // leg use: the LAST populated query state (post-compact when the
+    // lifecycle ran) is the shape a long-lived table serves.
+    let occupancy_resident = query_states
+        .last()
+        .map(|s| s.serving_resident_bytes(c.resident_anon_bytes))
+        .unwrap_or(c.resident_anon_bytes);
+    let occupancy_ram_label = query_states
+        .last()
+        .map(|s| s.serving_ram_label(c.resident_anon_bytes))
+        .unwrap_or_else(|| fmt_bytes(occupancy_resident));
+    // Billed compute per query at the same 95/5 blend (and the same
+    // single-sided fallback) as the monthly read line.
+    let blended_vcpu_q = match (steady_warm_vcpu_s, steady_cold_vcpu_s) {
+        (Some(warm_v), Some(cold_v)) => {
+            Some(warm_v * SUMMARY_READ_WARM_FRACTION + cold_v * (1.0 - SUMMARY_READ_WARM_FRACTION))
+        }
+        (Some(warm_v), None) => Some(warm_v),
+        (None, Some(cold_v)) => Some(cold_v),
+        (None, None) => None,
+    };
+    let cpu_sh = blended_vcpu_q.map(|v| inst.cpu_share_at_load(v, SUMMARY_QUERIES_PER_MONTH));
+    let ram_sh = (occupancy_resident > 0).then(|| inst.ram_share(occupancy_resident));
+    let nvme_sh = c.store.disk_cache_bytes.map(|b| inst.nvme_share(b));
+    let mut occupancy_rows: Vec<Vec<Cell>> = Vec::new();
+    if let (Some(share), Some(vcpu_q)) = (cpu_sh, blended_vcpu_q) {
+        occupancy_rows.push(vec![
+            text("CPU at assumed load"),
+            text(format!(
+                "{} queries/mo × {} billed vCPU·s/query on {} vCPU",
+                fmt_count(SUMMARY_QUERIES_PER_MONTH as usize),
+                fmt_vcpu_seconds(vcpu_q),
+                inst.vcpu,
+            )),
+            context(share, fmt_share(share), Better::Lower),
+            text(""),
+            text(""),
+        ]);
+    }
+    if let Some(share) = ram_sh {
+        occupancy_rows.push(vec![
+            text("RAM-resident (while worker live)"),
+            text(format!(
+                "{occupancy_ram_label} of {:.0} GiB — page cache is node-global and \
+                 reclaimable, not a standing per-tenant reservation",
+                inst.ram_gib,
+            )),
+            context(share, fmt_share(share), Better::Lower),
+            text(""),
+            text(""),
+        ]);
+    }
+    if let (Some(share), Some(bytes)) = (nvme_sh, c.store.disk_cache_bytes) {
+        occupancy_rows.push(vec![
+            text("NVMe disk cache"),
+            text(format!(
+                "{} local cache (user + hidden index, shared root) of {:.0} GB",
+                fmt_bytes(bytes),
+                inst.nvme_gb,
+            )),
+            context(share, fmt_share(share), Better::Lower),
+            text(""),
+            text(""),
+        ]);
+    }
+    if let Some((binding, share)) =
+        binding_share(&[("CPU", cpu_sh), ("RAM", ram_sh), ("NVMe", nvme_sh)])
+    {
+        let per_replica = share * node_month;
+        let total = per_replica * f64::from(replicas);
+        occupancy_rows.push(vec![
+            text(format!("Active occupancy (binding: {binding})")),
+            text(format!(
+                "largest share × {}/node-mo, held while the worker process is live",
+                usd(node_month),
+            )),
+            context(share, fmt_share(share), Better::Lower),
+            context(per_replica, usd(per_replica), Better::Lower),
+            context(total, usd(total), Better::Lower),
+        ]);
+    }
+    if let Some(share) = nvme_sh {
+        let per_replica = share * node_month;
+        let total = per_replica * f64::from(replicas);
+        occupancy_rows.push(vec![
+            text("Idle-retained occupancy (NVMe only)"),
+            text("cache kept on local disk between activations; worker reaped — zero RAM/CPU"),
+            context(share, fmt_share(share), Better::Lower),
+            context(per_replica, usd(per_replica), Better::Lower),
+            context(total, usd(total), Better::Lower),
+        ]);
+    }
+    let occupancy = (!occupancy_rows.is_empty()).then(|| Block {
+        subtitle: format!(
+            "Provisioned occupancy — keep-warm framing (informational, NOT in the Total \
+             above): what holding this tenant's capacity costs when it is reserved between \
+             queries instead of billed per query served. Share of one {} ({} vCPU / {:.0} GiB \
+             RAM / {:.0} GB NVMe at ${:.4}/h = {}/node-mo) × R={replicas} replicas (R-way HA, \
+             each replica keeps an independent local cache; INFINO_BENCH_COST_REPLICAS \
+             overrides). Shares are of raw instance capacity — apply any usable-capacity \
+             headroom policy as your own divisor.",
+            inst.name,
+            inst.vcpu,
+            inst.ram_gib,
+            inst.nvme_gb,
+            inst.usd_per_hour,
+            usd(node_month),
+        ),
+        headers: vec![
+            "Line".into(),
+            "Measured basis".into(),
+            "Share of node".into(),
+            "$/mo — 1 replica".into(),
+            format!("$/mo — ×{replicas} replicas"),
+        ],
+        rows: occupancy_rows,
+    });
+
+    // ---- Block 7: serving COGS (the composed per-tenant number) ----
+    // The one number the two blocks above only imply: what serving this
+    // tenant costs per month. Marginal work (storage + blended reads +
+    // writes + maintenance) PLUS the keep-warm floor that buys the blend's
+    // warm-hit rate (idle-retained NVMe × R). Egress is excluded — it is
+    // passed through to the customer, so it is revenue-neutral, not COGS.
+    // The floor requires a measured NVMe cache size; when unmeasured the
+    // total is withheld, never guessed low.
+    let marginal_ex_egress = storage_month
+        + blended_read_q
+            .map(|q| q * SUMMARY_QUERIES_PER_MONTH)
+            .unwrap_or(0.0)
+        + writes_month
+        + maintenance_month.unwrap_or(0.0);
+    let idle_floor_total = nvme_sh.map(|s| s * node_month * f64::from(replicas));
+    let serving_cogs = {
+        let warm_pct = SUMMARY_READ_WARM_FRACTION * 100.0;
+        let mut rows = vec![vec![
+            text(format!(
+                "Marginal work — storage + blended reads ({warm_pct:.0}/{:.0}) + writes + maintenance",
+                100.0 - warm_pct,
+            )),
+            text("summary lines above, egress excluded (passed through to the customer)"),
+            context(marginal_ex_egress, usd(marginal_ex_egress), Better::Lower),
+        ]];
+        match idle_floor_total {
+            Some(floor) => {
+                rows.push(vec![
+                    text(format!(
+                        "Keep-warm floor — idle-retained NVMe × R={replicas}"
+                    )),
+                    text("the occupancy row that buys the blend's warm-hit rate"),
+                    context(floor, usd(floor), Better::Lower),
+                ]);
+                let total = serving_cogs_month(marginal_ex_egress, idle_floor_total)
+                    .expect("floor is Some in this branch");
+                rows.push(vec![
+                    text("Serving COGS (marginal + keep-warm floor, ex-egress)"),
+                    text("—"),
+                    metric(total, usd(total), Better::Lower),
+                ]);
+            }
+            None => rows.push(vec![
+                text("Serving COGS (marginal + keep-warm floor, ex-egress)"),
+                text("NVMe cache unmeasured this run — total withheld, never guessed"),
+                text("—"),
+            ]),
+        }
+        Block {
+            subtitle: format!(
+                "Serving COGS — per tenant-month at {} queries/mo, {:.0}% warm blend, \
+                 keep-warm-NVMe policy. The composed number the marginal summary and the \
+                 occupancy view each show one half of.",
+                fmt_count(SUMMARY_QUERIES_PER_MONTH as usize),
+                SUMMARY_READ_WARM_FRACTION * 100.0,
+            ),
+            headers: vec!["Line".into(), "Basis".into(), "$/month".into()],
+            rows,
+        }
+    };
+
     let mut blocks = vec![rate_card];
     if let Some(io_ledger) = io_ledger {
         blocks.push(io_ledger);
@@ -2338,6 +2677,10 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     blocks.push(compute_ledger);
     blocks.push(serving);
     blocks.push(monthly_summary);
+    if let Some(occupancy) = occupancy {
+        blocks.push(occupancy);
+    }
+    blocks.push(serving_cogs);
 
     report.emit(&Section {
         anchor: anchor.into(),
@@ -2611,5 +2954,78 @@ mod tests {
         // (1000 PUT + 50 LIST) × $5e-6 + 100 reads × $4e-7; DELETE unpriced.
         let expected = 1050.0 * 5.0e-6 + 100.0 * 4.0e-7;
         assert!((request_usd(&io) - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn nvme_share_is_decimal_gb_fraction() {
+        let inst = test_instance();
+        // NVMe capacity is quoted in decimal GB, so 47.4e9 bytes on a 237 GB
+        // device is exactly a 20% share — a GiB divisor would misstate it.
+        assert!((inst.nvme_share(47_400_000_000) - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cpu_share_at_load_reconciles_with_month_seconds() {
+        let inst = test_instance();
+        // An 8-vCPU node holds 8 × 730.5 h × 3600 s = 21,038,400 vCPU·s per
+        // month; a load consuming exactly that many is a share of 1.0, and
+        // half the load is half the share.
+        let node_vcpu_s = 8.0 * HOURS_PER_MONTH * SECS_PER_HOUR;
+        assert!((inst.cpu_share_at_load(node_vcpu_s / 1e6, 1e6) - 1.0).abs() < 1e-12);
+        assert!((inst.cpu_share_at_load(node_vcpu_s / 2e6, 1e6) - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn binding_share_picks_largest_measured_and_skips_unmeasured() {
+        let picked = binding_share(&[("CPU", Some(0.1)), ("RAM", Some(0.6)), ("NVMe", Some(0.2))]);
+        assert_eq!(picked, Some(("RAM", 0.6)));
+        // An unmeasured share is skipped, never treated as a 0 that "loses"
+        // the max — with RAM absent, NVMe binds.
+        let picked = binding_share(&[("CPU", Some(0.1)), ("RAM", None), ("NVMe", Some(0.2))]);
+        assert_eq!(picked, Some(("NVMe", 0.2)));
+        // Nothing measured ⇒ no binding row, not a fabricated $0 one.
+        assert_eq!(binding_share(&[("CPU", None), ("RAM", None)]), None);
+    }
+
+    #[test]
+    fn occupancy_dollars_multiply_share_node_price_and_replicas() {
+        let inst = test_instance();
+        // usd_per_month is the plain hourly rate over the calendar month, and
+        // a 50% share on 2 replicas bills exactly one full node-month.
+        assert!((inst.usd_per_month() - 0.3629 * HOURS_PER_MONTH).abs() < 1e-9);
+        let billed = 0.5 * inst.usd_per_month() * 2.0;
+        assert!((billed - inst.usd_per_month()).abs() < 1e-9);
+    }
+
+    /// The composed serving-COGS number: marginal-ex-egress plus the
+    /// keep-warm floor, and withheld (not guessed at marginal-only) when
+    /// the floor is unmeasured. Values mirror the 100K FTS reference run:
+    /// $4.18 marginal + $0.78 idle-NVMe floor = $4.96/mo.
+    #[test]
+    fn serving_cogs_composes_marginal_plus_floor_or_withholds() {
+        let composed = serving_cogs_month(4.18, Some(0.78)).expect("floor measured");
+        assert!((composed - 4.96).abs() < 1e-9);
+        assert_eq!(serving_cogs_month(4.18, None), None);
+    }
+
+    #[test]
+    fn replicas_parse_defaults_and_rejects_zero() {
+        // Pure parser (no env mutation): unset and garbage fall back to the
+        // default, and R=0 is rejected — it would print a $0 keep-warm bill,
+        // which is never a measurement.
+        assert_eq!(parse_replicas(None), DEFAULT_OCCUPANCY_REPLICAS);
+        assert_eq!(parse_replicas(Some("1")), 1);
+        assert_eq!(parse_replicas(Some("3")), 3);
+        assert_eq!(parse_replicas(Some("0")), DEFAULT_OCCUPANCY_REPLICAS);
+        assert_eq!(parse_replicas(Some("x")), DEFAULT_OCCUPANCY_REPLICAS);
+    }
+
+    #[test]
+    fn fmt_share_keeps_tiny_shares_visible() {
+        // The CPU share at 1M queries/mo is often well below 0.1% — it must
+        // print with significant digits, never collapse to "0.0%".
+        assert_eq!(fmt_share(0.593), "59.3%");
+        assert_eq!(fmt_share(0.0006), "0.060%");
+        assert_eq!(fmt_share(0.0), "0%");
     }
 }

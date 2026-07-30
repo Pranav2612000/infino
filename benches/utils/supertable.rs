@@ -669,6 +669,7 @@ fn run_metered_optimize(
 fn store_phases_lifecycle(
     measured: Option<ColdStoreMeasurement>,
     compaction: Option<CompactionStats>,
+    disk_cache_bytes: Option<u64>,
     routing_states: &[RoutingStateStat],
 ) -> cost::StorePhases {
     let mut store = store_phases_from_measurement(measured);
@@ -678,8 +679,21 @@ fn store_phases_lifecycle(
         store.compaction_cpu_s = cpu_s;
         store.compaction_peak_rss_bytes = Some(peak_rss);
     }
+    store.disk_cache_bytes = disk_cache_bytes;
     store.query_states = query_state_costs(routing_states);
     store
+}
+
+/// Settled local disk-cache footprint of a consumer's cache store (user +
+/// hidden index — they share one root), for the cost model's
+/// provisioned-occupancy NVMe rows. `None` when the consumer has no disk
+/// cache attached (in-memory configs).
+fn consumer_disk_cache_bytes(consumer: &Supertable) -> Option<u64> {
+    consumer
+        .options()
+        .disk_cache
+        .as_ref()
+        .map(|cache| cache.stats().current_bytes)
 }
 
 /// Measure/emit hook points around the shared FTS/SQL compaction.
@@ -699,6 +713,15 @@ enum TextLifecyclePhase {
 /// "warm" batteries at serving scale.
 const SHARED_CONSUMER_CACHE_INDEX_FACTOR: u64 = 2;
 
+/// What the shared FTS/SQL lifecycle hands back: the compaction window's
+/// stats plus the settled local disk-cache footprint of the lifecycle
+/// consumer, sampled after the post-compact battery (just before the
+/// consumer drops) — the cost model's provisioned-occupancy NVMe basis.
+struct TextLifecycleStats {
+    compaction: CompactionStats,
+    disk_cache_bytes: Option<u64>,
+}
+
 /// Shared FTS/SQL mutation sequence: open a metered consumer, measure
 /// the pre-compact state, run `optimize`, then measure post-compact —
 /// invoking `on_phase` with the SAME consumer + meter so the
@@ -712,7 +735,7 @@ fn run_metered_text_lifecycle(
     modality: Modality,
     built: &supertable::IngestResult,
     mut on_phase: impl FnMut(TextLifecyclePhase, &Supertable, &storage_meter::MeteredStorage),
-) -> CompactionStats {
+) -> TextLifecycleStats {
     let meter = storage_meter::wrap(Arc::clone(&built.storage));
     let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
         meter.provider(),
@@ -731,9 +754,13 @@ fn run_metered_text_lifecycle(
     on_phase(TextLifecyclePhase::PreCompact, &consumer, &meter);
     let compaction = run_metered_optimize(label, &consumer, &meter);
     on_phase(TextLifecyclePhase::Compacted, &consumer, &meter);
+    let disk_cache_bytes = consumer_disk_cache_bytes(&consumer);
     drop(consumer);
     drop(cache_dir);
-    compaction
+    TextLifecycleStats {
+        compaction,
+        disk_cache_bytes,
+    }
 }
 
 /// Pre-drain (transient-shape) latency rows: the warm battery and the
@@ -1676,6 +1703,7 @@ pub mod fts {
         }
 
         let mut compaction_stats = None;
+        let mut lifecycle_disk_cache_bytes: Option<u64> = None;
         let mut routing_states: Vec<RoutingStateStat> = Vec::new();
         let (warm_post, cold_post) = if run_lifecycle {
             let mut warm_post = None;
@@ -1684,7 +1712,7 @@ pub mod fts {
             // no undrained-delta commit, so the lifecycle measures just
             // two states — pre-compact and post-compact — and emits only
             // the post-compact search battery (pre-compact already ran).
-            let compaction = run_metered_text_lifecycle(
+            let lifecycle = run_metered_text_lifecycle(
                 "supertable_fts",
                 Modality::Fts,
                 &built,
@@ -1729,7 +1757,8 @@ pub mod fts {
                 },
             );
             drop(corpus.take());
-            compaction_stats = Some(compaction);
+            compaction_stats = Some(lifecycle.compaction);
+            lifecycle_disk_cache_bytes = lifecycle.disk_cache_bytes;
             (warm_post, cold_post)
         } else {
             drop(corpus.take());
@@ -1833,7 +1862,12 @@ pub mod fts {
                     // Compaction-only text lifecycle: not a full-maintenance
                     // (drain/delta) cell, so drain/delta ledger rows never render.
                     false,
-                    store_phases_lifecycle(cold_measured, compaction_stats, &routing_states),
+                    store_phases_lifecycle(
+                        cold_measured,
+                        compaction_stats,
+                        lifecycle_disk_cache_bytes,
+                        &routing_states,
+                    ),
                     None,
                     // Serving/monthly priced per query-family from the same
                     // battery the search table reports (reconciles by
@@ -4526,6 +4560,7 @@ pub mod vector {
                     query_states: query_state_costs(&routing_states),
                     filtered_query: filtered_stats.map(|(io, _)| io),
                     filtered_query_iters: filtered_stats.map(|(_, n)| n).unwrap_or(0),
+                    disk_cache_bytes: consumer_disk_cache_bytes(&consumer),
                     ..store_phases_from_measurement(cold_measured)
                 };
                 let warm_pre_vec = pre_search_rows
@@ -4718,6 +4753,7 @@ pub mod sql {
         }
 
         let mut compaction_stats = None;
+        let mut lifecycle_disk_cache_bytes: Option<u64> = None;
         let mut routing_states: Vec<RoutingStateStat> = Vec::new();
         let (warm_sets_post, cold_post) = if run_lifecycle {
             let mut warm_sets_post = None;
@@ -4726,7 +4762,7 @@ pub mod sql {
             // has no drain; the lifecycle is compaction-only, measuring just
             // pre-compact and post-compact and emitting only the post-compact
             // query battery (pre-compact already ran).
-            let compaction = run_metered_text_lifecycle(
+            let lifecycle = run_metered_text_lifecycle(
                 "supertable_sql",
                 Modality::Sql,
                 &built,
@@ -4786,7 +4822,8 @@ pub mod sql {
                 },
             );
             drop(corpus.take());
-            compaction_stats = Some(compaction);
+            compaction_stats = Some(lifecycle.compaction);
+            lifecycle_disk_cache_bytes = lifecycle.disk_cache_bytes;
             (warm_sets_post, cold_post)
         } else {
             drop(corpus.take());
@@ -4901,7 +4938,12 @@ pub mod sql {
                 // Compaction-only text lifecycle: not a full-maintenance
                 // (drain/delta) cell, so drain/delta ledger rows never render.
                 false,
-                store_phases_lifecycle(cold_measured, compaction_stats, &routing_states),
+                store_phases_lifecycle(
+                    cold_measured,
+                    compaction_stats,
+                    lifecycle_disk_cache_bytes,
+                    &routing_states,
+                ),
                 None,
                 // Serving/monthly priced per query-family from the full warm
                 // battery the search table reports (all shapes, not one).

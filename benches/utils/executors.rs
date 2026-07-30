@@ -1167,7 +1167,7 @@ pub mod fts {
         note: &str,
         warm: Option<&[FtsQueryStat]>,
         cold: Option<&HashMap<&'static str, FtsColdStat>>,
-        probes: Option<&[(&'static str, Duration, Duration)]>,
+        probes: Option<&[(&'static str, Duration, Duration, Duration)]>,
     ) {
         let warm_map: Option<HashMap<&'static str, FtsQueryStat>> =
             warm.map(|w| w.iter().map(|q| (q.name, q.clone())).collect());
@@ -1225,17 +1225,25 @@ pub mod fts {
         let mut blocks = vec![or_block, and_block, clause_block, phrase_block];
         if let Some(probes) = probes {
             blocks.push(Block {
-                subtitle: "Per-algorithm probes (WAND+BMW vs MaxScore+BMM)".into(),
-                headers: vec!["Shape".into(), "WAND+BMW".into(), "MaxScore+BMM".into()],
+                subtitle: "Per-algorithm probes (WAND+BMW vs MaxScore+BMM vs windowed union)"
+                    .into(),
+                headers: vec![
+                    "Shape".into(),
+                    "WAND+BMW".into(),
+                    "MaxScore+BMM".into(),
+                    "Windowed union".into(),
+                ],
                 rows: probes
                     .iter()
-                    .map(|(shape, wand, bmm)| {
+                    .map(|(shape, wand, bmm, windowed)| {
                         let w = wand.as_secs_f64() * NS_PER_SEC;
                         let b = bmm.as_secs_f64() * NS_PER_SEC;
+                        let u = windowed.as_secs_f64() * NS_PER_SEC;
                         vec![
                             text(*shape),
                             context(w, fmt_time(w), Better::Lower),
                             context(b, fmt_time(b), Better::Lower),
+                            context(u, fmt_time(u), Better::Lower),
                         ]
                     })
                     .collect(),

@@ -31,6 +31,7 @@ pub mod supertable;
 
 pub mod concurrent;
 pub mod diag_common;
+pub mod disk_warm;
 pub mod fts_diag;
 pub mod recall_while_ingest;
 pub mod scale;

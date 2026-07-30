@@ -231,14 +231,19 @@ const OR_WINDOW_WORDS: usize = (OR_WINDOW as usize).div_ceil(64);
 
 /// Multi-term OR dispatch floor. A 2-term OR is already sub-millisecond
 /// on MaxScore, so the window's per-window bookkeeping isn't worth it
-/// below this many terms.
-const OR_WINDOW_MIN_TERMS: usize = 3;
+/// below this many terms. `pub(crate)`: the supertable fan-out reuses
+/// this same boundary to decide when a ranged kernel is heavy enough to
+/// ship to the reader pool (see `RANGED_KERNEL_POOL_MIN_TERMS`).
+pub(crate) const OR_WINDOW_MIN_TERMS: usize = 3;
 /// Route a multi-term OR to the windowed union scorer only when the top
 /// term's score upper bound is at most this multiple of the *average*
 /// term upper bound — i.e. no single term dominates. Uniform terms sit at
 /// ~1.0× the average (MaxScore can't prune them → windowed wins); a
 /// dominant rare term sits well above it (MaxScore prunes hard → it stays
-/// on MaxScore). Calibrated on the 1M tier.
+/// on MaxScore). Calibrated on the 1M tier; re-measured on every bench
+/// run by the superfile tier's per-algorithm probes
+/// (`benches/utils/superfile.rs`), whose shapes sit on both sides of
+/// this threshold.
 const OR_WINDOW_DOMINANCE_MULT: f32 = 1.5;
 
 /// Largest `k` for which a 2-term OR routes to WAND+BMW instead of
@@ -287,6 +292,36 @@ fn no_dominant_term_ub(cursors: &[TermCursor]) -> bool {
 /// union).
 fn prefer_windowed_union(cursors: &[TermCursor]) -> bool {
     cursors.len() >= OR_WINDOW_MIN_TERMS && no_dominant_term_ub(cursors)
+}
+
+/// Initial capacity for a scan's top-k heap, in [`TopKEntry`] slots.
+///
+/// `docs_in_scope` bounds the distinct doc_ids that can ever enter the
+/// heap. It exists because callers may pass `k = usize::MAX`
+/// (`search_multi` gathers every match before weighting across
+/// columns), and `usize::MAX * size_of::<TopKEntry>()` is not an
+/// allocation any machine will serve; the heap still grows on demand.
+///
+/// `range` is the doc-id window the scan will visit; `None` is a
+/// whole-superfile scan, whose scope is `n_docs`. **Every ranged kernel
+/// must pass its own `Some((start, end))`** — a slice can only rank the
+/// docs inside its window, so sizing it by `n_docs` instead makes a
+/// sliced fan-out preallocate `slices × min(k, n_docs)` slots for a doc
+/// space its slices collectively walk exactly once. That is a
+/// pool-sized multiple on a compacted table, where doc-mass allocation
+/// hands one merged superfile the entire reader pool: measured at 1M
+/// docs × 8 threads as 61 MiB requested against 7.6 MiB rankable.
+/// Guarded by `ranged_slice_heaps_are_sized_by_their_own_range`.
+///
+/// An un-ranged caller that still has a window handy may pass it — the
+/// `min` against `n_docs` makes `Some((0, u32::MAX))` and `None`
+/// equivalent.
+pub(crate) fn top_k_initial_capacity(k: usize, n_docs: u64, range: Option<(u32, u32)>) -> usize {
+    let docs_in_scope = match range {
+        Some((start, end)) => (end.saturating_sub(start) as usize).min(n_docs as usize),
+        None => n_docs as usize,
+    };
+    k.min(docs_in_scope).max(1)
 }
 
 /// True for a 2-term cursor set where one term's posting list is at least
@@ -1121,7 +1156,7 @@ impl FtsReader {
         floor_eff: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let dl_norm_k1 = &self.columns[column_id as usize].dl_norm_k1;
-        let initial_cap = k.min(self.n_docs as usize).max(1);
+        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
 
         // Per-atom pruning slack: an atom only needs to contribute
@@ -1859,26 +1894,84 @@ impl FtsReader {
         floor: f32,
         global_idf: Option<&GlobalTermIdf>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
+        let set = self.build_or_cursor_set(column, terms, global_idf).await?;
+        self.search_or_range_prebuilt(&set, k, doc_id_start, doc_id_end, floor)
+    }
+
+    /// Build the OR cursors for `terms` once — the postings fetch and
+    /// skip-table parse — for reuse across doc-id sub-ranges via
+    /// [`Self::search_or_range_prebuilt`]. An intra-superfile fan-out
+    /// that builds per slice re-fetches every term's full posting bytes
+    /// and re-parses its skip table per slice (measured at 1M as 2.5x
+    /// cold bytes when slicing widened); clones of these cursors share
+    /// `bytes` and the `Arc` skip table instead.
+    ///
+    /// `global_idf` is baked into the cursors here (see
+    /// [`Self::build_term_cursors`]), so every sub-range sharing a set
+    /// must want the same override — it does: one gather per query.
+    pub(crate) async fn build_or_cursor_set(
+        &self,
+        column: &str,
+        terms: &[&str],
+        global_idf: Option<&GlobalTermIdf>,
+    ) -> Result<OrCursorSet, FtsError> {
         let column_id = self.resolve_column_id(column)?;
-        if terms.is_empty() || k == 0 || doc_id_start >= doc_id_end {
+        let cursors = if terms.is_empty() {
+            Vec::new()
+        } else {
+            self.build_term_cursors(column_id, terms, global_idf)
+                .await?
+        };
+        Ok(OrCursorSet { column_id, cursors })
+    }
+
+    /// Multi-term OR over `[doc_id_start, doc_id_end)` against prebuilt
+    /// cursors — the ranged fan-out's per-slice call;
+    /// [`Self::search_or_range_pretokenized_with_floor`] delegates here.
+    /// The ranged path carries no negation in v1.
+    ///
+    /// Kernel choice mirrors `dispatch_multi_term_or` instead of
+    /// hardcoding MaxScore+BMM: on a broad OR over uniform-upper-bound
+    /// terms BMM cannot prune (every block max ties), so it degrades to
+    /// per-doc min-scan bookkeeping over ~the whole union — the exact
+    /// shape `run_windowed_union` exists for, and it is natively ranged.
+    /// Hardcoding BMM here made the SAME query run a different kernel
+    /// depending on whether the fan-out sliced (few large superfiles,
+    /// i.e. post-compaction) or not (many small ones, pre-compaction) —
+    /// measured at 1M as the 11-24x post-compact broad-OR regression.
+    pub(crate) fn search_or_range_prebuilt(
+        &self,
+        set: &OrCursorSet,
+        k: usize,
+        doc_id_start: u32,
+        doc_id_end: u32,
+        floor: f32,
+    ) -> Result<Vec<(u32, f32)>, FtsError> {
+        if set.cursors.is_empty() || k == 0 || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
         }
-        let cursors = self
-            .build_term_cursors(column_id, terms, global_idf)
-            .await?;
-        if cursors.is_empty() {
-            return Ok(Vec::new());
+        let cursors = set.cursors.clone();
+        if prefer_windowed_union(&cursors) {
+            self.run_windowed_union(
+                set.column_id,
+                cursors,
+                k,
+                None,
+                floor.next_down(),
+                doc_id_start,
+                doc_id_end,
+            )
+        } else {
+            self.run_max_score_bmm_range(
+                set.column_id,
+                cursors,
+                k,
+                doc_id_start,
+                doc_id_end,
+                None,
+                floor.next_down(),
+            )
         }
-        // The ranged (sub-range fan-out) path carries no negation in v1.
-        self.run_max_score_bmm_range(
-            column_id,
-            cursors,
-            k,
-            doc_id_start,
-            doc_id_end,
-            None,
-            floor.next_down(),
-        )
     }
 
     /// Multi-column BM25 search (most_fields semantics): each
@@ -2199,7 +2292,7 @@ impl FtsReader {
         // capacity at n_docs (the upper bound on distinct doc_ids in
         // the heap) so we don't try to allocate `usize::MAX * size_of::<TopKEntry>()`.
         // The BinaryHeap grows on demand if needed.
-        let initial_cap = k.min(self.n_docs as usize).max(1);
+        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let mut threshold: f32 = 0.0;
 
@@ -2457,7 +2550,7 @@ impl FtsReader {
         // expected number of leapfrog bumps per candidate.
         cursors.sort_by_key(|c| c.block_count());
 
-        let initial_cap = k.min(self.n_docs as usize).max(1);
+        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let mut sink = ScoreSink {
             heap: &mut heap,
@@ -2493,7 +2586,7 @@ impl FtsReader {
         let dl_norm_k1 = &col_meta.dl_norm_k1;
         must_cursors.sort_by_key(|c| c.block_count());
 
-        let initial_cap = k.min(self.n_docs as usize).max(1);
+        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let should_ub = should_cursors.iter().map(|c| c.term_max_bm25).sum();
         let mut sink = MustShouldSink {
@@ -2889,7 +2982,11 @@ impl FtsReader {
             partial_max[i] = partial_max[i + 1] + cursors[i].term_max_bm25;
         }
 
-        let initial_cap = k.min(self.n_docs as usize).max(1);
+        // Sized by this slice's own window: only docs inside it can be
+        // ranked here, and a sliced fan-out would otherwise preallocate
+        // one whole-superfile heap per slice.
+        let initial_cap =
+            top_k_initial_capacity(k, u64::from(self.n_docs), Some((doc_id_start, doc_id_end)));
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         // Seed the pruning threshold with the caller's floor: docs
         // strictly below it can never matter, so the MaxScore
@@ -3256,7 +3353,11 @@ impl FtsReader {
             }
         }
 
-        let initial_cap = k.min(self.n_docs as usize).max(1);
+        // This scan's own window, as in the MaxScore path. Un-ranged
+        // callers pass `[0, u32::MAX)`, which the `n_docs` cap collapses
+        // back to a whole-superfile scope.
+        let initial_cap =
+            top_k_initial_capacity(k, u64::from(self.n_docs), Some((doc_id_start, doc_id_end)));
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         // Floor-seeded threshold, identical to the MaxScore path.
         let mut threshold: f32 = floor_eff.max(0.0);
@@ -3378,9 +3479,9 @@ impl FtsReader {
     /// block skipping — every doc in the union of the cursor postings
     /// is scored and offered to the top-K heap.
     ///
-    /// **Not on the production path.** `dispatch_multi_term_or` always
-    /// routes to MaxScore+BMM; this function is reachable only via
-    /// `search_with_algo_for_bench(OrAlgo::Exhaustive)`. It exists
+    /// **Not on the production path.** `dispatch_multi_term_or` routes
+    /// to MaxScore+BMM or the windowed union; this function is reachable
+    /// only via `search_with_algo_for_bench(OrAlgo::Exhaustive)`. It exists
     /// because the supertable bench surfaced one specific shape where
     /// it narrowly wins, and we want the option available for future
     /// re-routing work without re-implementing it.
@@ -3438,7 +3539,7 @@ impl FtsReader {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = &col_meta.dl_norm_k1;
 
-        let initial_cap = k.min(self.n_docs as usize).max(1);
+        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let mut threshold: f32 = 0.0;
 
@@ -3581,10 +3682,11 @@ impl FtsReader {
     }
 
     /// Bench/dev helper: force the multi-term OR path to use a specific
-    /// algorithm regardless of the dispatcher's heuristic. Used by
-    /// `benches/fts_search.rs` to compare WAND+BMW, MaxScore+BMM, and
-    /// exhaustive-union under identical inputs so the heuristic
-    /// threshold can be validated against measured numbers.
+    /// algorithm regardless of the dispatcher's heuristic. Used by the
+    /// superfile tier's per-algorithm probes
+    /// (`benches/utils/superfile.rs`) to compare WAND+BMW, MaxScore+BMM,
+    /// and the windowed union under identical inputs so the dispatch
+    /// thresholds are validated against measured numbers every run.
     ///
     /// **Not part of the stable API** — production code should use
     /// `search`, which routes through `dispatch_multi_term_or`.
@@ -3614,6 +3716,15 @@ impl FtsReader {
             }
         }
     }
+}
+
+/// One query's built OR cursors for one superfile: the postings fetch
+/// and skip-table parse done once, cheaply cloneable per doc-id
+/// sub-range. Produced by [`FtsReader::build_or_cursor_set`], consumed
+/// by [`FtsReader::search_or_range_prebuilt`].
+pub(crate) struct OrCursorSet {
+    column_id: u32,
+    cursors: Vec<TermCursor>,
 }
 
 /// Top-k min-heap entry `(score, doc_id)`, shared by every search
@@ -4691,6 +4802,7 @@ struct BlockMeta {
 /// `current_doc_id() == u32::MAX` is the "exhausted" sentinel; the
 /// WAND loop drops cursors that are exhausted at the top of each
 /// iteration.
+#[derive(Clone)]
 struct TermCursor {
     /// Precomputed `idf * (K1 + 1)` — the score numerator's
     /// per-cursor constant. Computed once at cursor build so the
@@ -4706,8 +4818,10 @@ struct TermCursor {
     /// the 2-term OR router to detect a rare anchor term (short list),
     /// where WAND+BMW can skip the other term's long list.
     df: u64,
-    /// Per-block metadata.
-    blocks: Vec<BlockMeta>,
+    /// Per-block metadata (the parsed skip table). Read-only after
+    /// build and `Arc`-shared, so cloning a cursor for another doc-id
+    /// sub-range costs the ~1 KiB decode buffers, never a re-parse.
+    blocks: Arc<[BlockMeta]>,
     /// Decoded buffers for the current block. Reused across decodes.
     block_doc_ids: Vec<u32>,
     block_tfs: Vec<u32>,
@@ -4778,24 +4892,31 @@ impl TermCursor {
             _ => None,
         };
 
-        let mut blocks: Vec<BlockMeta> = Vec::with_capacity(term_meta.num_blocks);
+        // Collect straight into the `Arc` allocation: `0..num_blocks` is
+        // an exact-size iterator, so this writes each entry in place —
+        // one allocation, no intermediate `Vec` + copy. The skip table
+        // is ~a quarter of a long term's cursor-build bytes (one 32-byte
+        // entry per 128-doc block), so the doubled write showed up on
+        // common-term queries.
         let mut term_max_bm25: f32 = 0.0;
-        for i in 0..term_meta.num_blocks {
-            let (last_doc_id, block_offset_in_term, raw_block_max) =
-                term_meta.skip_entry(postings, i);
-            let block_max_bm25 = match idf_rescale {
-                Some(ratio) => raw_block_max * ratio,
-                None => raw_block_max,
-            };
-            term_max_bm25 = term_max_bm25.max(block_max_bm25);
+        let blocks: Arc<[BlockMeta]> = (0..term_meta.num_blocks)
+            .map(|i| {
+                let (last_doc_id, block_offset_in_term, raw_block_max) =
+                    term_meta.skip_entry(postings, i);
+                let block_max_bm25 = match idf_rescale {
+                    Some(ratio) => raw_block_max * ratio,
+                    None => raw_block_max,
+                };
+                term_max_bm25 = term_max_bm25.max(block_max_bm25);
 
-            blocks.push(BlockMeta {
-                last_doc_id,
-                block_byte_offset: metadata_offset + block_offset_in_term,
-                block_byte_end: metadata_offset + term_meta.block_end_in_term(postings, i),
-                block_max_bm25,
-            });
-        }
+                BlockMeta {
+                    last_doc_id,
+                    block_byte_offset: metadata_offset + block_offset_in_term,
+                    block_byte_end: metadata_offset + term_meta.block_end_in_term(postings, i),
+                    block_max_bm25,
+                }
+            })
+            .collect();
 
         let mut cursor = Self {
             idf_x_k1p1: idf * (bm25::K1 + 1.0),
@@ -4834,7 +4955,7 @@ impl TermCursor {
         let idf_x_k1p1 = idf * (bm25::K1 + 1.0);
         let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
 
-        let blocks = vec![BlockMeta {
+        let blocks: Arc<[BlockMeta]> = Arc::from([BlockMeta {
             last_doc_id: doc_id,
             // No postings-region bytes back this cursor; the decoded
             // buffer is pre-filled below so `decode_current_block` is
@@ -4842,7 +4963,7 @@ impl TermCursor {
             block_byte_offset: 0,
             block_byte_end: 0,
             block_max_bm25,
-        }];
+        }]);
 
         let mut block_doc_ids = vec![0u32; BLOCK_LEN];
         let mut block_tfs = vec![0u32; BLOCK_LEN];
@@ -6221,6 +6342,237 @@ mod tests {
             [2u32, 3, 4].into_iter().collect(),
             "only docs in [2,5) returned"
         );
+    }
+
+    /// A scan's top-k heap is preallocated for the docs it can actually
+    /// rank: the whole superfile un-ranged, the window's width when
+    /// ranged. Sizing a ranged scan by `n_docs` is what made a sliced
+    /// fan-out preallocate one whole-superfile heap per slice.
+    #[test]
+    fn top_k_capacity_is_scoped_to_the_range_the_scan_visits() {
+        /// Docs in the notional superfile.
+        const N_DOCS: u64 = 1_000_000;
+        /// Result size large enough that the scope, not `k`, is the cap.
+        const BIG_K: usize = N_DOCS as usize;
+
+        // Un-ranged: scope is the whole superfile.
+        assert_eq!(top_k_initial_capacity(BIG_K, N_DOCS, None), N_DOCS as usize);
+        // Ranged: scope is the window, not the file — an eighth of the
+        // doc space preallocates an eighth of the slots.
+        let eighth = (N_DOCS / 8) as u32;
+        assert_eq!(
+            top_k_initial_capacity(BIG_K, N_DOCS, Some((0, eighth))),
+            eighth as usize
+        );
+        assert_eq!(
+            top_k_initial_capacity(BIG_K, N_DOCS, Some((eighth, 2 * eighth))),
+            eighth as usize
+        );
+        // A window wider than the file (un-ranged callers pass
+        // `[0, u32::MAX)`) collapses back to the whole-superfile scope.
+        assert_eq!(
+            top_k_initial_capacity(BIG_K, N_DOCS, Some((0, u32::MAX))),
+            N_DOCS as usize
+        );
+        // Small `k` still wins over the scope, and the floor is 1 slot so
+        // a `k = 0` or empty-range caller never asks for a zero-capacity
+        // heap.
+        assert_eq!(top_k_initial_capacity(10, N_DOCS, Some((0, eighth))), 10);
+        assert_eq!(top_k_initial_capacity(0, N_DOCS, None), 1);
+        assert_eq!(top_k_initial_capacity(BIG_K, N_DOCS, Some((5, 5))), 1);
+        // `k = usize::MAX` (`search_multi`) is capped by the scope, never
+        // turned into an unservable allocation.
+        assert_eq!(
+            top_k_initial_capacity(usize::MAX, N_DOCS, None),
+            N_DOCS as usize
+        );
+    }
+
+    /// Regression: the ranged OR entry must produce the same results as
+    /// the un-ranged path for ANY partition of the doc space, on BOTH of
+    /// the kernels its dispatch can now pick. Before the fix it hardcoded
+    /// MaxScore+BMM, so a query sliced into sub-ranges (the fan-out shape
+    /// a compacted table takes) ran a different kernel than the same query
+    /// un-ranged — uniform broad ORs degraded 11-24x post-compaction.
+    #[tokio::test]
+    async fn search_or_range_partitions_agree_with_unranged() {
+        /// Docs in the planted corpus — spans several 4096-doc OR windows
+        /// and many 128-doc posting blocks.
+        const N_DOCS: u32 = 6_000;
+        /// Ask for every match so partition union == full result set.
+        const K_ALL: usize = N_DOCS as usize;
+        /// Top-k size for the truncated comparison.
+        const K_TOP: usize = 10;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            // Deterministic mixed-df corpus: four uniform terms with
+            // varying tf (windowed-union shape), plus one rare term
+            // (dominant-UB / BMM shape when queried with two commons).
+            let mut text = String::new();
+            for (t, name) in ["alpha", "beta", "gamma", "delta"].iter().enumerate() {
+                let h = i.wrapping_mul(31).wrapping_add(t as u32 * 17) % 5;
+                for _ in 0..h {
+                    text.push_str(name);
+                    text.push(' ');
+                }
+            }
+            if i % 2000 == 7 {
+                text.push_str("rareterm ");
+            }
+            if text.is_empty() {
+                text.push_str("filler");
+            }
+            b.add_doc(0, i, &text).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        // Uniform 4-term OR routes to the windowed union; the
+        // rare+common mix keeps a dominant term UB and stays on BMM.
+        // Assert the routing rather than assume it — a corpus tweak that
+        // silently stopped exercising one branch would otherwise turn
+        // this into a test of the other branch twice.
+        let shapes: [&[&str]; 2] = [
+            &["alpha", "beta", "gamma", "delta"],
+            &["rareterm", "alpha", "beta"],
+        ];
+        let column_id = r.resolve_column_id("body").expect("column");
+        let uniform_cursors = r
+            .build_term_cursors(column_id, shapes[0], None)
+            .await
+            .expect("cursors");
+        assert!(
+            prefer_windowed_union(&uniform_cursors),
+            "uniform shape must route to the windowed ranged branch"
+        );
+        let dominant_cursors = r
+            .build_term_cursors(column_id, shapes[1], None)
+            .await
+            .expect("cursors");
+        assert!(
+            !prefer_windowed_union(&dominant_cursors),
+            "dominant-UB shape must route to the BMM ranged branch"
+        );
+        // Uneven partitions, including window-boundary-crossing cuts.
+        let partitions: [&[(u32, u32)]; 3] = [
+            &[(0, N_DOCS)],
+            &[(0, 3_000), (3_000, N_DOCS)],
+            &[(0, 100), (100, 4_097), (4_097, 5_000), (5_000, N_DOCS)],
+        ];
+
+        for terms in shapes {
+            let full = r
+                .search("body", terms, K_ALL, BoolMode::Or)
+                .await
+                .expect("un-ranged search");
+            let mut full_sorted: Vec<(u32, u32)> =
+                full.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+            full_sorted.sort_unstable();
+
+            for cuts in partitions {
+                let mut merged: Vec<(u32, f32)> = Vec::new();
+                for &(lo, hi) in cuts {
+                    merged.extend(
+                        r.search_or_range_pretokenized("body", terms, K_ALL, lo, hi)
+                            .await
+                            .expect("ranged search"),
+                    );
+                }
+                let mut merged_sorted: Vec<(u32, u32)> =
+                    merged.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+                merged_sorted.sort_unstable();
+                assert_eq!(
+                    merged_sorted, full_sorted,
+                    "partition union must equal the un-ranged result \
+                     (terms={terms:?}, cuts={cuts:?})"
+                );
+
+                // Top-k contract: resorting the merged pool by
+                // (score desc, doc asc) reproduces the un-ranged top-k.
+                let mut pool = merged.clone();
+                pool.sort_unstable_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .expect("BM25 scores are finite")
+                        .then(a.0.cmp(&b.0))
+                });
+                pool.truncate(K_TOP);
+                let top: Vec<(u32, u32)> = pool.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+                let full_top: Vec<(u32, u32)> = full
+                    .iter()
+                    .take(K_TOP)
+                    .map(|&(d, s)| (d, s.to_bits()))
+                    .collect();
+                assert_eq!(
+                    top, full_top,
+                    "merged top-{K_TOP} must equal un-ranged top-{K_TOP} \
+                     (terms={terms:?}, cuts={cuts:?})"
+                );
+            }
+        }
+    }
+
+    /// The prebuilt-cursor ranged path must be byte-identical to fresh
+    /// per-call builds — it is the same search minus the redundant fetch
+    /// and parse, so any divergence is a sharing bug (walk state leaking
+    /// between clones, stale first-block decode, ...). One set serves
+    /// overlapping windows and a repeated window to force reuse.
+    #[tokio::test]
+    async fn search_or_range_prebuilt_matches_fresh_calls() {
+        /// Docs in the planted corpus (multiple OR windows and blocks).
+        const N_DOCS: u32 = 6_000;
+        /// Ask for every match so whole result sets are compared.
+        const K_ALL: usize = N_DOCS as usize;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::new();
+            for (t, name) in ["alpha", "beta", "gamma", "delta"].iter().enumerate() {
+                let h = i.wrapping_mul(31).wrapping_add(t as u32 * 17) % 5;
+                for _ in 0..h {
+                    text.push_str(name);
+                    text.push(' ');
+                }
+            }
+            if text.is_empty() {
+                text.push_str("filler");
+            }
+            b.add_doc(0, i, &text).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let terms: &[&str] = &["alpha", "beta", "gamma", "delta"];
+        let set = r
+            .build_or_cursor_set("body", terms, None)
+            .await
+            .expect("set");
+        let windows = [
+            (0u32, N_DOCS),
+            (0, 3_000),
+            (2_000, 4_097),
+            (3_000, N_DOCS),
+            (0, N_DOCS),
+        ];
+        for (lo, hi) in windows {
+            let fresh = r
+                .search_or_range_pretokenized("body", terms, K_ALL, lo, hi)
+                .await
+                .expect("fresh ranged search");
+            let pre = r
+                .search_or_range_prebuilt(&set, K_ALL, lo, hi, f32::NEG_INFINITY)
+                .expect("prebuilt ranged search");
+            let fresh_bits: Vec<(u32, u32)> =
+                fresh.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+            let pre_bits: Vec<(u32, u32)> = pre.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+            assert_eq!(pre_bits, fresh_bits, "window ({lo},{hi})");
+        }
     }
 
     #[tokio::test]

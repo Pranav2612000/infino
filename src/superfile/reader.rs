@@ -52,7 +52,7 @@ use crate::{
         BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
         format::{self, footer, kv},
         fts::{
-            reader::{self as fts_reader, BoolMode, ClauseLists, FtsReader},
+            reader::{self as fts_reader, BoolMode, ClauseLists, FtsReader, OrCursorSet},
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
         vector::{
@@ -1275,6 +1275,38 @@ impl SuperfileReader {
                 global_idf,
             )
             .await?)
+    }
+
+    /// Build the OR cursor set for `terms` once, for reuse across this
+    /// superfile's doc-id sub-ranges via
+    /// [`Self::bm25_search_or_range_prebuilt`].
+    pub(crate) async fn bm25_or_cursor_set(
+        &self,
+        column: &str,
+        terms: &[&str],
+        global_idf: Option<&fts_reader::GlobalTermIdf>,
+    ) -> Result<OrCursorSet, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.build_or_cursor_set(column, terms, global_idf).await?)
+    }
+
+    /// Ranged multi-term OR against prebuilt cursors — see
+    /// [`Self::bm25_search_or_range_pretokenized_with_floor`] for the
+    /// range and floor contract.
+    pub(crate) fn bm25_search_or_range_prebuilt(
+        &self,
+        set: &OrCursorSet,
+        k: usize,
+        doc_id_start: u32,
+        doc_id_end: u32,
+        floor: f32,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.search_or_range_prebuilt(set, k, doc_id_start, doc_id_end, floor)?)
     }
 
     /// Prefix-expanded BM25 search restricted to a doc_id sub-range.

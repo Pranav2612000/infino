@@ -32,6 +32,11 @@ parquet = "58"
 rand = "0.10"
 rand_distr = "0.6"
 rayon = "1"
+# rustix — safe posix_fadvise(DONTNEED) + sync for the disk-warm serving-state
+# diagnostic (`disk_warm.rs`): drop the OS page cache under the local disk
+# cache without unsafe libc calls. Already in the dependency tree
+# transitively (tokio/tempfile).
+rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

@@ -234,8 +234,13 @@ pub mod fts {
         ),
     ];
 
-    /// Per-algorithm probe shapes (OR-only; WAND+BMW vs MaxScore+BMM). This
-    /// is an infino-internal hook with no cross-engine analogue.
+    /// Per-algorithm probe shapes (OR-only; WAND+BMW vs MaxScore+BMM vs
+    /// windowed union). This is an infino-internal hook with no
+    /// cross-engine analogue. The shapes deliberately span both sides of
+    /// the dispatcher's dominance threshold (`OR_WINDOW_DOMINANCE_MULT`):
+    /// `wide_3_or` carries a dominant rare term (MaxScore side), the
+    /// `similar_*` shapes are uniform (windowed side) — so every run
+    /// re-measures the routing heuristic where it actually decides.
     const PROBE_SHAPES: &[(&str, &[&str])] = &[
         ("wide_3_or", &["term00001", "term00050", "term00100"]),
         ("similar_3_or", &["term00050", "term00051", "term00052"]),
@@ -736,18 +741,21 @@ pub mod fts {
     }
 
     /// Infino-only warm probes on the measured in-memory artifact.
-    fn measure_warm_probes(index: &InfinoFtsIndex) -> Vec<(&'static str, Duration, Duration)> {
+    fn measure_warm_probes(
+        index: &InfinoFtsIndex,
+    ) -> Vec<(&'static str, Duration, Duration, Duration)> {
         eprintln!(
-            "[superfile_fts] per-algorithm probes: {} OR shapes × {WARM_ITERS} iters (WAND+BMW vs MaxScore+BMM)...",
+            "[superfile_fts] per-algorithm probes: {} OR shapes × {WARM_ITERS} iters (WAND+BMW vs MaxScore+BMM vs windowed union)...",
             PROBE_SHAPES.len(),
         );
         let reader = index.reader();
-        let mut probes: Vec<(&'static str, Duration, Duration)> = Vec::new();
+        let mut probes: Vec<(&'static str, Duration, Duration, Duration)> = Vec::new();
         for (shape, terms) in PROBE_SHAPES {
             eprintln!("[superfile_fts] probe: {shape}...");
             let wand = probe_algo_p50(reader, terms, OrAlgo::WandBmw);
             let bmm = probe_algo_p50(reader, terms, OrAlgo::Bmm);
-            probes.push((shape, wand, bmm));
+            let windowed = probe_algo_p50(reader, terms, OrAlgo::Windowed);
+            probes.push((shape, wand, bmm, windowed));
         }
         probes
     }
