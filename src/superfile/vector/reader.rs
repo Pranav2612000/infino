@@ -12,15 +12,18 @@
 //! eagerly at `open()`; per-query work happens on demand.
 
 use std::{
-    cmp::Ordering,
-    collections::{BinaryHeap, HashMap},
+    collections::HashMap,
+    fmt,
     ops::Range,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock, PoisonError,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     thread,
 };
 
 use bytes::Bytes;
-use futures::future::try_join_all;
+use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use rayon::{ThreadPool, prelude::*};
 use roaring::RoaringBitmap;
 use serde::Deserialize;
@@ -49,7 +52,10 @@ use crate::{
                 nearest_k_centroids_bytes, sum_f32,
             },
             ivf_merge::Sq8IvfMergeInput,
-            quant::BitQuantizer,
+            quant::{
+                BitQuantizer, LUT_BLOCK_ROWS, LutQuery, build_transposed_code_cache,
+                for_each_code_block_scores, lut_scan_supported,
+            },
             rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
             rotation::RandomRotation,
         },
@@ -96,6 +102,10 @@ struct Sq8ParsedMeta {
 /// Per-column reader state; cached at open time.
 #[derive(Debug)]
 pub struct ColumnReader {
+    /// Lazily built transposed code blocks for the FastScan LUT scan
+    /// (shared `Arc` so rayon scan tasks can hold it past the reader
+    /// borrow). See [`TransposedCodeCache`].
+    transposed_codes: Arc<TransposedCodeCache>,
     pub name: String,
     pub dim: usize,
     pub n_cent: u32,
@@ -1157,6 +1167,7 @@ impl VectorReader {
             }
 
             columns.push(ColumnReader {
+                transposed_codes: Arc::new(TransposedCodeCache::default()),
                 name: cfg.column.clone(),
                 dim,
                 n_cent,
@@ -1727,6 +1738,7 @@ impl VectorReader {
         };
 
         Ok(ColumnReader {
+            transposed_codes: Arc::new(TransposedCodeCache::default()),
             name: cfg.column.clone(),
             dim,
             n_cent: n_cent_u32,
@@ -2844,7 +2856,7 @@ impl VectorReader {
             survivor_only_rerank_fetch,
             &ctx,
         )
-        .await
+        .await?
         {
             ShortlistOutcome::Done(out) => return Ok(out),
             ShortlistOutcome::Rerank {
@@ -3046,6 +3058,33 @@ impl VectorReader {
             .await
     }
 
+    /// Map flat cluster ids to per-cell probe work on a multi-cell
+    /// reader: `(cell index, doc-id base, cell-local cluster ids)`.
+    /// Doc-id bases follow parquet row order (cells concatenated in
+    /// directory order). The single shared resolution step of the
+    /// immediate probe ([`Self::search_clusters_async_multi_cell`]) and
+    /// the deferred scan ([`Self::search_clusters_scan_async`]), so the
+    /// two paths cannot drift.
+    fn resolve_cells_for_clusters(&self, clusters: &[u32]) -> Vec<(usize, u32, Vec<usize>)> {
+        let mut by_cell: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &flat in clusters {
+            let Some((cell_idx, local)) = self.resolve_flat_cluster(flat) else {
+                continue;
+            };
+            by_cell.entry(cell_idx).or_default().push(local as usize);
+        }
+        let mut doc_base = vec![0u32; self.columns.len()];
+        let mut running = 0u32;
+        for (i, col) in self.columns.iter().enumerate() {
+            doc_base[i] = running;
+            running = running.saturating_add(col.n_docs);
+        }
+        by_cell
+            .into_iter()
+            .map(|(cell_idx, locals)| (cell_idx, doc_base[cell_idx], locals))
+            .collect()
+    }
+
     /// Multi-cell probe: map flat cluster ids → (cell, local), probe each
     /// touched cell, merge hits. Local doc ids are unique within a cell
     /// subsection; across cells they may collide, so hits are tagged with
@@ -3083,72 +3122,408 @@ impl VectorReader {
             return Ok(Vec::new());
         }
 
-        // Group flat cluster ids by cell index.
-        let mut by_cell: HashMap<usize, Vec<usize>> = HashMap::new();
-        for &flat in clusters {
-            let Some((cell_idx, local)) = self.resolve_flat_cluster(flat) else {
-                continue;
-            };
-            by_cell.entry(cell_idx).or_default().push(local as usize);
-        }
-        if by_cell.is_empty() {
+        let per_cell = self.resolve_cells_for_clusters(clusters);
+        if per_cell.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Doc-id bases: parquet rows are concatenated in cell-directory order.
-        let mut doc_base = vec![0u32; self.columns.len()];
-        let mut running = 0u32;
-        for (i, col) in self.columns.iter().enumerate() {
-            doc_base[i] = running;
-            running = running.saturating_add(col.n_docs);
-        }
-
-        let mut merged: Vec<(u32, f32)> = Vec::new();
-        for (cell_idx, locals) in by_cell {
+        // Probe the selected cells CONCURRENTLY — the same wave shape the
+        // supertable's cross-superfile fan-out (and FTS) already uses, one
+        // level down. A width sweep selects many cells inside one packed
+        // shard; awaiting them serially stacked their fetch+scan+rerank
+        // walls (measured ~1.2 ms x width per query at w=54 on Cohere-1M).
+        // Each cell's probe is independent: own ProbeCtx, own blocks, own
+        // rerank; the merge below is order-independent (re-sorted).
+        let cell_probes = per_cell.into_iter().filter_map(|(cell_idx, base, locals)| {
             let col = &self.columns[cell_idx];
             if col.n_docs == 0 {
-                continue;
+                return None;
             }
-            let base = doc_base[cell_idx];
             // Allow/deny are file-local; each cell IVF checks cell-local ids.
             let cell_allow = self.cell_local_filter_bitmap(allow.as_deref(), cell_idx, base);
             let cell_deny = self.cell_local_filter_bitmap(deny.as_deref(), cell_idx, base);
-            let sub_start = col.subsection_range.start;
-            let idx_start = sub_start + col.cluster_idx_off;
-            let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-            let cluster_idx = self
-                .source
-                .range_async(idx_start..idx_end)
-                .await
-                .map_err(|e| VectorError::LazySource(e.to_string()))?;
-            let mut q_rot = vec![0f32; col.dim];
-            col.rot.apply(query, &mut q_rot);
             // No inverse-selectivity rerank inflation — same reasoning as
             // [`Self::search_clusters_async`]: the shortlist is allow-first
             // (matching rows only), so the standard `k × rerank_mult`
             // contract holds unchanged under a filter.
             if cell_allow.as_ref().is_some_and(|bm| bm.is_empty()) {
-                continue;
+                return None;
             }
-            let ctx = ProbeCtx {
-                q_rot: &q_rot,
-                k,
-                rerank_mult,
-                allow: cell_allow,
-                deny: cell_deny,
-                pool: pool.clone(),
-                budget: budget.clone(),
-            };
-            let hits = self
-                .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals)
-                .await?;
-            for (local_id, score) in hits {
-                merged.push((base.saturating_add(local_id), score));
-            }
-        }
+            let pool = pool.clone();
+            let budget = budget.clone();
+            Some(async move {
+                let sub_start = col.subsection_range.start;
+                let idx_start = sub_start + col.cluster_idx_off;
+                let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
+                let cluster_idx = self
+                    .source
+                    .range_async(idx_start..idx_end)
+                    .await
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let mut q_rot = vec![0f32; col.dim];
+                col.rot.apply(query, &mut q_rot);
+                let ctx = ProbeCtx {
+                    q_rot: &q_rot,
+                    k,
+                    rerank_mult,
+                    allow: cell_allow,
+                    deny: cell_deny,
+                    pool,
+                    budget,
+                };
+                let hits = self
+                    .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals)
+                    .await?;
+                Ok::<Vec<(u32, f32)>, VectorError>(
+                    hits.into_iter()
+                        .map(|(local_id, score)| (base.saturating_add(local_id), score))
+                        .collect(),
+                )
+            })
+        });
+        // Wave-cap the concurrent probes to the pool width (the same
+        // bound every other fan-out here uses): a wide sweep over a
+        // many-celled shard must not open unbounded simultaneous
+        // range reads / cold fetches.
+        let max_in_flight = pool_wave_cap(pool.as_deref());
+        let per_cell: Vec<Vec<(u32, f32)>> = stream::iter(cell_probes)
+            .buffer_unordered(max_in_flight)
+            .try_collect()
+            .await?;
+        let mut merged: Vec<(u32, f32)> = per_cell.into_iter().flatten().collect();
         // Distance ascending (smaller = closer), matching every other vector
         // search path. Descending here kept the farthest k hits and collapsed
         // packed-shard recall to ~0.
+        merged.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        merged.truncate(k);
+        Ok(merged)
+    }
+
+    /// Deferred-rerank scan for the supertable's GLOBAL shortlist selection
+    /// (unfiltered width sweeps). Per probed cell:
+    ///
+    /// - WARM (every `[codes][doc_ids]` prefix resident): run only the
+    ///   1-bit scan, heap-capped at the UNDIVIDED `k × rerank_mult`, and
+    ///   surface the survivors with their estimates — the supertable pools
+    ///   them across cells and superfiles, selects the global top
+    ///   `k × rerank_mult`, and calls [`Self::rerank_selected_async`] with
+    ///   the winners. No survivor fetch, no rerank here.
+    /// - COLD (or `RabitqOnly`, which has no rerank stage): probe exactly
+    ///   as [`Self::search_clusters_async`] does, under the width-divided
+    ///   `cold_rerank_mult` — deferring a cold cell would hold its fetched
+    ///   blocks and budget reservation across the whole fan-out.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn search_clusters_scan_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        clusters: &[u32],
+        rerank_mult: usize,
+        cold_rerank_mult: usize,
+        allow: Option<Arc<RoaringBitmap>>,
+        deny: Option<Arc<RoaringBitmap>>,
+        pool: Option<Arc<ThreadPool>>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
+    ) -> Result<ScanOutcome, VectorError> {
+        let rot_seed = self
+            .columns
+            .first()
+            .map(|c| c.rot_seed)
+            .ok_or_else(|| VectorError::UnknownColumn(column.to_string()))?;
+        let mut outcome = ScanOutcome {
+            hits: Vec::new(),
+            candidates: Vec::new(),
+            rot_seed,
+        };
+        if k == 0 || self.n_docs == 0 {
+            return Ok(outcome);
+        }
+
+        // (cell_idx, base, cell-local chosen clusters): multi-cell files
+        // resolve flat ids per cell; single-subsection files are the
+        // degenerate one-cell case.
+        let mut per_cell: Vec<(usize, u32, Vec<usize>)> = Vec::new();
+        if self.is_multi_cell() {
+            if !self.column_id_by_name.contains_key(column) {
+                return Err(VectorError::UnknownColumn(column.to_string()));
+            }
+            let dim = self
+                .columns
+                .first()
+                .map(|c| c.dim)
+                .ok_or_else(|| VectorError::UnknownColumn(column.to_string()))?;
+            if query.len() != dim {
+                return Err(VectorError::DimensionMismatch {
+                    expected: dim,
+                    got: query.len(),
+                });
+            }
+            per_cell = self.resolve_cells_for_clusters(clusters);
+        } else {
+            let (_, validated) = self.resolve_column(column, query, k)?;
+            if !validated {
+                return Ok(outcome);
+            }
+            // v1 layout: `column_id_by_name` indexes straight into `columns`.
+            let cell_idx = self
+                .column_id_by_name
+                .get(column)
+                .copied()
+                .ok_or_else(|| VectorError::UnknownColumn(column.to_string()))?
+                as usize;
+            per_cell.push((cell_idx, 0, clusters.iter().map(|&c| c as usize).collect()));
+        }
+
+        if per_cell.is_empty() {
+            return Ok(outcome);
+        }
+        // Estimates pool cross-superfile keyed by this seed; report the
+        // REQUESTED column's seed (every cell of one column shares it),
+        // not `columns[0]`'s — a multi-column file's first column can be
+        // a different column with a different rotation.
+        outcome.rot_seed = self.columns[per_cell[0].0].rot_seed;
+        // Rotate the query once per superfile: every cell of a column
+        // shares the table-wide rotation seed (cross-cell estimate pooling
+        // depends on it), so per-cell re-rotation is duplicate work — at a
+        // ~60-cell width sweep the repeated 768x768 applies measured
+        // ~1.3ms of wall per query.
+        let first_col = &self.columns[per_cell[0].0];
+        let mut q_rot_shared = vec![0f32; first_col.dim];
+        first_col.rot.apply(query, &mut q_rot_shared);
+        let q_rot_shared = &q_rot_shared;
+        let cell_scans = per_cell.into_iter().filter_map(|(cell_idx, base, locals)| {
+            let col = &self.columns[cell_idx];
+            if col.n_docs == 0 {
+                return None;
+            }
+            let cell_allow = self.cell_local_filter_bitmap(allow.as_deref(), cell_idx, base);
+            let cell_deny = self.cell_local_filter_bitmap(deny.as_deref(), cell_idx, base);
+            if cell_allow.as_ref().is_some_and(|bm| bm.is_empty()) {
+                return None;
+            }
+            let pool = pool.clone();
+            let budget = budget.clone();
+            Some(async move {
+                let sub_start = col.subsection_range.start;
+                let idx_start = sub_start + col.cluster_idx_off;
+                let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
+                let cluster_idx = self
+                    .source
+                    .range_async(idx_start..idx_end)
+                    .await
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let cb = col.quant.code_bytes();
+                let (cluster_meta, prefix_ranges) = chosen_cluster_meta(col, &cluster_idx, &locals);
+                if cluster_meta.is_empty() {
+                    return Ok((Vec::new(), Vec::new()));
+                }
+                // Warm fast path: every prefix resident -> defer rerank.
+                let prefix_blocks: Option<Vec<Bytes>> = prefix_ranges
+                    .iter()
+                    .map(|range| self.source.try_get_range_sync(range.clone()))
+                    .collect();
+                let rabitq_only = matches!(col.rerank_codec, RerankCodec::RabitqOnly);
+                if let (Some(blocks), false) = (prefix_blocks, rabitq_only) {
+                    let ctx = ProbeCtx {
+                        q_rot: q_rot_shared,
+                        k,
+                        rerank_mult,
+                        allow: cell_allow,
+                        deny: cell_deny,
+                        pool,
+                        budget,
+                    };
+                    let coarse_limit = k.saturating_mul(rerank_mult);
+                    let shortlist =
+                        scan_shortlist(col, cb, &cluster_meta, &blocks, true, coarse_limit, &ctx)
+                            .await?;
+                    let cands = shortlist
+                        .into_iter()
+                        .map(|(did, estimate, pos, cluster_id)| ScanCandidate {
+                            did: base.saturating_add(did),
+                            estimate,
+                            pos,
+                            cluster_id,
+                            cell_idx,
+                        })
+                        .collect();
+                    return Ok::<(Vec<(u32, f32)>, Vec<ScanCandidate>), VectorError>((
+                        Vec::new(),
+                        cands,
+                    ));
+                }
+                // Cold (or RabitqOnly): probe-and-rerank now, width-divided.
+                let ctx = ProbeCtx {
+                    q_rot: q_rot_shared,
+                    k,
+                    rerank_mult: cold_rerank_mult,
+                    allow: cell_allow,
+                    deny: cell_deny,
+                    pool,
+                    budget,
+                };
+                let hits = self
+                    .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals)
+                    .await?;
+                Ok((
+                    hits.into_iter()
+                        .map(|(local_id, score)| (base.saturating_add(local_id), score))
+                        .collect(),
+                    Vec::new(),
+                ))
+            })
+        });
+        let max_in_flight = pool_wave_cap(pool.as_deref());
+        let per_cell_results: Vec<(Vec<(u32, f32)>, Vec<ScanCandidate>)> = stream::iter(cell_scans)
+            .buffer_unordered(max_in_flight)
+            .try_collect()
+            .await?;
+        for (hits, cands) in per_cell_results {
+            outcome.hits.extend(hits);
+            outcome.candidates.extend(cands);
+        }
+        // Cold hits merge to this file's top-k exactly as the immediate
+        // path does; candidates stay unbounded here (per-cell heaps
+        // already cap them) — the supertable's global selection truncates.
+        outcome
+            .hits
+            .sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        outcome.hits.truncate(k);
+        Ok(outcome)
+    }
+
+    /// Rerank the GLOBAL shortlist winners that live in this superfile —
+    /// phase C of the deferred-rerank path. Every selected candidate came
+    /// from a WARM cell scan ([`Self::search_clusters_scan_async`]), so the
+    /// survivor rows and Sq8 meta resolve from resident bytes; per cell the
+    /// flow is exactly the warm arm of the immediate probe (survivor-only
+    /// gather -> exact rerank -> ascending top-k), minus the 1-bit scan
+    /// already done.
+    pub(crate) async fn rerank_selected_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        selected: Vec<ScanCandidate>,
+        pool: Option<Arc<ThreadPool>>,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        if selected.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        if !self.column_id_by_name.contains_key(column) {
+            return Err(VectorError::UnknownColumn(column.to_string()));
+        }
+        let mut by_cell: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
+        for cand in selected {
+            by_cell.entry(cand.cell_idx).or_default().push(cand);
+        }
+        let cell_reranks = by_cell.into_iter().filter_map(|(cell_idx, cands)| {
+            let col = self.columns.get(cell_idx)?;
+            let pool = pool.clone();
+            Some(async move {
+                let sub_start = col.subsection_range.start;
+                let idx_start = sub_start + col.cluster_idx_off;
+                let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
+                let cluster_idx = self
+                    .source
+                    .range_async(idx_start..idx_end)
+                    .await
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                // Distinct probed clusters -> (off, cnt), for survivor
+                // row addressing.
+                let mut extent_by_cid: HashMap<u32, (u32, u32)> = HashMap::new();
+                for cand in &cands {
+                    extent_by_cid.entry(cand.cluster_id).or_insert_with(|| {
+                        read_cluster_entry(&cluster_idx, cand.cluster_id as usize)
+                    });
+                }
+                let mut ranges = Vec::with_capacity(cands.len());
+                let mut rerank_cands = Vec::with_capacity(cands.len());
+                for cand in &cands {
+                    let (off, cnt) = extent_by_cid[&cand.cluster_id];
+                    // `pos = off + i` was captured from the same immutable
+                    // superfile this rerank reads, so the subtraction cannot
+                    // wrap — make any future layout drift loud instead of a
+                    // ~4e9 "local" and an out-of-range byte range.
+                    debug_assert!(
+                        cand.pos >= off && cand.pos - off < cnt,
+                        "candidate pos {} outside cluster extent (off {off}, cnt {cnt})",
+                        cand.pos
+                    );
+                    let local = (cand.pos - off) as usize;
+                    let full_idx = Some(ranges.len());
+                    ranges.push(col.cluster_rerank_row_range(off, cnt, local));
+                    // `did` passes through rerank untouched (norms are keyed
+                    // by `pos`), so the file-local id stays as selected.
+                    rerank_cands.push(RerankCandidate {
+                        did: cand.did,
+                        pos: cand.pos,
+                        cluster_id: cand.cluster_id,
+                        block_idx: 0,
+                        full_off: 0,
+                        full_idx,
+                    });
+                }
+                let meta_bytes = if let Some(range) = lazy_sq8_meta_range(col) {
+                    let mut fetched = self
+                        .source
+                        .get_ranges_parallel_async(&[range])
+                        .await
+                        .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                    fetched.pop()
+                } else {
+                    None
+                };
+                let survivor_t0 = io_counters::phase_start();
+                // Residency-aware gather: the globally selected winners are
+                // FEW and SCATTERED (~k x rerank_mult / width per cell), so
+                // the coalesce plan's gap window — correct for remote
+                // fetches, where round trips dominate — merges them into
+                // ~whole-cell spans that a resident cache then materializes
+                // (measured: ~300 MB touched per query to deliver ~10 MB of
+                // rows, 60% of warm query wall). When every row resolves
+                // synchronously from resident bytes, read the exact ranges
+                // instead; fall back to the coalesced remote plan otherwise.
+                let sync_rows: Option<Vec<Bytes>> = ranges
+                    .iter()
+                    .map(|range| self.source.try_get_range_sync(range.clone()))
+                    .collect();
+                let survivor_rows = match sync_rows {
+                    Some(rows) => rows,
+                    None => get_survivor_ranges_coalesced_async(&self.source, &ranges)
+                        .await
+                        .map_err(|e| VectorError::LazySource(e.to_string()))?,
+                };
+                if let Some(t0) = survivor_t0 {
+                    io_counters::phase_record(
+                        "vec.survivor_fetch",
+                        t0.elapsed().as_micros() as u64,
+                    );
+                }
+                io_counters::phase_timed_async("vec.rerank", async {
+                    rerank_candidates_from_blocks(
+                        &self.source,
+                        meta_bytes.as_ref(),
+                        &[],
+                        Some(&survivor_rows),
+                        &rerank_cands,
+                        col,
+                        query,
+                        pool,
+                        k,
+                    )
+                    .await
+                })
+                .await
+            })
+        });
+        let max_in_flight = pool_wave_cap(pool.as_deref());
+        let per_cell: Vec<Vec<(u32, f32)>> = stream::iter(cell_reranks)
+            .buffer_unordered(max_in_flight)
+            .try_collect()
+            .await?;
+        let mut merged: Vec<(u32, f32)> = per_cell.into_iter().flatten().collect();
         merged.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         merged.truncate(k);
         Ok(merged)
@@ -3169,19 +3544,7 @@ impl VectorReader {
         chosen: &[usize],
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let cb = col.quant.code_bytes();
-        let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(chosen.len());
-        let mut cluster_prefix_ranges: Vec<Range<usize>> = Vec::with_capacity(chosen.len());
-        for &c in chosen {
-            if c >= col.n_cent as usize {
-                continue;
-            }
-            let (off, cnt) = read_cluster_entry(cluster_idx, c);
-            if cnt == 0 {
-                continue;
-            }
-            cluster_prefix_ranges.push(col.cluster_codes_doc_ids_range(off, cnt));
-            cluster_meta.push((c, off, cnt));
-        }
+        let (cluster_meta, cluster_prefix_ranges) = chosen_cluster_meta(col, cluster_idx, chosen);
         if cluster_meta.is_empty() {
             return Ok(Vec::new());
         }
@@ -3287,7 +3650,7 @@ impl VectorReader {
             survivor_only_rerank_fetch,
             ctx,
         )
-        .await
+        .await?
         {
             ShortlistOutcome::Done(out) => {
                 if let Some(t0) = shortlist_t0 {
@@ -3540,72 +3903,256 @@ enum ShortlistOutcome {
 /// then runs [`rerank_candidates_from_blocks`]. Factoring this out
 /// keeps `search` / `search_async` down to their fetch waves around a
 /// single shared kernel, so the two can't drift in scoring/recall.
-async fn build_shortlist(
+/// Resolve the chosen cluster ids against a cell's cluster index:
+/// `(cluster_id, doc_off, count)` for every non-empty in-range cluster,
+/// plus each cluster's `[codes][doc_ids]` prefix range.
+fn chosen_cluster_meta(
+    col: &ColumnReader,
+    cluster_idx: &[u8],
+    chosen: &[usize],
+) -> (Vec<(usize, u32, u32)>, Vec<Range<usize>>) {
+    let mut cluster_meta = Vec::with_capacity(chosen.len());
+    let mut prefix_ranges = Vec::with_capacity(chosen.len());
+    for &c in chosen {
+        if c >= col.n_cent as usize {
+            continue;
+        }
+        let (off, cnt) = read_cluster_entry(cluster_idx, c);
+        if cnt == 0 {
+            continue;
+        }
+        prefix_ranges.push(col.cluster_codes_doc_ids_range(off, cnt));
+        cluster_meta.push((c, off, cnt));
+    }
+    (cluster_meta, prefix_ranges)
+}
+
+/// Wave cap for concurrent per-cell probes: the pool's width — the same
+/// bound every fan-out here uses, so a wide sweep cannot open unbounded
+/// simultaneous range reads / cold fetches.
+fn pool_wave_cap(pool: Option<&ThreadPool>) -> usize {
+    pool.map(ThreadPool::current_num_threads)
+        .unwrap_or_else(rayon::current_num_threads)
+        .max(1)
+}
+
+/// Per-cell cache of cluster codes in transposed (position-major)
+/// layout for the FastScan LUT scan — the codes counterpart of the
+/// routing layer's transposed centroid cache. Built lazily per cluster
+/// on the first scan that touches it (every later query reuses the
+/// blocks) and dropped with the reader, so its lifetime and footprint
+/// ride the reader cache. Each entry holds the RAII budget reservation
+/// that admitted it; a denied reservation keeps that cluster on the
+/// row-major estimator instead of evicting anything.
+#[derive(Default)]
+pub(super) struct TransposedCodeCache {
+    clusters: Mutex<HashMap<u32, TransposedCluster>>,
+    /// Sticky once the budget declines a build: warm queries must not
+    /// keep knocking on the gate (the budget's denial counter is an
+    /// operator diagnostic, and warm search's contract is to reserve
+    /// nothing at steady state). Already-built entries keep serving;
+    /// a reader-cache reopen retries naturally.
+    budget_denied: AtomicBool,
+}
+
+impl fmt::Debug for TransposedCodeCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let clusters = self
+            .clusters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        f.debug_struct("TransposedCodeCache")
+            .field("clusters", &clusters)
+            .finish()
+    }
+}
+
+struct TransposedCluster {
+    bytes: Arc<Vec<u8>>,
+    /// Held for the entry's lifetime; releases when the reader drops.
+    _reservation: Option<Reservation>,
+}
+
+impl TransposedCodeCache {
+    /// Return the cluster's transposed code blocks, building them on
+    /// first touch. `None` = the memory budget declined the bytes; the
+    /// caller falls back to the row-major scan for this cluster.
+    fn get_or_build(
+        &self,
+        off: u32,
+        codes: &[u8],
+        cnt: usize,
+        cb: usize,
+        budget: Option<&Arc<ConnectionMemoryBudget>>,
+    ) -> Option<Arc<Vec<u8>>> {
+        {
+            let map = self.clusters.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(hit) = map.get(&off) {
+                return Some(Arc::clone(&hit.bytes));
+            }
+        }
+        if self.budget_denied.load(AtomicOrdering::Relaxed) {
+            return None;
+        }
+        // Build outside the lock: concurrent chunks of one cell may race
+        // to build the same cluster; the first insert wins and the
+        // loser's work (and reservation) is discarded — bounded waste,
+        // no lock held across the transpose.
+        let transposed_len = cnt.div_ceil(LUT_BLOCK_ROWS) * cb * LUT_BLOCK_ROWS;
+        let reservation = match budget {
+            Some(b) => match b.try_reserve(transposed_len) {
+                Ok(r) => Some(r),
+                Err(_) => {
+                    self.budget_denied.store(true, AtomicOrdering::Relaxed);
+                    tracing::warn!(
+                        transposed_len,
+                        "vector scan: connection memory budget declined the \
+                         transposed-code cache; this reader keeps the exact \
+                         row-major estimator"
+                    );
+                    return None;
+                }
+            },
+            // No budget attached: measure-only, same as the cold path.
+            None => None,
+        };
+        let bytes = Arc::new(build_transposed_code_cache(codes, cnt, cb));
+        let mut map = self.clusters.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = map.entry(off).or_insert(TransposedCluster {
+            bytes,
+            _reservation: reservation,
+        });
+        Some(Arc::clone(&entry.bytes))
+    }
+}
+
+/// Scan one cluster through the transposed LUT kernels, pushing
+/// `(did, estimate, pos, cluster_id)` for every row — the fast-path
+/// body of [`scan_shortlist`]'s per-cluster loop (unfiltered scans
+/// only; filtered scans keep the row-major estimator, whose per-row
+/// allow/deny checks precede scoring).
+#[allow(clippy::too_many_arguments)]
+fn scan_cluster_transposed(
+    transposed: &[u8],
+    doc_ids: &[u8],
+    cnt: usize,
+    off: u32,
+    cluster_id: u32,
+    cb: usize,
+    lut: &LutQuery,
+    acc: &mut Vec<(u32, f32, u32, u32)>,
+) {
+    for_each_code_block_scores(transposed, cb, lut, |base_r, scores| {
+        let live = cnt.saturating_sub(base_r).min(LUT_BLOCK_ROWS);
+        for (lane, &est) in scores.iter().enumerate().take(live) {
+            let rr = base_r + lane;
+            let did = u32::from_le_bytes(
+                doc_ids[rr * 4..rr * 4 + 4]
+                    .try_into()
+                    .expect("4-byte doc id"),
+            );
+            acc.push((did, est, off + rr as u32, cluster_id));
+        }
+    });
+}
+
+/// The pure-CPU half of [`build_shortlist`]/// The pure-CPU half of [`build_shortlist`]: score every probed cluster's
+/// 1-bit codes into one bounded heap of `coarse_limit` survivors, rayon-
+/// parallel when the candidate pool amortizes the hand-off. Shared by the
+/// immediate-rerank path ([`build_shortlist`]) and the deferred-rerank
+/// scan ([`VectorReader::search_clusters_scan_async`]). Returns unsorted
+/// `(did, estimate, pos, cluster_id)` survivors.
+async fn scan_shortlist(
     col: &ColumnReader,
     cb: usize,
     cluster_meta: &[(usize, u32, u32)],
     cluster_blocks: &[Bytes],
     survivor_only_rerank_fetch: bool,
+    coarse_limit: usize,
     ctx: &ProbeCtx<'_>,
-) -> ShortlistOutcome {
+) -> Result<Vec<(u32, f32, u32, u32)>, VectorError> {
     let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
-    // Score each probed cluster's 1-bit codes into the shortlist.
-    // The per-cluster slices are zero-copy `Bytes` views; the actual
-    // estimate scan is the hot CPU work, parallelized across clusters
-    // once the candidate pool is large enough to amortize the rayon
-    // hand-off. Cluster scoring is order-independent: every survivor
-    // is re-sorted by estimate below, so parallel and serial
-    // shortlists rank identically.
     let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
-    let coarse_limit = if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
-        ctx.k
-    } else {
-        ctx.k.saturating_mul(ctx.rerank_mult)
-    };
-    if coarse_limit == 0 {
-        return ShortlistOutcome::Done(Vec::new());
-    }
-    let score_block =
-        |heap: &mut BoundedCoarseHeap, (&(c, off, cnt), block): (&(usize, u32, u32), &Bytes)| {
-            let codes_len = (cnt as usize) * cb;
-            let doc_ids_len = (cnt as usize) * 4;
-            debug_assert_eq!(
-                block.len(),
-                if survivor_only_rerank_fetch {
-                    codes_len + doc_ids_len
-                } else {
-                    codes_len + doc_ids_len + (cnt as usize) * full_vec_bytes
-                }
-            );
-            let codes = block.slice(0..codes_len);
-            let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
-            score_cluster_codes_into_heap(
+    // Collect every scored row, then keep the top `coarse_limit` with one
+    // O(n) partition. A bounded heap pays a sift on (nearly) every push
+    // to retain the same set `select_nth` finds in a single pass — at the
+    // 1M width-sweep shape (~9K-row cells against a k*rerank_mult cap)
+    // the heap admission machinery alone measured ~15% of scan CPU.
+    // FastScan LUT fast path: unfiltered scans score whole cells, so
+    // the transposed-block kernels apply. The per-query i16 bound
+    // (`fits_i16`) closes the accumulator-overflow hole exactly; when
+    // it declines, the exact row-major estimator below is the (more
+    // precise) fallback.
+    let lut_query = (ctx.allow.is_none() && ctx.deny.is_none() && lut_scan_supported())
+        .then(|| LutQuery::new(ctx.q_rot))
+        .filter(|lut| lut.fits_i16())
+        .map(Arc::new);
+    let scan_vec = |acc: &mut Vec<(u32, f32, u32, u32)>,
+                    (&(c, off, cnt), block): (&(usize, u32, u32), &Bytes)| {
+        let codes_len = (cnt as usize) * cb;
+        let doc_ids_len = (cnt as usize) * 4;
+        debug_assert_eq!(
+            block.len(),
+            if survivor_only_rerank_fetch {
+                codes_len + doc_ids_len
+            } else {
+                codes_len + doc_ids_len + (cnt as usize) * full_vec_bytes
+            }
+        );
+        let codes = block.slice(0..codes_len);
+        let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
+        if let Some(lut) = lut_query.as_deref()
+            && let Some(transposed) = col.transposed_codes.get_or_build(
+                off,
                 &codes,
+                cnt as usize,
+                cb,
+                ctx.budget.as_ref(),
+            )
+        {
+            scan_cluster_transposed(
+                &transposed,
                 &doc_ids,
-                cnt,
+                cnt as usize,
                 off,
                 c as u32,
-                &col.quant,
-                ctx.q_rot,
-                ctx.allow.as_deref(),
-                ctx.deny.as_deref(),
-                heap,
+                cb,
+                lut,
+                acc,
             );
-        };
-    let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
-        // Parallelize the coarse 1-bit scan across the configured rayon pool,
-        // bridged back via a oneshot so no tokio worker blocks under the
-        // compute. Cluster scoring is order-independent — every survivor
-        // is re-sorted below — so chunked-parallel and serial shortlists
-        // rank identically. Partial heaps merge after.
+            return;
+        }
+        score_cluster_codes_with(
+            &codes,
+            &doc_ids,
+            cnt,
+            off,
+            c as u32,
+            &col.quant,
+            ctx.q_rot,
+            ctx.allow.as_deref(),
+            ctx.deny.as_deref(),
+            &mut |cand| acc.push((cand.did, cand.estimate, cand.pos, cand.cluster_id)),
+        );
+    };
+    let mut acc = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
+        // Parallelize the coarse 1-bit scan across the configured rayon
+        // pool, bridged back via a oneshot so no tokio worker blocks under
+        // the compute. Cluster scoring is order-independent — the partition
+        // below and every caller re-sort survivors — so chunked-parallel
+        // and serial shortlists rank identically.
         let n_tasks = parallel_chunks(cluster_meta.len());
         let chunk = cluster_meta.len().div_ceil(n_tasks).max(1);
         let quant = col.quant.clone();
+        let transposed_cache = Arc::clone(&col.transposed_codes);
+        let budget_owned = ctx.budget.clone();
+        let lut_owned = lut_query.clone();
         let q_rot_v: Vec<f32> = ctx.q_rot.to_vec();
         let meta_owned: Vec<(usize, u32, u32)> = cluster_meta.to_vec();
         let blocks_owned: Vec<Bytes> = cluster_blocks.to_vec();
-        // Move an `Arc` clone of the allow-set + deny-set into the rayon task;
-        // each chunk borrows them as `Option<&RoaringBitmap>` via `as_deref`.
+        // Move an `Arc` clone of the allow-set + deny-set into the rayon
+        // task; each chunk borrows them as `Option<&RoaringBitmap>`.
         let allow_owned = ctx.allow.clone();
         let deny_owned = ctx.deny.clone();
         let (tx, rx) = oneshot::channel();
@@ -3614,13 +4161,36 @@ async fn build_shortlist(
                 .par_chunks(chunk)
                 .zip(blocks_owned.par_chunks(chunk))
                 .map(|(meta_chunk, block_chunk)| {
-                    let mut heap = BoundedCoarseHeap::new(coarse_limit);
+                    let chunk_rows: usize =
+                        meta_chunk.iter().map(|&(_, _, cnt)| cnt as usize).sum();
+                    let cap = coarse_limit.saturating_mul(SHORTLIST_TRUNCATE_SLACK);
+                    let mut acc = Vec::with_capacity(chunk_rows.min(cap));
                     for (&(c, off, cnt), block) in meta_chunk.iter().zip(block_chunk.iter()) {
                         let codes_len = (cnt as usize) * cb;
-                        let doc_ids_len = (cnt as usize) * 4;
+                        let doc_ids = block.slice(codes_len..codes_len + (cnt as usize) * 4);
                         let codes = block.slice(0..codes_len);
-                        let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
-                        score_cluster_codes_into_heap(
+                        if let Some(lut) = lut_owned.as_deref()
+                            && let Some(transposed) = transposed_cache.get_or_build(
+                                off,
+                                &codes,
+                                cnt as usize,
+                                cb,
+                                budget_owned.as_ref(),
+                            )
+                        {
+                            scan_cluster_transposed(
+                                &transposed,
+                                &doc_ids,
+                                cnt as usize,
+                                off,
+                                c as u32,
+                                cb,
+                                lut,
+                                &mut acc,
+                            );
+                            continue;
+                        }
+                        score_cluster_codes_with(
                             &codes,
                             &doc_ids,
                             cnt,
@@ -3630,33 +4200,130 @@ async fn build_shortlist(
                             &q_rot_v,
                             allow_owned.as_deref(),
                             deny_owned.as_deref(),
-                            &mut heap,
+                            &mut |cand| {
+                                acc.push((cand.did, cand.estimate, cand.pos, cand.cluster_id))
+                            },
                         );
+                        if acc.len() >= cap {
+                            truncate_to_top_estimates(&mut acc, coarse_limit);
+                        }
                     }
-                    heap
+                    acc
                 })
-                .reduce(
-                    || BoundedCoarseHeap::new(coarse_limit),
-                    |mut a, b| {
-                        a.merge(b);
-                        a
-                    },
-                );
+                .reduce(Vec::new, |mut a, mut b| {
+                    a.append(&mut b);
+                    if a.len() >= coarse_limit.saturating_mul(SHORTLIST_TRUNCATE_SLACK) {
+                        truncate_to_top_estimates(&mut a, coarse_limit);
+                    }
+                    a
+                });
             let _ = tx.send(acc);
         });
-        rx.await
-            .expect("vector shortlist rayon task dropped result")
+        rx.await.map_err(|_| VectorError::TaskDropped("scan"))?
     } else {
-        let mut heap = BoundedCoarseHeap::new(coarse_limit);
+        let cap = coarse_limit.saturating_mul(SHORTLIST_TRUNCATE_SLACK);
+        let mut acc = Vec::with_capacity(total_candidates.min(cap));
         for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
-            score_block(&mut heap, item);
+            scan_vec(&mut acc, item);
+            if acc.len() >= cap {
+                truncate_to_top_estimates(&mut acc, coarse_limit);
+            }
         }
-        heap
+        acc
     };
-    let mut shortlist = shortlist_heap.into_vec();
+    truncate_to_top_estimates(&mut acc, coarse_limit);
+    Ok(acc)
+}
+
+/// Keep the `limit` highest-estimate survivors of one cell scan via a
+/// single O(n) partition (`select_nth_unstable`), deterministic doc-id
+/// tie-break. Output order is unspecified — every caller re-sorts or
+/// re-selects downstream.
+fn truncate_to_top_estimates(acc: &mut Vec<(u32, f32, u32, u32)>, limit: usize) {
+    if limit == 0 {
+        acc.clear();
+        return;
+    }
+    if acc.len() > limit {
+        acc.select_nth_unstable_by(limit - 1, |a, b| {
+            b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+        });
+        acc.truncate(limit);
+    }
+}
+
+/// One 1-bit-scan survivor surfaced to the supertable's GLOBAL shortlist
+/// selection (unfiltered width sweeps): the estimate that admitted it plus
+/// everything the deferred rerank needs to find its bytes again. Estimates
+/// are comparable across cells and superfiles of one column — the rotation
+/// is seeded once per column, table-wide, and the estimator is a pure
+/// function of the rotated query and the stored code.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScanCandidate {
+    /// File-local doc id (cell base already applied on packed files).
+    pub(crate) did: u32,
+    /// 1-bit RaBitQ estimate; higher = better.
+    pub(crate) estimate: f32,
+    /// Row position within the cell's cluster ordering (`cluster off + i`).
+    pub(crate) pos: u32,
+    pub(crate) cluster_id: u32,
+    /// Cell directory index within this superfile.
+    pub(crate) cell_idx: usize,
+}
+
+/// Result of a deferred-rerank scan over one superfile
+/// ([`VectorReader::search_clusters_scan_async`]).
+pub(crate) struct ScanOutcome {
+    /// Exact hits from cells that probed COLD (whole blocks fetched and
+    /// reranked immediately under the width-divided budget — deferring
+    /// them would hold the fetched blocks and their budget reservation
+    /// across the whole fan-out) plus RabitqOnly short-circuits.
+    pub(crate) hits: Vec<(u32, f32)>,
+    /// Estimate survivors from warm cells, deferred to the supertable's
+    /// global selection.
+    pub(crate) candidates: Vec<ScanCandidate>,
+    /// The column's rotation seed — the supertable asserts every pooled
+    /// unit agrees before comparing estimates across superfiles.
+    pub(crate) rot_seed: u64,
+}
+
+async fn build_shortlist(
+    col: &ColumnReader,
+    cb: usize,
+    cluster_meta: &[(usize, u32, u32)],
+    cluster_blocks: &[Bytes],
+    survivor_only_rerank_fetch: bool,
+    ctx: &ProbeCtx<'_>,
+) -> Result<ShortlistOutcome, VectorError> {
+    let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
+    // Score each probed cluster's 1-bit codes into the shortlist.
+    // The per-cluster slices are zero-copy `Bytes` views; the actual
+    // estimate scan is the hot CPU work, parallelized across clusters
+    // once the candidate pool is large enough to amortize the rayon
+    // hand-off. Cluster scoring is order-independent: every survivor
+    // is re-sorted by estimate below, so parallel and serial
+    // shortlists rank identically.
+    let coarse_limit = if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
+        ctx.k
+    } else {
+        ctx.k.saturating_mul(ctx.rerank_mult)
+    };
+    if coarse_limit == 0 {
+        return Ok(ShortlistOutcome::Done(Vec::new()));
+    }
+    let mut shortlist = scan_shortlist(
+        col,
+        cb,
+        cluster_meta,
+        cluster_blocks,
+        survivor_only_rerank_fetch,
+        coarse_limit,
+        ctx,
+    )
+    .await?;
 
     if shortlist.is_empty() {
-        return ShortlistOutcome::Done(Vec::new());
+        return Ok(ShortlistOutcome::Done(Vec::new()));
     }
 
     // `RabitqOnly` short-circuit: the 1-bit shortlist *is* the final
@@ -3674,12 +4341,12 @@ async fn build_shortlist(
         // merge path — otherwise the two paths diverge on top-k for a
         // corrupt/degenerate score.
         shortlist.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        return ShortlistOutcome::Done(
+        return Ok(ShortlistOutcome::Done(
             shortlist
                 .into_iter()
                 .map(|(did, est, _pos, _c)| (did, -est))
                 .collect(),
-        );
+        ));
     }
 
     // Build lightweight rerank references into the cluster blocks
@@ -3719,10 +4386,10 @@ async fn build_shortlist(
             full_idx,
         });
     }
-    ShortlistOutcome::Rerank {
+    Ok(ShortlistOutcome::Rerank {
         candidates,
         survivor_full_ranges,
-    }
+    })
 }
 
 /// Maximum multiplier applied to filtered-search probe breadth and
@@ -3842,6 +4509,16 @@ fn score_centroids(
 /// supertable's `nprobe × superfiles` fan-out goes parallel.
 const PARALLEL_SCAN_MIN: usize = 2048;
 
+/// Amortized shortlist-truncation slack: scan accumulators may grow to
+/// this multiple of `coarse_limit` before being partitioned back down.
+/// At real cell shapes (~9K rows vs a 6.4K cap) the guard never fires;
+/// at the 500K-row cell backstop it bounds per-task growth to
+/// `2 x coarse_limit` entries instead of every scanned row. Early
+/// truncation keeps the final set exact: the kept set is the top
+/// `coarse_limit` under a total order, so any row dropped early is
+/// dominated by rows that stay until the final partition.
+const SHORTLIST_TRUNCATE_SLACK: usize = 2;
+
 /// Number of chunks to split a parallel rayon scan into — the machine's
 /// logical parallelism, capped by the item count so we never make more
 /// chunks than there is work.
@@ -3866,25 +4543,33 @@ fn spawn_on<F: FnOnce() + Send + 'static>(pool: Option<&ThreadPool>, f: F) {
 /// compute runs on rayon (`par_iter().map().collect()`) bridged back to
 /// the async caller via a oneshot, so no tokio worker blocks under it.
 /// `f` and the items must be `'static` so the work can move onto rayon.
-async fn par_map<T, R, F>(items: Vec<T>, f: F, pool: Option<Arc<ThreadPool>>) -> Vec<R>
+async fn par_map<T, R, F>(
+    items: Vec<T>,
+    f: F,
+    pool: Option<Arc<ThreadPool>>,
+) -> Result<Vec<R>, VectorError>
 where
     T: Send + Sync + 'static,
     R: Send + 'static,
     F: Fn(&T) -> R + Send + Sync + 'static,
 {
     if parallel_chunks(items.len()) <= 1 {
-        return items.iter().map(&f).collect();
+        return Ok(items.iter().map(&f).collect());
     }
     let (tx, rx) = oneshot::channel();
     spawn_on(pool.as_deref(), move || {
         let out: Vec<R> = items.par_iter().map(f).collect();
         let _ = tx.send(out);
     });
-    rx.await.expect("rerank rayon task dropped result")
+    rx.await.map_err(|_| VectorError::TaskDropped("rerank"))
 }
 
+/// The 1-bit scan loop over one cluster's codes, generic over the
+/// candidate sink ([`scan_shortlist`] appends to a plain vec and keeps
+/// the top `coarse_limit` with one O(n) partition afterwards).
 #[inline]
-fn score_cluster_codes_into_heap(
+#[allow(clippy::too_many_arguments)]
+fn score_cluster_codes_with(
     cluster_codes: &[u8],
     cluster_doc_ids: &[u8],
     cnt: u32,
@@ -3894,7 +4579,7 @@ fn score_cluster_codes_into_heap(
     q_rot: &[f32],
     allow: Option<&roaring::RoaringBitmap>,
     deny: Option<&roaring::RoaringBitmap>,
-    out: &mut BoundedCoarseHeap,
+    sink: &mut impl FnMut(CoarseCandidate),
 ) {
     let cb = quant.code_bytes();
     let q_total: f32 = sum_f32(q_rot);
@@ -3907,22 +4592,21 @@ fn score_cluster_codes_into_heap(
         ]);
         // Filtered search: the predicate's per-superfile allow-set is a
         // hard constraint applied *before* the candidate enters the
-        // coarse heap. The heap therefore ranks distance only among
-        // matching doc-ids, so the top-k is the true k-nearest among
-        // matching rows with no underflow — no over-fetch, no
-        // post-filter. Decode the code (the hot work) only for an
-        // allowed candidate.
+        // shortlist, which therefore ranks distance only among matching
+        // doc-ids — the top-k is the true k-nearest among matching rows
+        // with no underflow, no over-fetch, no post-filter. Decode the
+        // code (the hot work) only for an allowed candidate.
         if allow.is_some_and(|bm| !bm.contains(did)) {
             continue;
         }
-        // Tombstone deny-set: exclude deleted rows here, before they can take a
-        // coarse-heap slot, so the per-cell top-k is selected from live rows.
+        // Tombstone deny-set: exclude deleted rows here, before they can
+        // take a shortlist slot, so the per-cell top-k is from live rows.
         if deny.is_some_and(|bm| bm.contains(did)) {
             continue;
         }
         let code = &cluster_codes[i * cb..(i + 1) * cb];
         let est = quant.estimate_dot_rotated_with_total(q_rot, code, q_total);
-        out.push(CoarseCandidate {
+        sink(CoarseCandidate {
             did,
             estimate: est,
             pos: off + i as u32,
@@ -3937,93 +4621,6 @@ struct CoarseCandidate {
     estimate: f32,
     pos: u32,
     cluster_id: u32,
-}
-
-impl PartialEq for CoarseCandidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.estimate == other.estimate
-            && self.did == other.did
-            && self.pos == other.pos
-            && self.cluster_id == other.cluster_id
-    }
-}
-
-impl Eq for CoarseCandidate {}
-
-impl PartialOrd for CoarseCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for CoarseCandidate {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap is a max-heap. Reverse estimate ordering so `peek()`
-        // is the worst retained candidate; higher estimates are better.
-        other
-            .estimate
-            .partial_cmp(&self.estimate)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| other.did.cmp(&self.did))
-            .then_with(|| other.pos.cmp(&self.pos))
-            .then_with(|| other.cluster_id.cmp(&self.cluster_id))
-    }
-}
-
-struct BoundedCoarseHeap {
-    limit: usize,
-    heap: BinaryHeap<CoarseCandidate>,
-}
-
-impl BoundedCoarseHeap {
-    fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            heap: BinaryHeap::with_capacity(limit.max(1)),
-        }
-    }
-
-    #[inline]
-    fn push(&mut self, candidate: CoarseCandidate) {
-        if self.limit == 0 {
-            return;
-        }
-        if self.heap.len() < self.limit {
-            self.heap.push(candidate);
-            return;
-        }
-        if self
-            .heap
-            .peek()
-            .is_some_and(|worst| candidate.estimate > worst.estimate)
-        {
-            let mut worst = self
-                .heap
-                .peek_mut()
-                .expect("heap is non-empty because len == limit");
-            *worst = candidate;
-        }
-    }
-
-    fn merge(&mut self, other: BoundedCoarseHeap) {
-        for candidate in other.heap {
-            self.push(candidate);
-        }
-    }
-
-    fn into_vec(self) -> Vec<(u32, f32, u32, u32)> {
-        self.heap
-            .into_iter()
-            .map(|candidate| {
-                (
-                    candidate.did,
-                    candidate.estimate,
-                    candidate.pos,
-                    candidate.cluster_id,
-                )
-            })
-            .collect()
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -4125,7 +4722,7 @@ async fn rerank_candidates_from_blocks(
                     },
                     pool.clone(),
                 )
-                .await
+                .await?
             } else {
                 candidates
                     .iter()
@@ -4173,7 +4770,7 @@ async fn rerank_candidates_from_blocks(
                         pool.clone(),
                         stride,
                     )
-                    .await
+                    .await?
                 }
                 Sq8ColumnMeta::Lazy {
                     scale_abs_off,
@@ -4212,7 +4809,7 @@ async fn rerank_candidates_from_blocks(
                                 pool.clone(),
                                 stride,
                             )
-                            .await,
+                            .await?,
                             k,
                         ));
                     }
@@ -4359,7 +4956,7 @@ async fn score_sq8_residual_candidates(
     residual_divisor: f32,
     pool: Option<Arc<ThreadPool>>,
     stride: usize,
-) -> Vec<(u32, f32)> {
+) -> Result<Vec<(u32, f32)>, VectorError> {
     let mut cids: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
     cids.sort_unstable();
     cids.dedup();
@@ -4416,7 +5013,7 @@ async fn score_sq8_residual_candidates(
         )
         .await
     } else {
-        candidates.iter().map(score_one).collect()
+        Ok(candidates.iter().map(score_one).collect())
     }
 }
 
@@ -4728,6 +5325,7 @@ fn fetch_sync(source: &Source, range: Range<usize>, what: &str) -> Result<Bytes,
 #[cfg(test)]
 mod tests {
     use std::{
+        cmp::Ordering,
         collections::HashSet,
         fs::File,
         hint::black_box,
@@ -4898,7 +5496,8 @@ mod tests {
             None,
             2,
         )
-        .await;
+        .await
+        .expect("sq8 scorer");
         assert_eq!(scored.len(), candidates.len());
         scored.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
         assert_eq!(
@@ -8374,8 +8973,8 @@ mod tests {
     // -----------------------------------------------------------------
     //
     // The coarse 1-bit scan in `build_shortlist`, the fp32 / Sq8 rerank
-    // scans, and the `par_map` / `parallel_chunks` / `BoundedCoarseHeap::merge`
-    // helpers all switch from a serial loop to a chunked rayon scan once
+    // scans, and the `par_map` / `parallel_chunks` helpers all switch
+    // from a serial loop to a chunked rayon scan once
     // the candidate pool crosses `PARALLEL_SCAN_MIN` (2048) with more
     // than one probed cluster. The default test corpora are far below
     // that threshold, so these tests build a deliberately large corpus
@@ -8471,31 +9070,94 @@ mod tests {
         assert!(hits[0].1 < 1e-4, "self distance ~0, got {}", hits[0].1);
     }
 
+    /// Deferred-vs-immediate parity (review follow-up): nothing else
+    /// asserts the deferred pipeline (1-bit scan -> selection ->
+    /// selected-candidate rerank) agrees with the proven immediate
+    /// probe. Same reader, same clusters, untruncated budget
+    /// (`k * rerank_mult >= corpus`, so selection drops nothing and
+    /// both paths exact-rerank identical candidate sets): the top-k
+    /// must match exactly — ids and scores — since both ends run the
+    /// same rerank kernel over the same bytes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn parallel_scan_matches_serial_scan_results() {
-        // The parallel and serial coarse/rerank paths must rank
-        // identically (chunked-parallel scoring is order-independent).
-        // Run the same query through a large corpus (parallel) and pin
-        // that a smaller-k path on the same reader is internally
-        // consistent — both recover the planted self vector.
+    async fn deferred_scan_rerank_matches_immediate_probe_top_k() {
+        let (blob, json, all) =
+            build_large_corpus(16, 4, 2600, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        let clusters: Vec<u32> = (0..4).collect();
+        let k = 25usize;
+        let rerank_mult = 128usize; // 25 * 128 = 3200 >= 2600 rows
+        let immediate = r
+            .search_clusters_async(
+                "v",
+                &all[7],
+                k,
+                &clusters,
+                rerank_mult,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("immediate probe");
+        let scan = r
+            .search_clusters_scan_async(
+                "v",
+                &all[7],
+                k,
+                &clusters,
+                rerank_mult,
+                rerank_mult,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("deferred scan");
+        assert!(
+            scan.hits.is_empty(),
+            "a fully-resident reader defers every cell (no cold hits)"
+        );
+        assert!(!scan.candidates.is_empty(), "deferred candidates surface");
+        let deferred = r
+            .rerank_selected_async("v", &all[7], k, scan.candidates, None)
+            .await
+            .expect("selected rerank");
+        assert_eq!(
+            immediate, deferred,
+            "deferred scan+select+rerank must equal the immediate probe's top-k"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parallel_scan_untruncated_pool_matches_brute_force() {
+        // 2600 docs across 4 clusters puts the probed scan over
+        // PARALLEL_SCAN_MIN, driving the chunked-parallel arm. With an
+        // untruncated shortlist (k * rerank_mult >= corpus, so
+        // `truncate_to_top_estimates` drops nothing) and fp32 rerank,
+        // the returned top-k must equal brute-force L2 over the corpus
+        // exactly — a stronger pin than ranking-consistency heuristics.
         use std::collections::HashSet;
         let (blob, json, all) = build_large_corpus(16, 4, 2600, RerankCodec::Fp32, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
-        // Large shortlist → parallel.
-        let parallel = r.search("v", &all[42], 64, 4, 40).await.expect("parallel");
-        // Small shortlist → serial (coarse_limit = 50 < 2048).
-        let serial = r.search("v", &all[42], 10, 4, 5).await.expect("serial");
-        assert_eq!(parallel[0].0, 42, "parallel recovers self");
-        assert_eq!(serial[0].0, 42, "serial recovers self");
-        // The serial top-10 set must be a subset of the parallel top-64
-        // set (same scoring, parallel just keeps more).
-        let par_ids: HashSet<u32> = parallel.iter().map(|(id, _)| *id).collect();
-        for (id, _) in &serial {
-            assert!(
-                par_ids.contains(id),
-                "serial top-10 id {id} must appear in parallel top-64"
-            );
-        }
+        // k * rerank_mult = 64 * 41 = 2624 >= 2600: nothing truncated.
+        let hits = r.search("v", &all[42], 64, 4, 41).await.expect("search");
+        assert_eq!(hits[0].0, 42, "recovers planted self");
+        let l2sq =
+            |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum() };
+        let mut exact: Vec<(u32, f32)> = all
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u32, l2sq(v, &all[42])))
+            .collect();
+        exact.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let want: HashSet<u32> = exact[..64].iter().map(|&(i, _)| i).collect();
+        let got: HashSet<u32> = hits.iter().map(|&(i, _)| i).collect();
+        assert_eq!(
+            got, want,
+            "untruncated parallel scan + fp32 rerank == brute force"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8539,81 +9201,10 @@ mod tests {
     #[tokio::test]
     async fn par_map_serial_fallback_for_small_input() {
         // parallel_chunks(items) <= 1 takes the serial map arm.
-        let out = par_map(vec![1u32, 2, 3], |x| x * 10, None).await;
+        let out = par_map(vec![1u32, 2, 3], |x| x * 10, None)
+            .await
+            .expect("serial par_map cannot drop");
         assert_eq!(out, vec![10, 20, 30]);
-    }
-
-    #[test]
-    fn bounded_coarse_heap_merge_keeps_top_by_estimate() {
-        // Direct unit test of `BoundedCoarseHeap::merge` (otherwise only
-        // reached on the parallel reduce path). Two bounded heaps merged
-        // must retain the globally-highest `estimate` candidates up to
-        // the limit.
-        let mk = |did: u32, est: f32| CoarseCandidate {
-            did,
-            estimate: est,
-            pos: did,
-            cluster_id: 0,
-        };
-        let mut a = BoundedCoarseHeap::new(3);
-        for c in [mk(0, 1.0), mk(1, 2.0), mk(2, 3.0)] {
-            a.push(c);
-        }
-        let mut b = BoundedCoarseHeap::new(3);
-        for c in [mk(3, 0.5), mk(4, 5.0), mk(5, 4.0)] {
-            b.push(c);
-        }
-        a.merge(b);
-        let mut ests: Vec<f32> = a.into_vec().into_iter().map(|(_, est, _, _)| est).collect();
-        ests.sort_by(|x, y| y.partial_cmp(x).expect("finite estimates"));
-        // Top-3 by estimate across both heaps: 5.0, 4.0, 3.0.
-        assert_eq!(ests, vec![5.0, 4.0, 3.0]);
-    }
-
-    #[test]
-    fn coarse_candidate_ordering_and_equality_tie_breaks() {
-        // The Ord impl reverses estimate (max-heap "worst" peek) and
-        // tie-breaks on did, then pos, then cluster_id. PartialEq tests
-        // every field.
-        let base = CoarseCandidate {
-            did: 5,
-            estimate: 1.0,
-            pos: 10,
-            cluster_id: 2,
-        };
-        let same = CoarseCandidate { ..base };
-        assert_eq!(base, same, "identical fields compare equal");
-        assert_eq!(base.cmp(&same), Ordering::Equal, "identical → Equal");
-
-        // Higher estimate is "better" → reversed → Less in the heap order.
-        let higher_est = CoarseCandidate {
-            estimate: 2.0,
-            ..base
-        };
-        assert_eq!(
-            base.cmp(&higher_est),
-            Ordering::Greater,
-            "lower estimate sorts as the worse (Greater) candidate"
-        );
-        assert_ne!(base, higher_est);
-
-        // Equal estimate, differing did → did tie-break (reversed).
-        let other_did = CoarseCandidate { did: 6, ..base };
-        assert_eq!(base.cmp(&other_did), Ordering::Greater);
-        assert_ne!(base, other_did);
-
-        // Equal estimate + did, differing pos → pos tie-break.
-        let other_pos = CoarseCandidate { pos: 11, ..base };
-        assert_eq!(base.cmp(&other_pos), Ordering::Greater);
-        assert_ne!(base, other_pos);
-
-        // Equal estimate + did + pos, differing cluster_id.
-        let other_cluster = CoarseCandidate {
-            cluster_id: 3,
-            ..base
-        };
-        assert_eq!(base.cmp(&other_cluster), Ordering::Greater);
-        assert_ne!(base, other_cluster);
     }
 
     // -----------------------------------------------------------------
@@ -8898,10 +9489,39 @@ mod tests {
             "warm search returns hits under a tiny budget"
         );
 
-        // Resident slices reserve nothing: no denial, and peak stays 0 even
-        // under a 0-byte gate. This is what keeps warm queries off the gate.
-        assert_eq!(budget.denials(), 0, "warm search reserves nothing");
+        // Resident slices reserve nothing for the scan itself. The one
+        // permitted knock on the gate is the transposed-code cache's
+        // single opportunistic reservation attempt: denied here (sticky
+        // per reader), after which warm search reserves nothing again —
+        // peak stays 0 under the tiny gate either way.
+        assert!(
+            budget.denials() <= 1,
+            "at most the cache's one sticky attempt, got {}",
+            budget.denials()
+        );
         assert_eq!(budget.peak(), 0, "warm search commits no bytes");
+        let denials_after_first = budget.denials();
+        let hits = r_eager
+            .search_async(
+                "v",
+                &all[0],
+                5,
+                4,
+                20,
+                None,
+                None,
+                None,
+                Some(budget.clone()),
+            )
+            .await
+            .expect("second warm search");
+        assert!(!hits.is_empty());
+        assert_eq!(
+            budget.denials(),
+            denials_after_first,
+            "denied cache stays off the gate on later queries"
+        );
+        assert_eq!(budget.peak(), 0);
     }
 
     #[tokio::test]
@@ -9299,86 +9919,103 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // CoarseCandidate ordering + BoundedCoarseHeap
+    // truncate_to_top_estimates (per-cell shortlist truncation)
     // -----------------------------------------------------------------
 
-    fn coarse(did: u32, estimate: f32) -> CoarseCandidate {
-        CoarseCandidate {
-            did,
-            estimate,
-            pos: did,
-            cluster_id: 0,
-        }
+    /// The transposed code cache builds a cluster once (later scans get
+    /// the same shared buffer), and a budget denial falls back cleanly
+    /// (`None`) instead of evicting or failing the scan.
+    #[test]
+    fn transposed_code_cache_reuses_entries_and_respects_budget() {
+        let cache = TransposedCodeCache::default();
+        let cnt = 70usize;
+        let cb = 12usize;
+        let codes: Vec<u8> = (0..cnt * cb).map(|i| i as u8).collect();
+
+        let unbudgeted = cache
+            .get_or_build(3, &codes, cnt, cb, None)
+            .expect("no budget attached never declines");
+        let again = cache.get_or_build(3, &codes, cnt, cb, None).expect("hit");
+        assert!(
+            Arc::ptr_eq(&unbudgeted, &again),
+            "second touch reuses the built buffer"
+        );
+
+        // A budget too small for the transposed buffer declines the
+        // build — and the denial is sticky for the cache's lifetime:
+        // even a roomier budget on a later query is not consulted (a
+        // reader keeps one budget in production; the reopen cycle is
+        // the retry). A separate cache with room admits the build and
+        // holds the reservation for the entry's lifetime.
+        let denied = TransposedCodeCache::default();
+        let tiny = ConnectionMemoryBudget::with_limit(64);
+        assert!(
+            denied
+                .get_or_build(9, &codes, cnt, cb, Some(&tiny))
+                .is_none()
+        );
+        assert_eq!(tiny.denials(), 1);
+        let roomy = ConnectionMemoryBudget::with_limit(1 << 20);
+        assert!(
+            denied
+                .get_or_build(9, &codes, cnt, cb, Some(&roomy))
+                .is_none(),
+            "denial is sticky per cache"
+        );
+        assert_eq!(roomy.denials(), 0, "sticky path never touches the gate");
+
+        let admitted = TransposedCodeCache::default();
+        assert!(
+            admitted
+                .get_or_build(9, &codes, cnt, cb, Some(&roomy))
+                .is_some()
+        );
+        assert!(
+            roomy.used() > 0,
+            "admitted bytes stay reserved by the entry"
+        );
     }
 
-    /// `CoarseCandidate` is reverse-ordered on `estimate` so a max-heap
-    /// `peek()` yields the *worst* (lowest-estimate) retained candidate.
-    /// Also exercises `PartialEq`/`Eq` (identical fields compare equal,
-    /// differing fields do not).
+    /// Keeps the `limit` highest-estimate rows; the survivor set matches
+    /// what the old bounded-heap admission retained.
     #[test]
-    fn coarse_candidate_reverse_orders_on_estimate() {
-        let lo = coarse(1, 0.1);
-        let hi = coarse(2, 0.9);
-        // Higher estimate is "better" → compares as Less under the
-        // reversed Ord (so it sinks to the bottom of a max-heap's worst).
-        assert_eq!(hi.cmp(&lo), Ordering::Less);
-        assert_eq!(lo.cmp(&hi), Ordering::Greater);
-        assert_eq!(lo.partial_cmp(&hi), Some(Ordering::Greater));
-
-        // PartialEq / Eq.
-        assert_eq!(coarse(5, 0.5), coarse(5, 0.5));
-        assert_ne!(coarse(5, 0.5), coarse(6, 0.5));
-        assert_ne!(coarse(5, 0.5), coarse(5, 0.6));
-
-        // The max-heap's peek is the worst (lowest-estimate) candidate.
-        let mut heap = BinaryHeap::new();
-        heap.push(coarse(1, 0.1));
-        heap.push(coarse(2, 0.9));
-        heap.push(coarse(3, 0.5));
-        assert_eq!(heap.peek().expect("non-empty").estimate, 0.1);
-    }
-
-    /// `BoundedCoarseHeap` retains the `limit` highest-estimate
-    /// candidates; pushes beyond the limit evict the current worst.
-    #[test]
-    fn bounded_coarse_heap_retains_top_by_estimate() {
-        let mut h = BoundedCoarseHeap::new(3);
-        for (did, est) in [(0u32, 0.1f32), (1, 0.9), (2, 0.5), (3, 0.7), (4, 0.2)] {
-            h.push(coarse(did, est));
-        }
-        let mut kept: Vec<u32> = h.into_vec().into_iter().map(|(did, ..)| did).collect();
+    fn truncate_keeps_top_by_estimate() {
+        let mut acc: Vec<(u32, f32, u32, u32)> =
+            [(0u32, 0.1f32), (1, 0.9), (2, 0.5), (3, 0.7), (4, 0.2)]
+                .into_iter()
+                .map(|(did, est)| (did, est, did, 0))
+                .collect();
+        truncate_to_top_estimates(&mut acc, 3);
+        let mut kept: Vec<u32> = acc.into_iter().map(|(did, ..)| did).collect();
         kept.sort_unstable();
         // The three highest estimates are 0.9 (did 1), 0.7 (did 3),
         // 0.5 (did 2).
         assert_eq!(kept, vec![1, 2, 3]);
     }
 
-    /// A zero-limit `BoundedCoarseHeap` drops every push and yields an
-    /// empty result.
+    /// Zero limit clears the shortlist; a limit at or above the length
+    /// leaves it untouched.
     #[test]
-    fn bounded_coarse_heap_zero_limit_keeps_nothing() {
-        let mut h = BoundedCoarseHeap::new(0);
-        h.push(coarse(0, 0.5));
-        h.push(coarse(1, 0.9));
-        assert!(h.into_vec().is_empty());
+    fn truncate_limit_edges() {
+        let rows: Vec<(u32, f32, u32, u32)> = vec![(0, 0.5, 0, 0), (1, 0.9, 1, 0)];
+        let mut zero = rows.clone();
+        truncate_to_top_estimates(&mut zero, 0);
+        assert!(zero.is_empty());
+        let mut fits = rows.clone();
+        truncate_to_top_estimates(&mut fits, 2);
+        assert_eq!(fits, rows);
     }
 
-    /// `merge` folds another heap's candidates in under the receiver's
-    /// limit, preserving the global top-by-estimate set.
+    /// Ties on the estimate break deterministically toward the lower
+    /// doc id, so equal-estimate boundaries cannot flap between runs.
     #[test]
-    fn bounded_coarse_heap_merge_preserves_global_top() {
-        let mut a = BoundedCoarseHeap::new(2);
-        a.push(coarse(0, 0.1));
-        a.push(coarse(1, 0.4));
-        let mut b = BoundedCoarseHeap::new(2);
-        b.push(coarse(2, 0.9));
-        b.push(coarse(3, 0.2));
-        a.merge(b);
-        let mut kept: Vec<u32> = a.into_vec().into_iter().map(|(did, ..)| did).collect();
+    fn truncate_tie_breaks_on_doc_id() {
+        let mut acc: Vec<(u32, f32, u32, u32)> =
+            (0u32..6).rev().map(|did| (did, 0.5f32, did, 0)).collect();
+        truncate_to_top_estimates(&mut acc, 3);
+        let mut kept: Vec<u32> = acc.into_iter().map(|(did, ..)| did).collect();
         kept.sort_unstable();
-        // Across both heaps the two best estimates are 0.9 (did 2) and
-        // 0.4 (did 1).
-        assert_eq!(kept, vec![1, 2]);
+        assert_eq!(kept, vec![0, 1, 2]);
     }
 
     // -----------------------------------------------------------------

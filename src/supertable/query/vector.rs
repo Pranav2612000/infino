@@ -68,7 +68,8 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
     future::Future,
-    sync::Arc,
+    mem,
+    sync::{Arc, Mutex, PoisonError},
     time::Instant,
 };
 
@@ -97,6 +98,7 @@ use crate::{
         vector::{
             distance::{Metric, distance, relative_score_window},
             layout::VectorLayout,
+            reader::ScanCandidate,
         },
     },
     supertable::{
@@ -113,6 +115,20 @@ use crate::{
         tombstones::SidecarCache,
     },
 };
+
+/// A calibrated law width at or below this resolves to `None`: one cell
+/// is exactly the fine-first default's sweep, so the law only engages
+/// when it demands a WIDER read than the default already performs.
+const LAW_WIDTH_WITHIN_DEFAULT: usize = 1;
+
+/// Oversample factor on the per-sweep rerank budget. Dividing
+/// `k x rerank_mult` evenly across the sweep under-serves the nearest
+/// cells (they hold most true neighbors, and the 1-bit estimate ranks
+/// some of them deep within their cell): an even split measured
+/// 0.9695 recall@100 on Cohere-1M vs 0.9937 for undivided caps, and 2x
+/// headroom still only 0.9865. 4x holds the bar while keeping the total
+/// survivor budget well below the undivided width sweep.
+const WIDTH_BUDGET_OVERSAMPLE: usize = 4;
 
 /// Candidate growth when a deleted row occupies a current top-k slot.
 const DELETE_REFILL_GROWTH_FACTOR: usize = 2;
@@ -1341,36 +1357,20 @@ impl SupertableReader {
 
         let mut gated = Vec::new();
         let mut scored = Vec::new();
+        // Width the sweep was pinned to (caller nprobe or the width law);
+        // `None` on the fine-first default and legacy paths.
+        let mut sweep_width: Option<usize> = None;
         // Assigned in both admit arms; used below for the posting-aware
         // budget expand (keep scoring until we cover ≥ k postings).
         let candidate_counts: HashMap<(usize, u32), u64>;
         if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
-            let cell_routing = if hidden_vector_index {
-                let base = hidden_routing.expect("hidden manifest carries routing");
-                if options.nprobe.is_some() && (filtered || options.widen_unfiltered_hidden_cells) {
-                    // Explicit caller `nprobe` pins the hidden cell sweep. FILTERED
-                    // queries always honor it (the width-dial calibration and the
-                    // filtered sweep). UNFILTERED hidden queries honor it only when
-                    // `widen_unfiltered_hidden_cells` is set — a diagnostic whose
-                    // setter is `#[cfg(feature = "test-helpers")]`, so it is
-                    // unreachable from the production public API and used only by
-                    // the recall breadth-sweep bench. In production the flag is
-                    // always `false`, so an explicit `nprobe` on an unfiltered
-                    // hidden query keeps the persisted p=1 routing (the `else` arms
-                    // below) — `with_nprobe` does not change serving behavior.
-                    // Filtered queries additionally lift per-cell fine depth to the
-                    // filtered floor; unfiltered keeps the persisted fine depth.
-                    CellRoutingParams {
-                        nprobe_min: nprobe.max(1),
-                        nprobe_max: nprobe.max(1),
-                        fine_nprobe: if filtered {
-                            base.fine_nprobe.max(FILTERED_HIDDEN_FINE_NPROBE)
-                        } else {
-                            base.fine_nprobe
-                        },
-                        ..base
-                    }
-                } else if filtered {
+            // Base routing shape first (per branch), then one shared caller
+            // override on top.
+            let mut cell_routing = if hidden_vector_index {
+                let base = hidden_routing.ok_or_else(|| {
+                    QueryError::Execute("hidden manifest missing cell routing".into())
+                })?;
+                if filtered {
                     // Allow-set queries widen to the filtered floor and
                     // probe DEEPER fine runs per cell — the matching
                     // neighbors sit past the unfiltered top runs; the
@@ -1383,12 +1383,6 @@ impl SupertableReader {
                     }
                 } else {
                     base
-                }
-            } else if options.nprobe.is_some() {
-                CellRoutingParams {
-                    nprobe_min: nprobe.max(1),
-                    nprobe_max: nprobe.max(1),
-                    ..CellRoutingParams::default()
                 }
             } else if filtered {
                 // Filtered UNDRAINED-tail fan: the default user-table
@@ -1403,6 +1397,32 @@ impl SupertableReader {
             } else {
                 CellRoutingParams::default()
             };
+            // Per-table probe-width law: when the drain calibrated one and
+            // the caller passed nothing, the law's width for this `k` acts
+            // exactly like an explicit caller `nprobe` — same pin, same
+            // per-fragment gating downstream. How far the true top-k
+            // spreads over cells is a property of the corpus (synthetic
+            // clustered data calibrates to 1 cell at k=10; Cohere-1M/768d
+            // measured ~30 of 256 cells at k=100), so the default width
+            // must be per-table and per-k, never a constant. A law width
+            // of 1 resolves to `None` and keeps the fine-first p=1 path
+            // byte-for-byte.
+            let law_width: Option<usize> =
+                if hidden_vector_index && !filtered && options.nprobe.is_none() {
+                    hidden_routing
+                        .and_then(|r| r.width_for_k_at(k))
+                        .filter(|w| *w > LAW_WIDTH_WITHIN_DEFAULT)
+                } else {
+                    None
+                };
+            let populated_cells = postings_by_cell.len().max(1);
+            sweep_width = apply_width_pin(
+                &mut cell_routing,
+                options.nprobe.map(|n| n.max(1)),
+                law_width,
+                filtered,
+                populated_cells,
+            );
             // Per-cell fine probe = max(floor, floor(pct × cell fine-cluster
             // count)), so depth scales with cell size. Filtered queries keep
             // their own fixed fine floor (pct = 0); the proportional depth
@@ -1490,6 +1510,22 @@ impl SupertableReader {
                     union_cell_selection(&grid_cells, &fine_cells)
                 };
                 let selected_cells: HashSet<u32> = selected_cells_ordered.iter().copied().collect();
+                // Wave-pooled depth is the p=1 read-volume model: keep runs
+                // per drain wave so reads track wave count, not probed-cell
+                // count — which also means widening the cell sweep alone
+                // cannot deepen the read (measured flat 0.443 recall@100
+                // from nprobe=4 through 256 on Cohere-1M). An explicit
+                // caller `nprobe` — or the calibrated width law standing in
+                // for one — is a request to actually read N cells, so gate
+                // per (cell, fragment) exactly like the pre-drain user path:
+                // depth follows width, read amplification is what was asked
+                // for (explicitly by the caller, or measured as necessary
+                // by the drain's calibration).
+                let generation_of = if sweep_width.is_some() {
+                    None
+                } else {
+                    Some(birth_versions.as_slice())
+                };
                 gated = gate_fine_candidates_by_fragment(
                     candidates,
                     &selected_cells,
@@ -1499,7 +1535,7 @@ impl SupertableReader {
                     gated_target,
                     &candidate_counts,
                     &mut scored,
-                    Some(&birth_versions),
+                    generation_of,
                 );
             } else {
                 // Fine-first p=1 over all scored fines. Explicit nprobe /
@@ -1662,8 +1698,10 @@ impl SupertableReader {
         // for every entry would `expect`-panic on exactly those
         // filtered-out superfiles; gating it behind the selection guard
         // keeps the lookup on the path where presence is invariant.
-        let mut units: Vec<(Arc<SuperfileEntry>, (Vec<u32>, Option<Arc<RoaringBitmap>>))> =
-            Vec::new();
+        let mut units: Vec<(
+            Arc<SuperfileEntry>,
+            (usize, Vec<u32>, Option<Arc<RoaringBitmap>>),
+        )> = Vec::new();
         for (si, entry) in superfiles.iter().enumerate() {
             let Some(ids) = per_seg.remove(&si) else {
                 continue;
@@ -1675,7 +1713,7 @@ impl SupertableReader {
                 },
                 None => None,
             };
-            units.push((Arc::clone(entry), (ids, bitmap)));
+            units.push((Arc::clone(entry), (si, ids, bitmap)));
         }
         if units.is_empty() {
             if let Some(t0) = admit_t0 {
@@ -1694,8 +1732,49 @@ impl SupertableReader {
         // capping the number of concurrent superfiles keeps that transient
         // memory bounded by instance configuration instead of table size.
         // Skipped superfiles issue zero GETs.
+        // Per-sweep rerank budget. The `k x rerank_mult` shortlist cap was
+        // sized for the fine-first p=1 read: applied per probed cell it
+        // exceeds any cell's row count, so at width every row of every
+        // probed cell "survives" the 1-bit prune and the survivor-only
+        // rerank fetch degenerates into fetching whole cells (measured:
+        // ~6.5 MB x 54 cells per query at w=54). Divide the cap across the
+        // sweep so the TOTAL survivor budget stays ~k x rerank_mult —
+        // measured sufficient at that total: 0.9957 recall@100 on
+        // Cohere-1M with ~25.6K survivors.
+        // On the hidden width sweep the divide is superseded by GLOBAL
+        // shortlist selection: warm cells scan at the undivided cap and the
+        // supertable keeps the best `k x rerank_mult` estimates across the
+        // whole sweep — exact, no even-split heuristic (measured 0.9937
+        // undivided vs 0.9914 divided recall@100 on Cohere-1M). Cold cells
+        // still rerank inside their own probe under the divided budget:
+        // deferring them would hold their fetched blocks and their budget
+        // reservation across the entire fan-out.
+        let global_shortlist_width = if hidden_vector_index {
+            sweep_width.filter(|w| *w > 1)
+        } else {
+            None
+        };
+        let mut cold_rerank_mult = 0;
+        let options = match sweep_width {
+            Some(w) if w > 1 => {
+                let (_, rerank_mult) = options.resolve(filtered);
+                let divided = rerank_mult
+                    .saturating_mul(WIDTH_BUDGET_OVERSAMPLE)
+                    .div_ceil(w)
+                    .max(1);
+                if global_shortlist_width.is_some() {
+                    cold_rerank_mult = divided;
+                    options
+                } else {
+                    options.with_rerank_mult(divided)
+                }
+            }
+            _ => options,
+        };
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
+        let column_arc2 = Arc::clone(&column_arc);
+        let query_arc2 = Arc::clone(&query_arc);
         let reader_pool = Arc::clone(&manifest.options.reader_pool);
         // Per-connection memory budget: gates each superfile's cold cluster-block fetch.
         let budget = Some(Arc::clone(&manifest.options.connection_memory_budget));
@@ -1709,76 +1788,112 @@ impl SupertableReader {
         // dropped after ranking by identity instead. The hidden path skips
         // sidecars entirely: its deletes ride inline in the hidden manifest
         // and are applied after remapping to user `_id`s.
-        let body = move |reader: Arc<SuperfileReader>,
-                         entry: Arc<SuperfileEntry>,
-                         tombstone_cache: Option<Arc<SidecarCache>>,
-                         now: Instant,
-                         (ids, bitmap): (Vec<u32>, Option<Arc<RoaringBitmap>>)| {
-            let column = Arc::clone(&column_arc);
-            let query = Arc::clone(&query_arc);
-            let reader_pool = Arc::clone(&reader_pool);
-            let budget = budget.clone();
-            let storage = storage.clone();
-            async move {
-                // Unfiltered user path on row-addressable locals: resolve the
-                // bitmap once (warm after the orchestrator's prefetch) and
-                // push it down. Filtered search leaves it `None` — its
-                // allow-set already excludes tombstones.
-                let deny_pushdown = !hidden_vector_index
-                    && bitmap.is_none()
-                    && entry.vector_layout != VectorLayout::MultiCellIvf;
-                let deny = match tombstone_cache.as_ref() {
-                    Some(cache) if deny_pushdown => {
-                        dispatch::tombstone_deny_set(cache, entry.superfile_id, now)?
-                    }
-                    _ => None,
-                };
-                let pool = Some(Arc::clone(&reader_pool));
-                // Replicated hidden cells store boundary duplicates; fetch
-                // enough extra slots that the post-merge stable-id dedup
-                // still leaves k distinct rows.
-                let replica_overhead = reader
-                    .vec()
-                    .map(|v| (v.n_docs() as usize).saturating_sub(reader.n_docs() as usize))
-                    .unwrap_or(0);
-                let k_fetch = k.saturating_add(replica_overhead);
-                let reader_for_ids = Arc::clone(&reader);
-                let hits = reader
-                    .vector_search_clusters_filtered(
-                        &column, &query, k_fetch, &ids, options, bitmap, deny, pool, budget,
-                    )
-                    .await
-                    .map_err(vector_read_query_error)?;
-                let mut tagged = dispatch::tag_hits(&entry, hits);
-                // Prefer manifest span arithmetic; only touch `_id` pages /
-                // inline IVF regions when the layout is cell-packed or gapped.
-                io_counters::phase_timed_async("vec.stable_id", async {
-                    dispatch::attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false).await
-                })
-                .await?;
-                if !hidden_vector_index && !deny_pushdown {
-                    // MultiCell user files (and any path that skipped the
-                    // push-down): drop deleted rows by identity post-rank.
-                    dispatch::apply_resolved_tombstone_filter(
-                        &reader_for_ids,
-                        storage.as_ref(),
-                        tombstone_cache.as_ref(),
-                        &entry,
-                        &mut tagged,
-                        now,
-                    )
+        // Warm-cell estimate survivors from every scanned unit, pooled for
+        // the global selection: (unit index, rot seed, candidates).
+        let scan_pool: Arc<Mutex<Vec<(usize, u64, usize, Vec<ScanCandidate>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let scan_pool_body = Arc::clone(&scan_pool);
+        let body =
+            move |reader: Arc<SuperfileReader>,
+                  entry: Arc<SuperfileEntry>,
+                  tombstone_cache: Option<Arc<SidecarCache>>,
+                  now: Instant,
+                  (si, ids, bitmap): (usize, Vec<u32>, Option<Arc<RoaringBitmap>>)| {
+                let column = Arc::clone(&column_arc);
+                let query = Arc::clone(&query_arc);
+                let reader_pool = Arc::clone(&reader_pool);
+                let budget = budget.clone();
+                let storage = storage.clone();
+                let scan_pool = Arc::clone(&scan_pool_body);
+                async move {
+                    // Unfiltered user path on row-addressable locals: resolve the
+                    // bitmap once (warm after the orchestrator's prefetch) and
+                    // push it down. Filtered search leaves it `None` — its
+                    // allow-set already excludes tombstones.
+                    let deny_pushdown = !hidden_vector_index
+                        && bitmap.is_none()
+                        && entry.vector_layout != VectorLayout::MultiCellIvf;
+                    let deny = match tombstone_cache.as_ref() {
+                        Some(cache) if deny_pushdown => {
+                            dispatch::tombstone_deny_set(cache, entry.superfile_id, now)?
+                        }
+                        _ => None,
+                    };
+                    let pool = Some(Arc::clone(&reader_pool));
+                    // Replicated hidden cells store boundary duplicates; fetch
+                    // enough extra slots that the post-merge stable-id dedup
+                    // still leaves k distinct rows.
+                    let replica_overhead = reader
+                        .vec()
+                        .map(|v| (v.n_docs() as usize).saturating_sub(reader.n_docs() as usize))
+                        .unwrap_or(0);
+                    let k_fetch = k.saturating_add(replica_overhead);
+                    let reader_for_ids = Arc::clone(&reader);
+                    let hits = if global_shortlist_width.is_some() {
+                        // Deferred-rerank scan: exact hits from cold cells now;
+                        // warm-cell estimate survivors pooled for the global
+                        // selection (phase C reranks the winners).
+                        let scan = reader
+                            .vector_scan_clusters_filtered(
+                                &column,
+                                &query,
+                                k_fetch,
+                                &ids,
+                                options,
+                                cold_rerank_mult,
+                                bitmap,
+                                deny,
+                                pool,
+                                budget,
+                            )
+                            .await
+                            .map_err(vector_read_query_error)?;
+                        if !scan.candidates.is_empty() {
+                            scan_pool
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .push((si, scan.rot_seed, replica_overhead, scan.candidates));
+                        }
+                        scan.hits
+                    } else {
+                        reader
+                            .vector_search_clusters_filtered(
+                                &column, &query, k_fetch, &ids, options, bitmap, deny, pool, budget,
+                            )
+                            .await
+                            .map_err(vector_read_query_error)?
+                    };
+                    let mut tagged = dispatch::tag_hits(&entry, hits);
+                    // Prefer manifest span arithmetic; only touch `_id` pages /
+                    // inline IVF regions when the layout is cell-packed or gapped.
+                    io_counters::phase_timed_async("vec.stable_id", async {
+                        dispatch::attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false)
+                            .await
+                    })
                     .await?;
+                    if !hidden_vector_index && !deny_pushdown {
+                        // MultiCell user files (and any path that skipped the
+                        // push-down): drop deleted rows by identity post-rank.
+                        dispatch::apply_resolved_tombstone_filter(
+                            &reader_for_ids,
+                            storage.as_ref(),
+                            tombstone_cache.as_ref(),
+                            &entry,
+                            &mut tagged,
+                            now,
+                        )
+                        .await?;
+                    }
+                    Ok::<Vec<SuperfileHit>, QueryError>(tagged)
                 }
-                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
-            }
-        };
+            };
         // Filtered search holds a per-superfile RoaringBitmap while the
         // kernel builds its shortlist; wave-cap the fan-out by reader-pool
         // width so transient memory stays bounded. The unfiltered path
         // carries no bitmaps and fans out all units at once (matching
         // main's concurrency — every superfile GET overlaps on tokio).
         let fanout_t0 = io_counters::phase_start();
-        let per_superfile = if allow.is_some() {
+        let mut per_superfile = if allow.is_some() {
             let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
             let mut collected = Vec::new();
             while !units.is_empty() {
@@ -1793,6 +1908,102 @@ impl SupertableReader {
         } else {
             dispatch::fanout_with(self, units, !hidden_vector_index, false, body).await?
         };
+
+        // Phase C of the deferred-rerank width sweep: select the best
+        // `k x rerank_mult` estimates ACROSS every warm-scanned cell and
+        // superfile, then rerank only those winners where they live. The
+        // estimates are comparable across units — one rotation seed per
+        // column, table-wide — asserted here at the only place different
+        // units' estimates ever meet.
+        if global_shortlist_width.is_some() {
+            let pooled = {
+                let mut guard = scan_pool.lock().unwrap_or_else(PoisonError::into_inner);
+                mem::take(&mut *guard)
+            };
+            if !pooled.is_empty() {
+                // Hard error, not debug_assert: this is the one site where
+                // estimates from different superfiles are pooled and ranked
+                // against each other. Backstopped by the open-time seed
+                // check today, but if a future path ever admits a
+                // differently-seeded unit, fail the query loudly instead of
+                // silently ranking incomparable estimates.
+                if pooled.windows(2).any(|w| w[0].1 != w[1].1) {
+                    return Err(QueryError::Execute(
+                        "pooled 1-bit estimates require one rotation seed per column".into(),
+                    ));
+                }
+                let (_, rerank_mult) = options.resolve(filtered);
+                // Mirror phase A/C's `k_fetch = k + replica_overhead` in the
+                // global cut so boundary replicas (dormant today: overhead
+                // is 0 with replication off) cannot take shortlist slots
+                // from distinct rows before the stable-id dedup.
+                let replica_overhead = pooled.iter().map(|(_, _, o, _)| *o).max().unwrap_or(0);
+                let mut flat: Vec<(usize, ScanCandidate)> = pooled
+                    .into_iter()
+                    .flat_map(|(si, _, _, cands)| cands.into_iter().map(move |c| (si, c)))
+                    .collect();
+                flat = select_global_shortlist(
+                    flat,
+                    k.saturating_add(replica_overhead)
+                        .saturating_mul(rerank_mult),
+                );
+                let mut winners_by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
+                for (si, cand) in flat {
+                    winners_by_seg.entry(si).or_default().push(cand);
+                }
+                let rerank_units: Vec<(Arc<SuperfileEntry>, Vec<ScanCandidate>)> = superfiles
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(si, entry)| {
+                        winners_by_seg
+                            .remove(&si)
+                            .map(|sel| (Arc::clone(entry), sel))
+                    })
+                    .collect();
+                let column = Arc::clone(&column_arc2);
+                let query = Arc::clone(&query_arc2);
+                let reader_pool = Arc::clone(&manifest.options.reader_pool);
+                let body_c = move |reader: Arc<SuperfileReader>,
+                                   entry: Arc<SuperfileEntry>,
+                                   _tombstone_cache: Option<Arc<SidecarCache>>,
+                                   _now: Instant,
+                                   selected: Vec<ScanCandidate>| {
+                    let column = Arc::clone(&column);
+                    let query = Arc::clone(&query);
+                    let reader_pool = Arc::clone(&reader_pool);
+                    async move {
+                        // Hidden-path invariants: no tombstone sidecars (the
+                        // manifest's deletes apply after the stable-id
+                        // remap upstream), replica slack mirrors phase A.
+                        let replica_overhead = reader
+                            .vec()
+                            .map(|v| (v.n_docs() as usize).saturating_sub(reader.n_docs() as usize))
+                            .unwrap_or(0);
+                        let k_fetch = k.saturating_add(replica_overhead);
+                        let reader_for_ids = Arc::clone(&reader);
+                        let hits = reader
+                            .vector_rerank_selected(
+                                &column,
+                                &query,
+                                k_fetch,
+                                selected,
+                                Some(reader_pool),
+                            )
+                            .await
+                            .map_err(vector_read_query_error)?;
+                        let mut tagged = dispatch::tag_hits(&entry, hits);
+                        io_counters::phase_timed_async("vec.stable_id", async {
+                            dispatch::attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false)
+                                .await
+                        })
+                        .await?;
+                        Ok::<Vec<SuperfileHit>, QueryError>(tagged)
+                    }
+                };
+                per_superfile
+                    .extend(dispatch::fanout_with(self, rerank_units, false, false, body_c).await?);
+            }
+        }
         if let Some(t0) = fanout_t0 {
             io_counters::phase_record("vec.fanout_wall", t0.elapsed().as_micros() as u64);
         }
@@ -2709,6 +2920,73 @@ fn subtract_tombstones(
 /// distance (smallest = closest). Uses a max-heap of size k so
 /// we never sort more than k elements — O(S·k·log k) instead of
 /// O(S·k·log(S·k)) for the full-sort approach.
+/// One shared width override on top of the per-branch base routing:
+/// explicit caller `nprobe` pins the cell sweep width on every branch —
+/// an override is honored, never discarded — and with no override a
+/// drain-calibrated law width pins the same way. Returns the engaged
+/// `sweep_width` (drives the per-sweep rerank-budget divide and the
+/// per-fragment fine gating downstream), `None` when nothing pinned.
+///
+/// Depth rides the width on the UNFILTERED path, for the pin exactly as
+/// for the law: the law's coverage numbers assume a probed cell is read
+/// in full (measured: half-depth caps recall at 0.964 where full depth
+/// reaches 0.995), and a caller-widened sweep at the persisted
+/// fine-first depth contributes only each cell's first runs — measured
+/// ~0.83 recall@100 on Cohere-1M REGARDLESS of width, a dial that
+/// widened without deepening. The per-fragment gate still clamps to
+/// each fragment's real run count. FILTERED queries keep their own fine
+/// floors (already applied to `routing` by the base branch) and never
+/// engage `sweep_width`: a sparse allow-set's shortlist divided across
+/// cells starves. `populated_cells` clamps the width the budget divide
+/// splits by — never more than the cells that actually carry postings.
+fn apply_width_pin(
+    routing: &mut CellRoutingParams,
+    caller_nprobe: Option<usize>,
+    law_width: Option<usize>,
+    filtered: bool,
+    populated_cells: usize,
+) -> Option<usize> {
+    if let Some(nprobe) = caller_nprobe {
+        routing.nprobe_min = nprobe;
+        routing.nprobe_max = nprobe;
+        if filtered {
+            return None;
+        }
+        routing.fine_nprobe = usize::MAX;
+        Some(nprobe.clamp(1, populated_cells))
+    } else if let Some(width) = law_width {
+        routing.nprobe_min = width;
+        routing.nprobe_max = width;
+        routing.fine_nprobe = usize::MAX;
+        Some(width.min(populated_cells))
+    } else {
+        None
+    }
+}
+
+/// Deterministic global shortlist selection for deferred-rerank width
+/// sweeps: keep the `limit` best 1-bit estimates pooled across every
+/// scanned unit. Higher estimate = better; ties break on
+/// (unit, cell, pos, did), a total order, so the KEPT SET is
+/// insertion-order independent across concurrent scans. O(n) partition,
+/// not a sort — the winners need no internal order (phase C regroups by
+/// unit and the rerank is exact).
+fn select_global_shortlist(
+    mut pooled: Vec<(usize, ScanCandidate)>,
+    limit: usize,
+) -> Vec<(usize, ScanCandidate)> {
+    let cmp = |a: &(usize, ScanCandidate), b: &(usize, ScanCandidate)| {
+        b.1.estimate.total_cmp(&a.1.estimate).then_with(|| {
+            (a.0, a.1.cell_idx, a.1.pos, a.1.did).cmp(&(b.0, b.1.cell_idx, b.1.pos, b.1.did))
+        })
+    };
+    if pooled.len() > limit {
+        pooled.select_nth_unstable_by(limit, cmp);
+        pooled.truncate(limit);
+    }
+    pooled
+}
+
 fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
     // Total order over hits: distance ascending, then the unique
     // `(superfile, local_doc_id)` key. The tie-break makes the kept set
@@ -2866,11 +3144,11 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, VectorFilter, VectorSearchOptions,
-        admit_shortlist_window, cells_ranked_by_fine_score, gate_fine_candidates_by_fragment,
-        hidden_hits_user_ids, is_hidden_vector_manifest, postings_by_cell_from_summaries,
-        projection_is_id_score_only, score_fine_candidates, union_cell_selection,
-        vector_read_query_error,
+        RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
+        VectorSearchOptions, admit_shortlist_window, apply_width_pin, cells_ranked_by_fine_score,
+        gate_fine_candidates_by_fragment, hidden_hits_user_ids, is_hidden_vector_manifest,
+        postings_by_cell_from_summaries, projection_is_id_score_only, score_fine_candidates,
+        select_global_shortlist, union_cell_selection, vector_read_query_error,
     };
     use crate::{
         InfinoError,
@@ -2883,7 +3161,10 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             error::QueryError,
-            manifest::{ClusterCentroids, list::PartitionStrategy},
+            manifest::{
+                ClusterCentroids,
+                list::{CellRoutingParams, PartitionStrategy},
+            },
         },
         test_helpers::default_tokenizer as tok,
     };
@@ -3979,6 +4260,87 @@ mod tests {
         );
     }
 
+    /// Warm-vs-cold parity for the width sweep — the review's "cold
+    /// fixture". The warm arm defers survivors to the global shortlist;
+    /// a cell with non-resident prefixes reranks in-probe under the
+    /// divided cold budget and never enters global selection. At an
+    /// untruncated budget both arms exact-rerank every candidate, so
+    /// the same query on the same committed table must return identical
+    /// hits regardless of cache state. (The replica variant stays
+    /// blocked on the drain_replica_target_factor crash filed
+    /// separately.)
+    #[test]
+    fn vector_cold_arm_matches_warm_top_k() {
+        use crate::test_helpers::lazy_foreground_disk_cache;
+
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+
+        // Warm: default in-memory reader cache — every prefix resident,
+        // the sweep defers to the global shortlist.
+        let warm_hits = {
+            let st = Supertable::create(
+                options_one_superfile_per_commit(dim).with_storage(Arc::clone(&storage)),
+            )
+            .expect("create");
+            for c in 0..4u64 {
+                let mut w = st.writer().expect("writer");
+                w.append(&build_vector_batch(c * 32, 32, dim, schema.clone()))
+                    .expect("append");
+                w.commit().expect("commit");
+            }
+            st.drain_vectors_to_cells_sync().expect("drain");
+            st.reader()
+                .expect("reader")
+                .vector_hits(
+                    "emb",
+                    &q,
+                    20,
+                    VectorSearchOptions::new().with_nprobe(4),
+                    None,
+                )
+                .expect("warm search")
+        };
+
+        // Cold: a fresh handle reading through a lazy disk-cache source —
+        // nothing resident, every probed cell takes the cold arm.
+        let cache_dir = tempfile::TempDir::new().expect("cache dir");
+        let cache = lazy_foreground_disk_cache(Arc::clone(&storage), cache_dir.path());
+        let st_cold = Supertable::open(
+            options_one_superfile_per_commit(dim)
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(Arc::clone(&cache)),
+        )
+        .expect("open cold");
+        let cold_hits = st_cold
+            .reader()
+            .expect("reader")
+            .vector_hits(
+                "emb",
+                &q,
+                20,
+                VectorSearchOptions::new().with_nprobe(4),
+                None,
+            )
+            .expect("cold search");
+        assert!(
+            cache.stats().n_cold_fetches >= 1,
+            "the cold handle must actually read through the lazy cache \
+             (otherwise this fixture proves nothing)"
+        );
+
+        assert_eq!(
+            warm_hits, cold_hits,
+            "cache state must not change the top-k (warm deferred-global vs \
+             cold divided in-probe, both exact at an untruncated budget)"
+        );
+    }
+
     /// A larger post-drain corpus (many docs across several commits, drained
     /// into multiple cells) searched with a wider `k` and `nprobe`, so the
     /// query reranks candidates spanning multiple clusters — the multi-cluster
@@ -4018,13 +4380,21 @@ mod tests {
                 None,
             )
             .expect("wide search");
+        let unfiltered_exact = near_count(&hits);
         assert!(
-            hits.len() >= 8,
-            "e_0 has 8 exact matches across commits; wide search must find them, got {}",
-            hits.len()
+            unfiltered_exact >= 8,
+            "e_0 has 8 exact matches across commits; wide search must find \
+             them, got {unfiltered_exact}"
         );
 
-        // Filtered variant over the same corpus.
+        // Filtered variant over the same corpus. The title predicate
+        // matches every row, so the allow-set machinery runs with full
+        // coverage and must recover the SAME exact matches as the
+        // unfiltered sweep — pinning that a filtered query with an explicit
+        // `nprobe` keeps its full per-cell shortlist (the width-era
+        // rerank-budget divide and per-fragment gating are unfiltered-only
+        // semantics; a filtered sweep that picked them up would starve a
+        // sparse allow-set).
         let filtered = st
             .reader()
             .expect("reader")
@@ -4040,7 +4410,298 @@ mod tests {
                 }),
             )
             .expect("filtered wide search");
-        assert!(!filtered.is_empty(), "filtered wide search returns hits");
+        assert_eq!(
+            near_count(&filtered),
+            unfiltered_exact,
+            "filtered+nprobe must find the same exact matches as the \
+             unfiltered sweep"
+        );
+    }
+
+    /// Score bound separating planted neighbors from orthogonal docs in the
+    /// drained one-hot fixture: query-aligned directions score well below
+    /// it, every other direction scores exactly 1.0 (cos = 0).
+    const ORTHOGONAL_SCORE: f32 = 0.9;
+    /// Fixture dimensionality — one one-hot direction per dim.
+    const FIXTURE_DIM: usize = 16;
+    /// Commits in the drained fixture (each its own user superfile).
+    const FIXTURE_COMMITS: u64 = 4;
+    /// Rows per fixture commit; `FIXTURE_COMMITS x this / FIXTURE_DIM`
+    /// docs land on each one-hot direction.
+    const FIXTURE_ROWS_PER_COMMIT: usize = 32;
+    /// Docs planted per one-hot direction (128 docs mod 16 dims).
+    const DOCS_PER_DIRECTION: usize =
+        FIXTURE_COMMITS as usize * FIXTURE_ROWS_PER_COMMIT / FIXTURE_DIM;
+
+    /// Drained planted fixture shared by the probe-width tests: 128 one-hot
+    /// docs over 16 directions in 4 commits, drained into per-direction
+    /// cells, plus a query leaning on three directions — its exact top-24
+    /// spans three cells. Returns `(tempdir, table, query, k)`; the tempdir
+    /// must outlive the table.
+    fn drained_three_direction_fixture() -> (tempfile::TempDir, Supertable, Vec<f32>, usize) {
+        let dim = FIXTURE_DIM;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        for c in 0..FIXTURE_COMMITS {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(
+                c * FIXTURE_ROWS_PER_COMMIT as u64,
+                FIXTURE_ROWS_PER_COMMIT,
+                dim,
+                schema.clone(),
+            ))
+            .expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        q[1] = 0.9;
+        q[2] = 0.8;
+        (dir, st, q, 3 * DOCS_PER_DIRECTION)
+    }
+
+    /// Planted neighbors among `hits` (orthogonal docs score exactly 1.0).
+    fn near_count(hits: &[SuperfileHit]) -> usize {
+        hits.iter().filter(|h| h.score < ORTHOGONAL_SCORE).count()
+    }
+
+    /// Explicit caller `nprobe` widens the post-drain UNFILTERED cell sweep.
+    ///
+    /// Regression test for the discarded-override bug: unfiltered hidden
+    /// routing used to keep the persisted p=1 params and ignore
+    /// `with_nprobe`, so a query whose true top-k spans several cells could
+    /// never recover the neighbors outside the single probed cell (measured
+    /// on Cohere-1M/768d at k=100: recall capped at 0.61 with the probed
+    /// cell scanned in full). The corpus below plants the top-k across
+    /// THREE cells — two would pass even without the fix, because the
+    /// no-override union selection already admits `UNION_FINE_PICKS_MIN = 2`
+    /// fine-ranked cells.
+    #[test]
+    fn caller_nprobe_widens_unfiltered_post_drain_sweep() {
+        let (_dir, st, q, k) = drained_three_direction_fixture();
+
+        // Narrow override: the drain calibrated a wide width law for this
+        // corpus, but `with_nprobe(1)` pulls the sweep back below it — the
+        // override wins in both directions, it is never merely a floor.
+        // (nprobe=1 still reads the grid∪fine union's UNION_FINE_PICKS_MIN
+        // fine picks, so "narrow" means fewer cells than the law, not one.)
+        let narrow_hits = st
+            .reader()
+            .expect("reader")
+            .vector_hits(
+                "emb",
+                &q,
+                k,
+                VectorSearchOptions::new().with_nprobe(1),
+                None,
+            )
+            .expect("narrow search");
+        let narrow = near_count(&narrow_hits);
+        assert!(
+            narrow >= DOCS_PER_DIRECTION && narrow < k,
+            "with_nprobe(1) must narrow the sweep below the law-widened \
+             default (got {narrow} of {k})"
+        );
+
+        // Wide override: recovers the full exact top-k across three cells.
+        let wide_hits = st
+            .reader()
+            .expect("reader")
+            .vector_hits(
+                "emb",
+                &q,
+                k,
+                VectorSearchOptions::new().with_nprobe(DOCS_PER_DIRECTION),
+                None,
+            )
+            .expect("wide search");
+        assert_eq!(
+            near_count(&wide_hits),
+            k,
+            "with_nprobe must widen the unfiltered post-drain sweep to all \
+             {k} exact neighbors across three cells — caller nprobe is an \
+             override, never discarded"
+        );
+    }
+
+    /// [`apply_width_pin`] semantics, all four arms. Depth MUST ride the
+    /// width on unfiltered pins — a widened sweep at the persisted
+    /// fine-first depth reads only each cell's first runs and caps recall
+    /// regardless of width (measured ~0.83 on Cohere-1M at any nprobe).
+    #[test]
+    fn width_pin_lifts_fine_depth_on_unfiltered_overrides() {
+        let base = CellRoutingParams {
+            nprobe_min: 1,
+            nprobe_max: 1,
+            fine_nprobe: 6,
+            ..CellRoutingParams::default()
+        };
+
+        // Unfiltered caller nprobe: width pinned, depth lifted, sweep
+        // engaged (clamped to populated cells).
+        let mut r = base;
+        let sweep = apply_width_pin(&mut r, Some(64), None, false, 40);
+        assert_eq!((r.nprobe_min, r.nprobe_max), (64, 64));
+        assert_eq!(r.fine_nprobe, usize::MAX, "depth rides the pin");
+        assert_eq!(sweep, Some(40), "sweep width clamps to populated cells");
+
+        // Filtered caller nprobe: width pinned, but the filtered fine
+        // floor is preserved and the width machinery stays disengaged.
+        let mut r = base;
+        let sweep = apply_width_pin(&mut r, Some(64), None, true, 40);
+        assert_eq!((r.nprobe_min, r.nprobe_max), (64, 64));
+        assert_eq!(r.fine_nprobe, 6, "filtered floors untouched by the pin");
+        assert_eq!(sweep, None, "filtered sweeps keep pre-width budget");
+
+        // Law width (no caller override): same pin + depth as an explicit
+        // unfiltered nprobe.
+        let mut r = base;
+        let sweep = apply_width_pin(&mut r, None, Some(45), false, 256);
+        assert_eq!((r.nprobe_min, r.nprobe_max), (45, 45));
+        assert_eq!(r.fine_nprobe, usize::MAX, "depth rides the law");
+        assert_eq!(sweep, Some(45));
+
+        // Nothing pinned: routing untouched.
+        let mut r = base;
+        let sweep = apply_width_pin(&mut r, None, None, false, 256);
+        assert_eq!(r, base);
+        assert_eq!(sweep, None);
+    }
+
+    /// The deferred-rerank width sweep under the tightest possible rerank
+    /// budget: `rerank_mult = 1` leaves the global selection exactly `k`
+    /// slots across ALL probed cells — the even-split divide would hand
+    /// each cell a starved slice, but the global pool ranks every cell's
+    /// estimates together, so the planted neighbors (whose one-hot
+    /// estimates dominate the orthogonal rest) all survive selection and
+    /// rerank to the exact top-k.
+    #[test]
+    fn global_shortlist_survives_minimal_rerank_budget() {
+        let (_dir, st, q, k) = drained_three_direction_fixture();
+        let hits = st
+            .reader()
+            .expect("reader")
+            .vector_hits(
+                "emb",
+                &q,
+                k,
+                VectorSearchOptions::new()
+                    .with_nprobe(DOCS_PER_DIRECTION)
+                    .with_rerank_mult(1),
+                None,
+            )
+            .expect("wide search, minimal budget");
+        assert_eq!(
+            near_count(&hits),
+            k,
+            "global shortlist selection at k x 1 must keep every planted \
+             neighbor across three cells"
+        );
+    }
+
+    /// [`select_global_shortlist`] is deterministic and order-independent:
+    /// the same candidates in any arrival order produce the same cut, ties
+    /// on estimate break on (unit, cell, pos, did), and the limit is a
+    /// hard truncation.
+    #[test]
+    fn select_global_shortlist_is_deterministic() {
+        let cand = |est: f32, cell: usize, pos: u32, did: u32| ScanCandidate {
+            did,
+            estimate: est,
+            pos,
+            cluster_id: 0,
+            cell_idx: cell,
+        };
+        let a = vec![
+            (0usize, cand(0.9, 0, 1, 1)),
+            (1usize, cand(0.9, 0, 1, 1)),
+            (0usize, cand(0.5, 1, 2, 2)),
+            (1usize, cand(0.7, 0, 3, 3)),
+        ];
+        let mut b = a.clone();
+        b.reverse();
+        let pick = |v: Vec<(usize, ScanCandidate)>| {
+            select_global_shortlist(v, 3)
+                .into_iter()
+                .map(|(si, c)| (si, c.cell_idx, c.pos, c.did))
+                .collect::<Vec<_>>()
+        };
+        let mut from_a = pick(a);
+        let mut from_b = pick(b);
+        from_a.sort_unstable();
+        from_b.sort_unstable();
+        assert_eq!(
+            from_a, from_b,
+            "the kept SET must be arrival-order independent (its internal \
+             order is unspecified — the partition does not sort)"
+        );
+        assert_eq!(from_a.len(), 3, "limit is a hard truncation");
+        // Tie on estimate 0.9 breaks by unit, so both 0.9 copies stay and
+        // the 0.7 candidate takes the last slot; 0.5 falls off the cut.
+        assert_eq!(from_a, vec![(0, 0, 1, 1), (1, 0, 1, 1), (1, 0, 3, 3)]);
+    }
+
+    /// A clean drain calibrates the probe-width law from the table's own
+    /// rows and stamps it into the manifest routing; a DEFAULT search (no
+    /// nprobe, no config) then widens to the calibrated width. On this
+    /// planted corpus the exact top-24 spans three cells, which the old
+    /// fixed p=1 default could never recover (it returned one direction's
+    /// 8 docs); the law measures the spread and buys the coverage without
+    /// the caller knowing any knob exists.
+    #[test]
+    fn drain_calibrated_width_law_widens_default_search() {
+        let (_dir, st, q, k) = drained_three_direction_fixture();
+        let hits = st
+            .reader()
+            .expect("reader")
+            .vector_hits("emb", &q, k, VectorSearchOptions::new(), None)
+            .expect("default search");
+        let near = near_count(&hits);
+        assert_eq!(
+            near, k,
+            "drain-calibrated width law must widen the default sweep to all \
+             {k} exact neighbors across three cells, got {near}"
+        );
+    }
+
+    /// An incremental drain calibrates only the newly spilled tail; its
+    /// measurement must never NARROW the stamped law (element-wise max
+    /// merge), or a small tightly-clustered append would under-probe all
+    /// older data. The delta here spans few directions, so its own law is
+    /// far narrower than the fixture's — the default search must still
+    /// recover the full three-cell top-k afterward.
+    #[test]
+    fn incremental_drain_never_narrows_the_width_law() {
+        let (_dir, st, q, k) = drained_three_direction_fixture();
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(
+            (FIXTURE_COMMITS * FIXTURE_ROWS_PER_COMMIT as u64) + 1,
+            DOCS_PER_DIRECTION,
+            FIXTURE_DIM,
+            schema_with_vector(FIXTURE_DIM),
+        ))
+        .expect("append delta");
+        w.commit().expect("commit delta");
+        st.drain_vectors_to_cells_sync().expect("incremental drain");
+
+        let hits = st
+            .reader()
+            .expect("reader")
+            .vector_hits("emb", &q, k, VectorSearchOptions::new(), None)
+            .expect("default search after incremental drain");
+        let near = near_count(&hits);
+        assert_eq!(
+            near,
+            k,
+            "the delta-only calibration must not narrow the stamped law: \
+             default search lost {} of {k} planted neighbors",
+            k - near
+        );
     }
 
     /// The `Supertable::vector_search` handle wrapper (tests normally call

@@ -26,20 +26,32 @@
 //! manifest centroids and rows to fp32 before [`distance`]; rows are
 //! re-spliced with [`encode_encoded_rows`], never decoded to full fp32 corpora.
 
-use std::{cmp::Ordering, collections::HashMap};
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    sync::{Mutex, PoisonError},
+};
 
 use crate::{
     config,
     superfile::vector::{
         cell_posting::{
-            EncodedCellRow, dequantize_sq8_residual_into, manifest_centroid_components_from_row,
+            EncodedCellRow, MaterializedIvfRow, dequantize_sq8_residual_into,
+            manifest_centroid_components_from_row,
         },
-        distance::{Metric, distance, nearest_k_centroids_transposed, relative_score_window},
+        distance::{
+            Metric, distance, nearest_k_centroids_transposed, normalize, relative_score_window,
+        },
         kmeans::{kmeans, kmeans_pp},
+        reservoir::Reservoir,
+        spill::SpilledCellRows,
     },
-    supertable::manifest::{
-        ClusterCentroids, RABITQ_ADMIT_CELL_SHORTLIST_FRACTION, RABITQ_ADMIT_CELL_SHORTLIST_MIN,
-        RabitqAdmitContext,
+    supertable::{
+        error::BuildError,
+        manifest::{
+            ClusterCentroids, RABITQ_ADMIT_CELL_SHORTLIST_FRACTION,
+            RABITQ_ADMIT_CELL_SHORTLIST_MIN, RabitqAdmitContext, list::WIDTH_LAW_KS,
+        },
     },
 };
 
@@ -221,18 +233,7 @@ pub(crate) fn boundary_assignment_encoded(
     admit_ctx: &RabitqAdmitContext,
     window: usize,
 ) -> BoundaryAssignment {
-    let dim = clusters.dim as usize;
-    let mut row_fp = vec![0f32; dim];
-    dequantize_sq8_residual_into(
-        &row.scale,
-        &row.offset,
-        &row.codes,
-        &row.residuals,
-        row.rerank_codec
-            .residual_divisor()
-            .expect("encoded row uses residual-family codec"),
-        &mut row_fp,
-    );
+    let row_fp = dequantize_row(row, clusters.dim as usize);
     boundary_assignment_fp32(clusters, metric, &row_fp, admit_ctx, window)
 }
 
@@ -314,6 +315,13 @@ fn boundary_from_ranked(
 /// Dequantize one Sq8+ε residual row to fp32.
 fn dequantize_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
     let mut out = vec![0f32; dim];
+    dequantize_row_into(row, &mut out);
+    out
+}
+
+/// [`dequantize_row`] into a caller-owned scratch (hot loops reuse one
+/// allocation). The scratch length is the row's `dim`.
+fn dequantize_row_into(row: &EncodedCellRow, out: &mut [f32]) {
     dequantize_sq8_residual_into(
         &row.scale,
         &row.offset,
@@ -322,9 +330,8 @@ fn dequantize_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
         row.rerank_codec
             .residual_divisor()
             .expect("encoded row uses residual-family codec"),
-        &mut out,
+        out,
     );
-    out
 }
 
 /// Ashman D of a two-means partition, measured on the 1-D projection onto the
@@ -694,6 +701,268 @@ pub(crate) fn plan_sq8_split_kway(
     (cents, cand)
 }
 
+// ---------- Drain-time probe-width calibration ----------
+
+/// Rows reservoir-sampled as stand-in queries for probe-width calibration.
+/// Corpus rows are the right calibration distribution — on Cohere-1M/768d,
+/// stored-row queries and the dataset's held-out test queries measured the
+/// same top-k cell spread.
+const WIDTH_LAW_QUERY_SAMPLE: usize = 256;
+/// Mean top-k coverage a probe width must reach to be recorded in the law —
+/// the engine's recall@k acceptance bar.
+const WIDTH_LAW_TARGET_COVERAGE: f64 = 0.99;
+/// Fixed seed for the calibration reservoir, so a re-drained identical
+/// corpus stamps an identical law.
+const WIDTH_LAW_SAMPLE_SEED: u64 = 0x51ED_CA1B;
+/// Rows decoded per chunk while scoring a spilled cell.
+const WIDTH_LAW_SCORE_CHUNK: usize = 1024;
+
+/// Frozen query sample: dequantized fp32 vectors + their stable ids
+/// (self-hit exclusion while scoring).
+struct WidthLawQueries {
+    queries: Vec<f32>,
+    ids: Vec<i128>,
+}
+
+/// Drain-time probe-width calibration: measures, on this table's own data,
+/// how many grid cells (in routing order) cover the exact top-k, and stamps
+/// the result into the manifest's [`CellRoutingParams::width_for_k`] law.
+///
+/// How far the true top-k spreads over cells is a property of the corpus —
+/// synthetic clustered data concentrates (1 cell at k = 10), real text
+/// embeddings spray (Cohere-1M/768d measured ~30 of 256 cells at k = 100,
+/// identical under a converged reference clustering, so it is the data and
+/// not grid quality) — which is why the default probe width must be
+/// measured per table rather than hardcoded.
+///
+/// Lifecycle inside one clean (non-resumed) drain:
+///   1. [`Self::offer`] on every spilled row — [`Reservoir`]-samples the
+///      stand-in queries (sequential; the spill loop holds `&mut`).
+///   2. [`Self::freeze`] once all batches have spilled.
+///   3. [`Self::score_cell`] per cell during the pack fan-out — re-reads
+///      the cell's spill (the pack pass reads it anyway), scores every row
+///      with the shared [`distance`] kernel (rows unit-normalized for
+///      cosine, matching the rerank kernels' norm division), and merges
+///      that cell's per-query top-k under one lock per cell.
+///   4. [`Self::finish`] before the drain's manifest stamp — ranks cells
+///      with the same [`ClusterCentroids::rank_cells`] routing order
+///      queries use and extracts the width law.
+///
+/// Resumed drains skip calibration entirely (checkpointed batches never
+/// re-stream), keeping whatever law the manifest already carries.
+pub(crate) struct WidthLawCalibration {
+    dim: usize,
+    metric: Metric,
+    reservoir: Reservoir,
+    /// Stable id of each reservoir slot, kept in lockstep through
+    /// [`Reservoir::update_traced`].
+    slot_ids: Vec<i128>,
+    dequant_scratch: Vec<f32>,
+    frozen: Option<WidthLawQueries>,
+    /// Per-query `(score, cell, stable id)` candidates, truncated to the
+    /// largest law `k` as cells merge in. The stable id lets [`Self::finish`]
+    /// deduplicate boundary replicas (drain replica factor > 1.0) to their
+    /// best-scored copy, so one neighbor can never occupy several top-k
+    /// slots and narrow the law. Lock poisoning is recovered, not
+    /// propagated: each merge is an atomic append+truncate, so a panicked
+    /// pack worker leaves the held data usable.
+    tops: Mutex<Vec<Vec<(f32, u32, i128)>>>,
+}
+
+impl WidthLawCalibration {
+    pub(crate) fn new(dim: usize, metric: Metric) -> Self {
+        Self {
+            dim,
+            metric,
+            reservoir: Reservoir::new(WIDTH_LAW_QUERY_SAMPLE, dim, WIDTH_LAW_SAMPLE_SEED),
+            slot_ids: Vec::with_capacity(WIDTH_LAW_QUERY_SAMPLE),
+            dequant_scratch: vec![0f32; dim],
+            frozen: None,
+            tops: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Offer one spilled row as a calibration-query candidate.
+    pub(crate) fn offer(&mut self, row: &MaterializedIvfRow) {
+        debug_assert!(self.frozen.is_none(), "offer after freeze");
+        dequantize_row_into(&row.encoded, &mut self.dequant_scratch);
+        if let Some(slot) = self.reservoir.update_traced(&self.dequant_scratch) {
+            if slot == self.slot_ids.len() {
+                self.slot_ids.push(row.stable_id);
+            } else {
+                self.slot_ids[slot] = row.stable_id;
+            }
+        }
+    }
+
+    /// Freeze the sampled queries. Called once, after the last batch
+    /// spilled and before cell packing scores.
+    pub(crate) fn freeze(&mut self) {
+        let queries = self.reservoir.sample().to_vec();
+        let ids = self.slot_ids.clone();
+        *self.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![Vec::new(); ids.len()];
+        self.frozen = Some(WidthLawQueries { queries, ids });
+    }
+
+    /// Score every row of one spilled cell against the frozen queries and
+    /// merge into the per-query candidate lists. Safe to call from the
+    /// pack fan-out workers; the merge takes one lock per cell.
+    pub(crate) fn score_cell(&self, cell: u32, spill: &SpilledCellRows) -> Result<(), BuildError> {
+        let Some(frozen) = self.frozen.as_ref() else {
+            return Err(BuildError::Store(
+                "width-law score_cell before freeze".into(),
+            ));
+        };
+        let n_queries = frozen.ids.len();
+        if n_queries == 0 {
+            return Ok(());
+        }
+        let k_max = *WIDTH_LAW_KS.last().expect("law has k points");
+        let mut partial: Vec<Vec<(f32, u32, i128)>> = vec![Vec::new(); n_queries];
+        let mut reader = spill.reader()?;
+        let mut remaining = spill.n_rows();
+        let mut scratch = vec![0f32; self.dim];
+        while remaining > 0 {
+            let chunk = reader.next_chunk(WIDTH_LAW_SCORE_CHUNK.min(remaining))?;
+            remaining -= chunk.len();
+            for row in &chunk {
+                dequantize_row_into(&row.encoded, &mut scratch);
+                if self.metric == Metric::Cosine {
+                    // The rerank kernels divide by the stored row norm;
+                    // unit-normalizing the row lets the shared [`distance`]
+                    // kernel (which assumes unit inputs for cosine) score
+                    // with the same ranking. Query scaling is per-query
+                    // monotone and cannot reorder its candidates.
+                    normalize(&mut scratch);
+                }
+                for (qi, q) in frozen.queries.chunks_exact(self.dim).enumerate() {
+                    // Self-hit: a sampled query trivially covers itself.
+                    if row.stable_id == frozen.ids[qi] {
+                        continue;
+                    }
+                    partial[qi].push((distance(self.metric, q, &scratch), cell, row.stable_id));
+                }
+            }
+            // Bound the per-cell partials the same way the merge does.
+            for cand in &mut partial {
+                truncate_ascending(cand, k_max);
+            }
+        }
+        let mut tops = self.tops.lock().unwrap_or_else(PoisonError::into_inner);
+        for (qi, cand) in partial.into_iter().enumerate() {
+            merge_candidates(&mut tops[qi], cand, k_max);
+        }
+        Ok(())
+    }
+
+    /// Extract the width law: cells (in the grid's routing order) needed
+    /// for mean [`WIDTH_LAW_TARGET_COVERAGE`] coverage of the exact top-k
+    /// at each [`WIDTH_LAW_KS`] point. Each point is measured over the
+    /// queries whose candidate count reaches its `k` — one boundary-starved
+    /// query excludes itself, not the whole sample. Points NO query can
+    /// support stay `0` (uncalibrated). Measured points are floored to be
+    /// monotone in `k`. `None` when nothing was sampled.
+    pub(crate) fn finish(self, grid: &ClusterCentroids) -> Option<[u32; WIDTH_LAW_KS.len()]> {
+        let frozen = self.frozen?;
+        let n_queries = frozen.ids.len();
+        if n_queries == 0 || grid.n_cent == 0 {
+            return None;
+        }
+        let n_cells = grid.n_cent as usize;
+        let tops = self
+            .tops
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Superseded or empty cells inflate ranks slightly (routing skips
+        // them, this count does not) — an over-probe, never an under-probe;
+        // fresh drains, the normal calibration moment, have neither.
+        let mut law = [0u32; WIDTH_LAW_KS.len()];
+        let mut coverage_sums: Vec<Vec<f64>> = vec![vec![0f64; n_cells]; WIDTH_LAW_KS.len()];
+        let mut support = [0usize; WIDTH_LAW_KS.len()];
+        let mut rank_of_cell = vec![0u32; n_cells];
+        for (qi, cand) in tops.iter().enumerate() {
+            let q = &frozen.queries[qi * self.dim..(qi + 1) * self.dim];
+            let ranked = grid.rank_cells(self.metric, q);
+            for (rank, (cell, _)) in ranked.iter().enumerate() {
+                if let Some(slot) = rank_of_cell.get_mut(*cell as usize) {
+                    *slot = rank as u32;
+                }
+            }
+            // [`merge_candidates`] keeps one entry per stable id, so the
+            // accumulator only needs ranking by score for the prefix walk.
+            let mut sorted = cand.clone();
+            sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            for (ki, &k) in WIDTH_LAW_KS.iter().enumerate() {
+                if sorted.len() < k {
+                    // Below this point's k: the query measures the smaller
+                    // points and sits out this one.
+                    continue;
+                }
+                support[ki] += 1;
+                // Per-rank counts of this query's top-k, then a prefix walk
+                // accumulates the mean coverage curve.
+                let mut per_rank = vec![0u32; n_cells];
+                for (_, cell, _) in &sorted[..k] {
+                    // Candidate cell ids come from the same drain that built
+                    // `grid` and split parents keep their slot when
+                    // superseded, so an out-of-range id is unreachable today
+                    // — but calibration is best-effort diagnostics: an
+                    // inconsistent input abandons the law (unstamped ⇒
+                    // default routing) rather than panicking the drain.
+                    let &rank = rank_of_cell.get(*cell as usize)?;
+                    per_rank[rank as usize] += 1;
+                }
+                let mut covered = 0u32;
+                for (rank, count) in per_rank.iter().enumerate() {
+                    covered += count;
+                    coverage_sums[ki][rank] += f64::from(covered) / k as f64;
+                }
+            }
+        }
+        for (ki, sums) in coverage_sums.iter().enumerate() {
+            if support[ki] == 0 {
+                continue;
+            }
+            let target = WIDTH_LAW_TARGET_COVERAGE * support[ki] as f64;
+            if let Some(rank) = sums.iter().position(|&s| s >= target) {
+                law[ki] = (rank + 1) as u32;
+            }
+        }
+        // Coverage need only grows with k, so each measured point is floored
+        // by the measured points below it — sampling noise near the target
+        // must never let a larger k probe FEWER cells than a smaller one (a
+        // recall inversion at query time). Unmeasured points (0) stay 0; the
+        // interpolator skips them.
+        let mut floor = 0u32;
+        for w in law.iter_mut().filter(|w| **w > 0) {
+            *w = (*w).max(floor);
+            floor = *w;
+        }
+        (law.iter().any(|&w| w > 0)).then_some(law)
+    }
+}
+
+/// Merge one cell's candidates into a query's accumulator: collapse to the
+/// best-scored copy per stable id FIRST (boundary replicas of one row are
+/// one neighbor), then keep the ascending-best `cap`. The dedup must
+/// precede the truncate — replicated copies of near rows filling raw slots
+/// would evict distinct farther neighbors and stamp a narrower law than a
+/// real query experiences.
+fn merge_candidates(acc: &mut Vec<(f32, u32, i128)>, mut cand: Vec<(f32, u32, i128)>, cap: usize) {
+    acc.append(&mut cand);
+    acc.sort_unstable_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.total_cmp(&b.0)));
+    acc.dedup_by_key(|c| c.2);
+    truncate_ascending(acc, cap);
+}
+
+/// Keep the ascending-best `cap` candidates in place.
+fn truncate_ascending(cand: &mut Vec<(f32, u32, i128)>, cap: usize) {
+    if cand.len() > cap {
+        cand.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        cand.truncate(cap);
+    }
+}
+
 /// Two-centroid (`k = 2`) test-only wrapper over [`plan_sq8_split_kway`],
 /// returning the two-centroid / `u8`-assignment shape the split unit tests
 /// were written against. The production split path calls
@@ -769,6 +1038,164 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    /// Boundary replicas must count as ONE neighbor in the width law:
+    /// [`WidthLawCalibration::finish`] dedups candidates to the
+    /// best-scored copy per stable id before measuring coverage. The
+    /// fixture plants one id three times in the two query-nearest cells;
+    /// without the dedup those copies pad the top-10 and the law would
+    /// stop at width 2, hiding the two real neighbors in the 4th-ranked
+    /// cell.
+    #[test]
+    fn width_law_finish_dedups_replicated_rows() {
+        const DIM: usize = 4;
+        // Grid ranked against the e0 query: cells 0, 1, 2, 3 in order.
+        let grid = ClusterCentroids::from_fp32(
+            4,
+            DIM as u32,
+            &[
+                1.0, 0.0, 0.0, 0.0, //
+                0.9, 0.1, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0,
+            ],
+            vec![1; 4],
+        );
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut query = vec![0.0f32; DIM];
+        query[0] = 1.0;
+        cal.frozen = Some(WidthLawQueries {
+            queries: query,
+            ids: vec![999],
+        });
+        // (score, cell, stable id): id 1 replicated across cells 0 and 1;
+        // ids 2..=8 fill the near cells; ids 9 and 10 sit in cell 3 and
+        // only enter the top-10 once the replicas collapse to one slot.
+        let mut cands = vec![(0.01, 0, 1), (0.02, 1, 1), (0.03, 1, 1)];
+        cands.extend((2..=8).map(|id| (0.03 + id as f32 * 0.01, (id % 2) as u32, id as i128)));
+        cands.push((0.5, 3, 9));
+        cands.push((0.6, 3, 10));
+        // Plant through the same merge the scorer uses — dedup happens
+        // there, BEFORE the truncate, so replicas can never occupy slots.
+        let mut acc = Vec::new();
+        merge_candidates(&mut acc, cands, *WIDTH_LAW_KS.last().expect("knots"));
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
+
+        let law = cal.finish(&grid).expect("law from planted candidates");
+        // k=1: the best copy of id 1 sits in the top-ranked cell.
+        assert_eq!(law[0], 1, "top-1 coverage is the nearest cell");
+        // k=10: deduped top-10 = ids 1..=10, whose coverage needs the
+        // 4th-ranked cell. Replica padding would have stopped at 2.
+        assert_eq!(
+            law[1], 4,
+            "replicated copies must not pad top-k coverage (got width {})",
+            law[1]
+        );
+        // 10 deduped candidates cannot support the k=100/1000 points.
+        assert_eq!(&law[2..], &[0, 0], "unsupported points stay uncalibrated");
+    }
+
+    /// Per-query point support and the monotone floor. Query A (10
+    /// candidates spread over four cells) cannot support k=100 — it must
+    /// sit that point out rather than zero it for the whole sample. Query B
+    /// (100 candidates in one cell) then measures k=100 alone at width 1,
+    /// NARROWER than the two-query k=10 point (width 4) — the monotone
+    /// floor lifts it, because a larger k probing fewer cells would invert
+    /// recall at query time.
+    #[test]
+    fn width_law_supports_points_per_query_and_stays_monotone() {
+        const DIM: usize = 4;
+        let grid = ClusterCentroids::from_fp32(
+            4,
+            DIM as u32,
+            &[
+                1.0, 0.0, 0.0, 0.0, //
+                0.9, 0.1, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0,
+            ],
+            vec![1; 4],
+        );
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut queries = vec![0.0f32; 2 * DIM];
+        queries[0] = 1.0;
+        queries[DIM] = 1.0;
+        cal.frozen = Some(WidthLawQueries {
+            queries,
+            ids: vec![998, 999],
+        });
+        let k_max = *WIDTH_LAW_KS.last().expect("knots");
+        // A: distinct ids 1..=10 spread 2/2/3/3 over cells 0..=3, so its
+        // 0.99 top-10 coverage needs the 4th-ranked cell.
+        let a: Vec<(f32, u32, i128)> = (1..=10)
+            .map(|id| {
+                let cell = match id {
+                    1 | 2 => 0u32,
+                    3 | 4 => 1,
+                    5..=7 => 2,
+                    _ => 3,
+                };
+                (id as f32 * 0.01, cell, id as i128)
+            })
+            .collect();
+        // B: distinct ids 100..=199, every one in the top-ranked cell.
+        let b: Vec<(f32, u32, i128)> = (100..200)
+            .map(|id| (id as f32 * 0.001, 0u32, id as i128))
+            .collect();
+        let (mut acc_a, mut acc_b) = (Vec::new(), Vec::new());
+        merge_candidates(&mut acc_a, a, k_max);
+        merge_candidates(&mut acc_b, b, k_max);
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc_a, acc_b];
+
+        let law = cal.finish(&grid).expect("law from planted candidates");
+        assert_eq!(law[0], 1, "top-1: both queries covered by the nearest cell");
+        assert_eq!(
+            law[1], 4,
+            "k=10 measured over both queries needs A's spread"
+        );
+        assert_eq!(
+            law[2], 4,
+            "k=100: B alone measures width 1; the monotone floor lifts it \
+             to the k=10 width instead of stamping a recall inversion"
+        );
+        assert_eq!(law[3], 0, "k=1000 has no supporting query and stays 0");
+    }
+
+    /// An out-of-range cell id in the candidates (impossible in the current
+    /// drain flow, by construction) abandons the law instead of panicking —
+    /// calibration is diagnostics riding a drain and must never abort one.
+    #[test]
+    fn width_law_bails_on_out_of_range_cell_id() {
+        const DIM: usize = 4;
+        let grid = ClusterCentroids::from_fp32(
+            2,
+            DIM as u32,
+            &[
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0,
+            ],
+            vec![1; 2],
+        );
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
+        let mut query = vec![0.0f32; DIM];
+        query[0] = 1.0;
+        cal.frozen = Some(WidthLawQueries {
+            queries: query,
+            ids: vec![999],
+        });
+        // Cell 7 does not exist in the two-cell grid.
+        let mut acc = Vec::new();
+        merge_candidates(
+            &mut acc,
+            vec![(0.01, 7, 1)],
+            *WIDTH_LAW_KS.last().expect("knots"),
+        );
+        *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
+        assert!(
+            cal.finish(&grid).is_none(),
+            "inconsistent calibration input must abandon the law, not panic"
+        );
+    }
     use crate::superfile::vector::{
         cell_posting::{encode_blob, load_encoded_rows_from_blob},
         rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},

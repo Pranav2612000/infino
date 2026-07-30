@@ -57,7 +57,7 @@ use crate::{
         },
         vector::{
             layout::VectorLayout,
-            reader::{self as vector_reader, VectorReader},
+            reader::{self as vector_reader, ScanCandidate, ScanOutcome, VectorReader},
         },
     },
     supertable::query::provider::tombstone_access_plan,
@@ -1484,6 +1484,63 @@ impl SuperfileReader {
         )
         .await?)
     }
+
+    /// Deferred-rerank sibling of [`Self::vector_search_clusters_filtered`]
+    /// for the supertable's global-shortlist width sweeps: warm cells
+    /// return 1-bit estimate survivors (scanned at the undivided
+    /// `k × rerank_mult`), cold cells rerank immediately under
+    /// `cold_rerank_mult`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn vector_scan_clusters_filtered(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        clusters: &[u32],
+        options: VectorSearchOptions,
+        cold_rerank_mult: usize,
+        allow: Option<Arc<RoaringBitmap>>,
+        deny: Option<Arc<RoaringBitmap>>,
+        pool: Option<Arc<ThreadPool>>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
+    ) -> Result<ScanOutcome, ReadError> {
+        let filtered = allow.is_some();
+        let (_, rerank_mult) = options.resolve(filtered);
+        let v = self
+            .vec()
+            .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
+        let rerank_mult = v.public_rerank_mult(column, rerank_mult);
+        Ok(v.search_clusters_scan_async(
+            column,
+            query,
+            k,
+            clusters,
+            rerank_mult,
+            cold_rerank_mult,
+            allow,
+            deny,
+            pool,
+            budget,
+        )
+        .await?)
+    }
+
+    /// Rerank this superfile's share of the globally selected shortlist —
+    /// phase C of the deferred-rerank width sweep.
+    pub(crate) async fn vector_rerank_selected(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        selected: Vec<ScanCandidate>,
+        pool: Option<Arc<ThreadPool>>,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
+        let v = self
+            .vec()
+            .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
+        Ok(v.rerank_selected_async(column, query, k, selected, pool)
+            .await?)
+    }
 }
 
 /// Tuning knobs for vector search (`Supertable::vector_search`).
@@ -1502,12 +1559,6 @@ pub struct VectorSearchOptions {
     /// IVF probe override. `None` → engine default for the query path.
     pub nprobe: Option<usize>,
     rerank_mult: Option<usize>,
-    /// Diagnostic, bench/test builds only: when set, an explicit `nprobe`
-    /// widens the coarse cell probe on UNFILTERED hidden-indexed queries too.
-    /// Always `false` in production — the setter is `#[cfg(feature =
-    /// "test-helpers")]`, so it cannot be reached from the public API and the
-    /// serving path never sees it.
-    pub(crate) widen_unfiltered_hidden_cells: bool,
 }
 
 impl VectorSearchOptions {
@@ -1529,16 +1580,6 @@ impl VectorSearchOptions {
     /// the cost of more work.
     pub fn with_nprobe(mut self, n: usize) -> Self {
         self.nprobe = Some(n);
-        self
-    }
-
-    /// Diagnostic, bench/test builds only: let an explicit `nprobe` widen the
-    /// coarse cell probe on UNFILTERED hidden-indexed queries (used by the
-    /// recall breadth-sweep). Absent from production builds, so it never
-    /// affects the serving path.
-    #[cfg(feature = "test-helpers")]
-    pub fn widen_unfiltered_hidden_cells(mut self) -> Self {
-        self.widen_unfiltered_hidden_cells = true;
         self
     }
 

@@ -82,7 +82,7 @@ use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::time::sleep;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use super::{
@@ -159,7 +159,10 @@ use crate::{
         manifest::{
             ClusterCentroids, RabitqAdmitContext,
             commit::get_current_manifest_etag,
-            list::{CellRoutingParams, DrainedVersionRanges, GlobalVectorIndex, PartitionStrategy},
+            list::{
+                CellRoutingParams, DrainedVersionRanges, GlobalVectorIndex, PartitionStrategy,
+                WIDTH_LAW_KS,
+            },
             options_hash,
             part::{self as part_mod, PartId},
         },
@@ -3050,7 +3053,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // `routing` (query tuning) is preserved from the hidden grid either way.
     let hidden_manifest = hidden_inner.manifest.load_full();
     let hidden_bootstrapped = !hidden_manifest.get_drained_ranges().is_empty();
-    let (clusters, routing) = match hidden_manifest.get_partition_strategy() {
+    let (clusters, mut routing) = match hidden_manifest.get_partition_strategy() {
         PartitionStrategy::VectorCell {
             clusters, routing, ..
         } if hidden_bootstrapped => (clusters, routing),
@@ -3060,7 +3063,6 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     if clusters.n_cent == 0 || clusters.dim == 0 {
         return Ok(());
     }
-
     // Source: every user-table vector superfile, processed in BOUNDED BATCHES so
     // drain working-set RAM stays O(batch) instead of O(corpus) (the >3M memory
     // wall). Each batch opens its readers, builds its cell superfiles, publishes
@@ -3320,6 +3322,21 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
         new_entries.push(entry);
     }
+
+    // Probe-width calibration rides only CLEAN drains: a resumed drain's
+    // checkpointed batches never re-stream, so its sample would be partial
+    // and the law would under-count. A resumed drain keeps whatever law
+    // the manifest already carries.
+    // `spills.is_empty()` is implied today — spills co-save with
+    // `batches_done` in one checkpoint write at each batch boundary — but
+    // checking it here makes the clean-run requirement locally visible:
+    // if a mid-batch checkpoint save is ever introduced, calibration
+    // disables safely instead of sampling a partial stream.
+    let clean_uncheckpointed_drain = local_checkpoint.batches_done == 0
+        && completed_shards.is_empty()
+        && local_checkpoint.spills.is_empty();
+    let mut width_law = clean_uncheckpointed_drain
+        .then(|| opann::WidthLawCalibration::new(running_clusters.dim as usize, metric));
 
     let mut cell_spills = HashMap::new();
     for (&cell, spill) in &local_checkpoint.spills {
@@ -3581,6 +3598,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             row.cluster,
                             row,
                         )?;
+                        // Each distinct row is a calibration-query candidate
+                        // exactly once (replica spills excluded: sampling
+                        // replicas would bias queries toward boundary rows).
+                        if let Some(cal) = width_law.as_mut() {
+                            cal.offer(row);
+                        }
                     }
                 } else {
                     let replica_extra_budget =
@@ -3642,6 +3665,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             assignment.primary,
                             row,
                         )?;
+                        // Primary placement only — see the assign-skip arm.
+                        if let Some(cal) = width_law.as_mut() {
+                            cal.offer(row);
+                        }
                     }
                 }
                 let mut checkpointed_spills = HashMap::with_capacity(cell_spills.len());
@@ -3756,6 +3783,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .first()
             .cloned()
             .ok_or_else(|| BuildError::Store("drain pack requires a vector column".into()))?;
+        // All batches spilled: freeze the calibration sample so the pack
+        // fan-out below can score cells against a stable query set.
+        if let Some(cal) = width_law.as_mut() {
+            cal.freeze();
+        }
+        let width_law_ref = width_law.as_ref();
         let prepared_shards: Vec<PreparedSuperfile> = fanout_shards(
             &hidden_inner.options.writer_pool,
             &shard_sources,
@@ -3765,6 +3798,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     let cell = match source {
                         DrainCellSource::Packed(cell) => cell.clone(),
                         DrainCellSource::Rows(spill) => {
+                            // Calibration reads the spill the pack pass is
+                            // about to read anyway (before remove_files).
+                            if let Some(cal) = width_law_ref {
+                                cal.score_cell(*cell_id, spill)?;
+                            }
                             let cell = build_spilled_packed_cell_from_rows(
                                 scratch,
                                 *cell_id,
@@ -3920,6 +3958,35 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // shard membership append — never ArcSwap.store them beforehand
         // (contention refresh would drop the stamps; readers would also see
         // an advanced watermark without the new shards).
+        // Stamp the measured probe-width law into the routing this commit
+        // already persists; ranked against the same live grid queries route
+        // on. `None` (resumed drain / empty sample) keeps the prior law.
+        //
+        // Element-wise MAX with the previously stamped law: an incremental
+        // drain samples and scores only the newly spilled tail, so its
+        // measurement alone could narrow the law for the whole table (a
+        // small tightly-clustered append would under-probe older data).
+        // Widening on new evidence is always recall-safe; the law narrows
+        // only when a full rebuild re-measures everything.
+        //
+        // Known staleness bound, accepted for the drain's O(delta) cost
+        // model: the incremental sample scores only tail candidates, so a
+        // distribution-shifting append whose true neighbors span old
+        // packed cells is not fully measured — the merged law can lag the
+        // real cross-generation spread until a full rebuild recalibrates.
+        // The alternative (rescoring every packed cell per incremental
+        // drain) would make drain cost track table size, not delta size.
+        if let Some(cal) = width_law.take()
+            && let Some(law) = cal.finish(&running_clusters)
+        {
+            for (slot, measured) in routing.width_for_k.iter_mut().zip(law) {
+                *slot = (*slot).max(measured);
+            }
+            info!(
+                "supertable drain: probe-width law (cells for 0.99 top-k coverage at k={WIDTH_LAW_KS:?}): measured {law:?}, stamped {:?}",
+                routing.width_for_k
+            );
+        }
         let list_metadata = CommitListMetadata {
             partition_strategy: Some(PartitionStrategy::VectorCell {
                 column: column.clone(),
