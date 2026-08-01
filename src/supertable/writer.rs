@@ -6258,7 +6258,22 @@ pub(crate) async fn try_commit_attempt(
     //     `update` clears the ref; restamp it onto this same successor
     //     before the list/pointer CAS so a crash cannot leave durable
     //     membership with a missing slow-state ref (S17).
-    if super::handle::is_hidden_vector_index_table(&opts) {
+    //
+    //     Keyed on the successor's LOCKED partition strategy — the same
+    //     signal `update` used to route membership into the blob instead
+    //     of manifest parts — never on the handle's options. A hidden
+    //     handle built at table `create` has no user manifest to
+    //     bootstrap a grid from, so its options carry no VectorCell
+    //     strategy for the whole life of the process; gating on options
+    //     let a membership commit (e.g. a cell split) clear the ref
+    //     without restamping it, publishing a manifest whose membership
+    //     is durably EMPTY for every consumer — zero hits from every
+    //     cell, and no recovery path, because parts were never written
+    //     and the entries' only address was the cleared ref.
+    if matches!(
+        new_manifest.partition_strategy(),
+        Some(PartitionStrategy::VectorCell { .. })
+    ) {
         let entries = new_manifest.get_all_superfiles();
         if !entries.is_empty() {
             // Carried-forward entries are stripped; the PREVIOUS manifest

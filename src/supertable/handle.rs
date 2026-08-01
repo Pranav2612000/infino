@@ -4445,6 +4445,184 @@ mod tests {
         }
     }
 
+    /// A committed cell split ALONE — without the pass-final in-process
+    /// `refresh_slow_vector_state` that production maintenance tacks onto the
+    /// end of the hidden pass — must leave every doc retrievable, both
+    /// in-process and after a reopen from storage. The split's own commit
+    /// (`try_commit_attempt` step 2b) publishes the slow-state blob + centroid
+    /// section for the post-split membership; if that publication disagrees
+    /// with what the refresh composes, a crash between the split commit and
+    /// the refresh leaves the table durably under-serving (0 hits from every
+    /// cell, including cells the split never touched) with no recovery path —
+    /// reopen re-hydrates the broken state and a post-reopen `optimize`
+    /// republishes it unchanged. Two populated cells are required to expose
+    /// the mismatch.
+    #[test]
+    fn split_commit_without_refresh_keeps_docs_retrievable() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                reader::VectorSearchOptions,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{manifest::list::PartitionStrategy, writer::split_overflow_cell},
+        };
+
+        /// Docs planted per orthogonal direction (two directions → the two
+        /// populated cells the repro needs).
+        const ROWS_PER_DIRECTION: usize = 8;
+        /// Total planted docs.
+        const N_TOTAL: usize = 2 * ROWS_PER_DIRECTION;
+        /// Probe width covering every cell before and after the split.
+        const SPLIT_NPROBE: usize = 64;
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let dir = TempDir::new().expect("tempdir");
+        let make_options = || {
+            let pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .expect("pool"),
+            );
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: false,
+                }],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim,
+                    n_cent: 4,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8Residual,
+                    provided_centroids: None,
+                }],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(storage)
+            .with_writer_pool(pool)
+        };
+        let st = Supertable::create(make_options()).expect("create");
+
+        // Two orthogonal directions, ROWS_PER_DIRECTION docs each, in ONE
+        // commit so the grid trains on both and the drain populates two cells.
+        let titles =
+            LargeStringArray::from((0..N_TOTAL).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut vectors = vec![0.0f32; N_TOTAL * dim];
+        for i in 0..N_TOTAL {
+            vectors[i * dim + i / ROWS_PER_DIRECTION] = 1.0;
+        }
+        let flat = Float32Array::from(vectors);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+
+        // Exhaustive-width retrieval per planted direction: with k = N_TOTAL
+        // and every cell probed, each query must surface every live doc, so
+        // the count reads as true retrievability rather than ranking.
+        let live_hit_count = |table: &Supertable, direction: usize| {
+            let mut q = vec![0.0f32; dim];
+            q[direction] = 1.0;
+            table
+                .reader()
+                .expect("reader")
+                .vector_hits(
+                    "emb",
+                    &q,
+                    N_TOTAL,
+                    VectorSearchOptions::new().with_nprobe(SPLIT_NPROBE),
+                    None,
+                )
+                .expect("vector search")
+                .len()
+        };
+        for direction in 0..2 {
+            assert_eq!(
+                live_hit_count(&st, direction),
+                N_TOTAL,
+                "all docs resolve before the split (direction {direction})"
+            );
+        }
+
+        let split_cell = match hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_partition_strategy()
+        {
+            PartitionStrategy::VectorCell { clusters, .. } => (0..clusters.n_cent)
+                .max_by_key(|&c| clusters.counts.get(c as usize).copied().unwrap_or(0))
+                .expect("a populated cell"),
+            other => panic!("hidden must be VectorCell after drain, got {other:?}"),
+        };
+
+        hidden
+            .block_on_query(split_overflow_cell(hidden.inner().clone(), split_cell, 0.0))
+            .expect("split")
+            .expect("live rows present, split commits");
+
+        // Deliberately NO refresh_slow_vector_state here: the split commit's
+        // own slow-state publication is the durable state a crash right after
+        // the commit leaves behind, and it must serve on its own.
+        for direction in 0..2 {
+            assert_eq!(
+                live_hit_count(&st, direction),
+                N_TOTAL,
+                "all docs resolve after the split commit alone (direction {direction})"
+            );
+        }
+
+        // The same durable state must serve a fresh process: reopen from
+        // storage and retrieve every doc again.
+        drop(hidden);
+        drop(st);
+        let reopened = Supertable::open(make_options()).expect("reopen");
+        for direction in 0..2 {
+            assert_eq!(
+                live_hit_count(&reopened, direction),
+                N_TOTAL,
+                "all docs resolve after reopen from post-split state (direction {direction})"
+            );
+        }
+    }
+
     /// End-to-end reclaim loop: a cell split appends its children and marks the
     /// parent cell superseded (no removal); a later merge drops those superseded
     /// blocks and reclaims the parent. Every doc must resolve exactly once at
