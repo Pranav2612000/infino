@@ -1225,6 +1225,15 @@ const CACHE_BUDGET_HEADROOM_DIVISOR: u64 = 10;
 /// ~one compact packed shard object per partition key instead of many
 /// small delta files.
 /// True for the derived hidden vector-index sibling (VectorCell routing, no FTS).
+///
+/// Options-keyed, so it is STALE for a hidden handle built at table create
+/// time: with no user manifest to train a grid from,
+/// [`build_vector_index_options`] leaves `partition_strategy: None`, and the
+/// options never catch up after the first drain locks VectorCell into the
+/// manifest. Gates deciding whether hidden maintenance must run should key on
+/// the manifest's locked strategy (`ManifestSnapshot::partition_strategy`)
+/// instead; this predicate answers "was this handle BUILT as the hidden
+/// sibling", which is only true for open-era handles.
 pub(crate) fn is_hidden_vector_index_table(opts: &SupertableOptions) -> bool {
     !opts.vector_columns.is_empty()
         && opts.fts_columns.is_empty()
@@ -1858,7 +1867,7 @@ mod tests {
         time::Duration,
     };
 
-    use arrow_array::RecordBatch;
+    use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -1870,12 +1879,17 @@ mod tests {
     use crate::{
         config::OptimizeOptions,
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
-        superfile::{builder::FtsConfig, vector::layout::VectorLayout},
+        superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
+        },
         supertable::{
             manifest::{
                 SuperfileEntry, SuperfileUri,
                 commit::{POINTER_PATH, get_current_manifest_etag},
+                list::PartitionStrategy,
             },
+            opann::MODALITY_MIN_CELL_DOCS,
             options::Consistency,
             query::dispatch::open_reader,
         },
@@ -4801,6 +4815,146 @@ mod tests {
             N,
             "all docs retrievable after the merge — no loss, no half-recall"
         );
+    }
+
+    /// Regression: `optimize` must run the hidden cell-split phase on a handle
+    /// built at table CREATE time, in the same process, with no reopen. The
+    /// split gate in `compact_one_table` once keyed on the handle's options —
+    /// but a create-era hidden handle has no user manifest to train a grid
+    /// from, so its options never carry a VectorCell strategy (only the first
+    /// drain locks it into the manifest), and the options-keyed gate silently
+    /// skipped every split until the table was reopened elsewhere. This pins
+    /// the manifest-keyed gate through the public `optimize()` entry.
+    #[test]
+    fn optimize_runs_split_phase_on_create_era_handle() {
+        // The 500k `cell_split_doc_cap` is out of unit-test reach and config is
+        // process-global, so the fixture leans on the default modality trigger
+        // instead: a cell holding >= MODALITY_MIN_CELL_DOCS rows in MORE than
+        // the whole-mode grouping factor (4 modes, `opann::cell_split_plan`)
+        // of well-separated modes splits under `optimize`.
+        const DIM: usize = 16;
+        /// One-hot modes e_0..e_7 — more than the 4-modes-per-cell grouping
+        /// stop, so the modality plan must split the cell.
+        const MODES: usize = 8;
+        const DOCS_PER_MODE: usize = 64;
+        const N: usize = MODES * DOCS_PER_MODE;
+        assert!(
+            N as u64 >= MODALITY_MIN_CELL_DOCS,
+            "fixture must reach the modality trigger's minimum cell size"
+        );
+
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), DIM as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim: DIM,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool)
+        // A single hidden cell: every mode drains into cell 0, making it the
+        // one over-populated multimodal cell the split phase must act on.
+        .with_vector_cell_counts(1, 1);
+        // The handle under test comes from CREATE and is never reopened.
+        let st = Supertable::create(options).expect("create");
+
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut flat = vec![0.0f32; N * DIM];
+        for r in 0..N {
+            let mode = r / DOCS_PER_MODE;
+            flat[r * DIM + mode] = 1.0;
+            // Tiny deterministic jitter on a component no mode occupies keeps
+            // within-mode variance non-zero (no 0/0 Ashman-D corner) while the
+            // modes stay maximally separated.
+            flat[r * DIM + MODES + mode] = ((r % 5) as f32 - 2.0) * 1e-3;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field,
+            DIM as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        match hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_partition_strategy()
+        {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                assert_eq!(clusters.n_cent, 1, "single-cell grid before optimize");
+                // Grid counts are maintenance bookkeeping (they tally the
+                // incoming region as well as the drained cells), so only the
+                // populated/empty distinction is asserted here.
+                assert!(clusters.counts[0] > 0, "the one cell is populated");
+            }
+            other => panic!("hidden must be VectorCell after drain, got {other:?}"),
+        }
+
+        st.optimize(&OptimizeOptions::default()).expect("optimize");
+
+        // No reopen: the same create-era handles observe the split. The grid
+        // must have grown past one cell (doc preservation across a split is
+        // pinned by the dedicated `split_overflow_cell_*` tests).
+        let reader = hidden.reader().expect("reader");
+        match reader.manifest().get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                assert!(
+                    clusters.n_cent > 1,
+                    "optimize on a create-era handle must run the split phase; \
+                     grid stayed at {} cell(s)",
+                    clusters.n_cent
+                );
+            }
+            other => panic!("hidden stays VectorCell after optimize, got {other:?}"),
+        }
     }
 
     /// With writer_pool=N>1 and multiple touched cells, drain publishes at most
