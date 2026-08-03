@@ -45,11 +45,26 @@ pub enum FaultOp {
     Delete,
 }
 
+/// The failure an armed rule injects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultKind {
+    /// [`StorageError::TransientExhausted`] — the provider's own retries
+    /// are spent, so the caller must surface it. The shape [`FaultStorage::fail`]
+    /// arms, and the one that must never be mistaken for contention.
+    Transient,
+    /// [`StorageError::PreconditionFailed`] — a conditional write that lost
+    /// its race. The one storage error the commit / mutation paths are
+    /// allowed to treat as contention, so tests use it to drive a CAS-loss
+    /// to its retry budget and check what the caller finally sees.
+    Precondition,
+}
+
 /// One armed fault: the next `remaining` calls of `op` whose URI
-/// contains `uri_fragment` fail.
+/// contains `uri_fragment` fail with `kind`.
 #[derive(Debug)]
 struct FaultRule {
     op: FaultOp,
+    kind: FaultKind,
     uri_fragment: String,
     remaining: usize,
 }
@@ -82,8 +97,16 @@ impl FaultStorage {
     /// the repo's numbered object names are fixed-width (zero-padded), so
     /// a full path never substring-matches a sibling.
     pub fn fail(&self, op: FaultOp, uri_fragment: &str, times: usize) {
+        self.fail_with(FaultKind::Transient, op, uri_fragment, times);
+    }
+
+    /// Arm a rule that fails with `kind`. Same matching rules as
+    /// [`Self::fail`]; use [`FaultKind::Precondition`] to model a peer
+    /// writer winning the CAS instead of a broken store.
+    pub fn fail_with(&self, kind: FaultKind, op: FaultOp, uri_fragment: &str, times: usize) {
         self.rules_guard().push(FaultRule {
             op,
+            kind,
             uri_fragment: uri_fragment.to_string(),
             remaining: times,
         });
@@ -117,9 +140,14 @@ impl FaultStorage {
             if rule.op == op && rule.remaining > 0 && uri.contains(&rule.uri_fragment) {
                 rule.remaining -= 1;
                 self.fired.fetch_add(1, Ordering::SeqCst);
-                return Err(StorageError::TransientExhausted {
-                    uri: uri.to_string(),
-                    source: Box::new(IoError::other("injected fault")),
+                return Err(match rule.kind {
+                    FaultKind::Transient => StorageError::TransientExhausted {
+                        uri: uri.to_string(),
+                        source: Box::new(IoError::other("injected fault")),
+                    },
+                    FaultKind::Precondition => StorageError::PreconditionFailed {
+                        uri: uri.to_string(),
+                    },
                 });
             }
         }
@@ -214,13 +242,29 @@ mod tests {
         let (bytes, _) = faults.get("data/a.bin").await.expect("rule burned down");
         assert_eq!(bytes.as_ref(), b"abc");
 
+        // The kind is per-rule: a precondition rule models a lost CAS, not
+        // a broken store, and callers distinguish the two.
+        faults.fail_with(FaultKind::Precondition, FaultOp::PutIfMatch, "data/", 1);
+        let err = faults
+            .put_if_match("data/a.bin", Bytes::from_static(b"xyz"), None)
+            .await
+            .expect_err("armed precondition rule fires");
+        assert!(
+            matches!(err, StorageError::PreconditionFailed { .. }),
+            "expected PreconditionFailed, got {err:?}"
+        );
+
         faults.fail(FaultOp::Get, "data/", 1);
         faults.clear();
         faults
             .get("data/a.bin")
             .await
             .expect("cleared rules never fire");
-        assert_eq!(faults.fired(), 1, "no further faults fired");
+        assert_eq!(
+            faults.fired(),
+            2,
+            "the get and the precondition rule fired, nothing since"
+        );
 
         // Passthroughs: multipart reaches the inner provider, the raw
         // object-store handle is withheld, the meter is the inner one.

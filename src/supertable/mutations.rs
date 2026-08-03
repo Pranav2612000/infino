@@ -194,6 +194,22 @@ impl MutationError {
             _ => None,
         }
     }
+
+    /// True when the mutation lost a compare-and-set race — against another
+    /// writer's manifest commit, another writer's tombstone sidecar, or the
+    /// compactor. The whole `delete` / `update` call is safe to reissue: the
+    /// WAL either completes under the recovery sweep or is replayed
+    /// idempotently, and a retry re-resolves the predicate against fresh
+    /// state.
+    pub(crate) fn is_conflict(&self) -> bool {
+        match self {
+            MutationError::Storage(e) => e.is_conflict(),
+            MutationError::WalStore(e) => e.is_conflict(),
+            MutationError::AppendPhase(e) => e.is_conflict(),
+            MutationError::TombstonePhase(e) => e.is_conflict(),
+            _ => false,
+        }
+    }
 }
 
 /// Value returned from [`SupertableWriter::update`]. Carries the
@@ -280,6 +296,18 @@ impl CommitError {
         match self {
             CommitError::AppendFlush(b) => b.over_budget(),
             CommitError::PartialCommit { cause, .. } => cause.over_budget(),
+        }
+    }
+
+    /// True when the commit failed because it lost a compare-and-set race.
+    ///
+    /// On `PartialCommit` this reports the *cause* of the stop; the
+    /// mutations that already landed stay landed, and the writer keeps the
+    /// unattempted ones buffered for the retry.
+    pub(crate) fn is_conflict(&self) -> bool {
+        match self {
+            CommitError::AppendFlush(b) => b.is_conflict(),
+            CommitError::PartialCommit { cause, .. } => cause.is_conflict(),
         }
     }
 }

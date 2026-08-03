@@ -19,7 +19,9 @@ use std::{sync::Arc, time::Duration};
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
+use datafusion::prelude::{col, lit};
 use infino::{
+    InfinoError,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
@@ -32,7 +34,7 @@ use infino::{
     test_helpers::{
         build_title_batch, decimal128_id_field, decimal128_ids, default_supertable_options,
         default_tokenizer,
-        fault_storage::{FaultOp, FaultStorage},
+        fault_storage::{FaultKind, FaultOp, FaultStorage},
         lazy_foreground_disk_cache,
     },
 };
@@ -43,6 +45,12 @@ const FTS_TOP_K: usize = 8;
 /// Generous rule budget for fanout paths (cold search issues many range
 /// GETs); large enough that every fetch of the failing phase hits it.
 const FANOUT_FAULTS: usize = 1024;
+/// Rule budget for the sidecar-CAS test: comfortably above the engine's own
+/// per-sidecar retry budget, so every attempt in that loop loses its race.
+const SIDECAR_CAS_FAULTS: usize = 64;
+/// Suffix of the per-superfile tombstone sidecars the delete path CAS-writes.
+/// Targeting it leaves superfile, manifest, and WAL writes untouched.
+const TOMBSTONES_SUFFIX: &str = ".tombstones";
 
 /// A LocalFS-backed table wrapped in `FaultStorage`, with one committed
 /// batch, plus the tempdir guard.
@@ -282,4 +290,45 @@ fn gc_counts_delete_faults_without_failing_the_sweep() {
             .await
     });
     assert!(gone.is_err(), "the orphan is reclaimed once deletes heal");
+}
+
+/// The mirror image of the tests above. Where a transient fault must never
+/// be dressed up as contention, a genuine lost CAS must be *reported* as
+/// contention: `delete` drives per-superfile tombstone sidecars through a
+/// CAS loop, and losing every attempt is the one commit failure worth
+/// retrying — nothing partial is visible and a reissue re-resolves the
+/// predicate against fresh state. It has to reach the caller as the
+/// retryable [`InfinoError::Conflict`], not as an opaque backend fault a
+/// serving layer can only give up on.
+#[test]
+fn delete_losing_the_sidecar_cas_surfaces_a_retryable_conflict() {
+    let (st, faults, _dir) = faulted_table();
+
+    faults.fail_with(
+        FaultKind::Precondition,
+        FaultOp::PutIfMatch,
+        TOMBSTONES_SUFFIX,
+        SIDECAR_CAS_FAULTS,
+    );
+    let err = st
+        .delete(col("title").eq(lit("first commit alpha")))
+        .expect_err("a sidecar CAS that never lands must fail the delete");
+
+    assert!(
+        matches!(err, InfinoError::Conflict(_)),
+        "a lost sidecar CAS must surface as a retryable Conflict, got {err:?}"
+    );
+    assert!(
+        faults.fired() > 1,
+        "the engine must spend its own CAS retries before surfacing, fired {}",
+        faults.fired()
+    );
+
+    // Retryable means retryable: with the peer writer gone, the same delete
+    // lands and the row is tombstoned.
+    faults.clear();
+    let stats = st
+        .delete(col("title").eq(lit("first commit alpha")))
+        .expect("the reissued delete succeeds once contention clears");
+    assert_eq!(stats.n_tombstoned(), 1);
 }
