@@ -37,6 +37,8 @@
 use std::{
     cmp::Reverse,
     collections::BinaryHeap,
+    fs, io,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -51,7 +53,10 @@ use infino::{OptimizeOptions, supertable::Supertable};
 use rayon::prelude::*;
 
 use crate::{
-    corpus::{self, DIM, SequentialSyntheticCorpus},
+    corpus::{
+        self, DIM, SequentialSyntheticCorpus,
+        grading::{read_f32, read_u32, read_u64},
+    },
     diag_common::{env_bool_default_true, env_u64, env_usize},
     executors::vector as exec_vec,
     ingest::supertable::{self as ingest, Modality, VEC_COLUMN},
@@ -152,6 +157,11 @@ impl HeldTopK {
     fn ids(&self) -> Vec<u32> {
         self.heap.iter().map(|Reverse(c)| c.id).collect()
     }
+
+    /// `(id, score)` pairs currently held — for GT-bin serialization.
+    fn entries(&self) -> Vec<(u32, f32)> {
+        self.heap.iter().map(|Reverse(c)| (c.id, c.dot)).collect()
+    }
 }
 
 /// Fold a freshly generated batch's exact top-k into the running heaps, one
@@ -171,6 +181,220 @@ fn update_heaps(heaps: &mut [HeldTopK], queries: &[Vec<f32>], flat: &[f32], base
                 heap.offer(dot, base + j as u32);
             }
         });
+}
+
+// ─── Ground-truth bin (persist / reload across resumes) ──────────────────────
+
+/// On-disk GT-bin format version. Bumped on any header/layout change so an
+/// older bin is refused rather than misparsed.
+const GT_BIN_VERSION: u32 = 1;
+/// Fixed header size in bytes: magic(4) + version(4) + m(8) + n_queries(8) +
+/// n_cent(8) + dim(4) + k(4) + vec_seed(8) + query_seed(8).
+const GT_BIN_HEADER_BYTES: usize = 56;
+
+/// A loaded GT bin: the doc-count it covers, the ORIGINAL build's cluster count
+/// (provenance — the header is authoritative), and the rebuilt per-query heaps.
+struct GtBin {
+    m: usize,
+    n_cent: usize,
+    heaps: Vec<HeldTopK>,
+}
+
+/// Why a GT bin could not be loaded. The two cases must be handled
+/// differently on resume: `Corrupt` (io error / bad magic / truncation) is
+/// recoverable — rebuild by replay; `Incompatible` means the bin was written
+/// by a build with different query-DETERMINING constants (format version /
+/// dim / k / seeds), so its heaps are keyed to different queries. That is
+/// provenance the resume cannot override, so it must abort rather than score
+/// against the wrong ground truth.
+#[derive(Debug)]
+enum GtBinError {
+    Corrupt(String),
+    Incompatible(String),
+}
+
+/// Serialize the running GT heaps to `path` atomically (temp + rename) so a
+/// crash never leaves a half-written bin. The header carries the provenance a
+/// reload needs to reject an incompatible bin.
+fn gt_bin_write(
+    path: &str,
+    heaps: &[HeldTopK],
+    m: usize,
+    n_queries: usize,
+    n_cent: usize,
+) -> io::Result<()> {
+    let mut b: Vec<u8> = Vec::with_capacity(GT_BIN_HEADER_BYTES + heaps.len() * (K * 8 + 4));
+    b.extend_from_slice(b"GTB1");
+    b.extend_from_slice(&GT_BIN_VERSION.to_le_bytes());
+    b.extend_from_slice(&(m as u64).to_le_bytes());
+    b.extend_from_slice(&(n_queries as u64).to_le_bytes());
+    b.extend_from_slice(&(n_cent as u64).to_le_bytes());
+    b.extend_from_slice(&(DIM as u32).to_le_bytes());
+    b.extend_from_slice(&(K as u32).to_le_bytes());
+    b.extend_from_slice(&VEC_SEED.to_le_bytes());
+    b.extend_from_slice(&QUERY_SEED.to_le_bytes());
+    for h in heaps {
+        let e = h.entries();
+        b.extend_from_slice(&(e.len() as u32).to_le_bytes());
+        for (id, score) in e {
+            b.extend_from_slice(&id.to_le_bytes());
+            b.extend_from_slice(&score.to_le_bytes());
+        }
+    }
+    let tmp = format!("{path}.tmp");
+    fs::write(&tmp, &b)?;
+    fs::rename(&tmp, path)
+}
+
+/// Header + heaps parsed from a bin's bytes (past the magic). Truncation
+/// surfaces as the reader's `io::Error`; compatibility is judged by the caller.
+struct ParsedGtBin {
+    version: u32,
+    m: usize,
+    n_queries: usize,
+    n_cent: usize,
+    dim: usize,
+    k: usize,
+    vec_seed: u64,
+    query_seed: u64,
+    heaps: Vec<HeldTopK>,
+}
+
+/// Parse `bytes` (everything after the 4-byte magic) via the shared `grading`
+/// cursor readers. Any short read is a truncation `io::Error`.
+fn parse_gt_bin(bytes: &[u8]) -> io::Result<ParsedGtBin> {
+    let mut cur: &[u8] = bytes;
+    let version = read_u32(&mut cur)?;
+    let m = read_u64(&mut cur)? as usize;
+    let n_queries = read_u64(&mut cur)? as usize;
+    let n_cent = read_u64(&mut cur)? as usize;
+    let dim = read_u32(&mut cur)? as usize;
+    let k = read_u32(&mut cur)? as usize;
+    let vec_seed = read_u64(&mut cur)?;
+    let query_seed = read_u64(&mut cur)?;
+    let mut heaps = Vec::with_capacity(n_queries);
+    for _ in 0..n_queries {
+        let len = read_u32(&mut cur)? as usize;
+        let mut h = HeldTopK::new();
+        for _ in 0..len {
+            let id = read_u32(&mut cur)?;
+            let score = read_f32(&mut cur)?;
+            h.offer(score, id);
+        }
+        heaps.push(h);
+    }
+    Ok(ParsedGtBin {
+        version,
+        m,
+        n_queries,
+        n_cent,
+        dim,
+        k,
+        vec_seed,
+        query_seed,
+        heaps,
+    })
+}
+
+/// Load a GT bin. `n_cent` is read from the header as PROVENANCE — the original
+/// build's cluster count, which a resume cannot re-derive from `COUNT(*)` (a run
+/// that crashed mid-target sits in a different doc-count band than its target).
+/// The query-DETERMINING constants (format version, `n_queries`, dim, k, seeds)
+/// ARE validated against this run: a mismatch is [`GtBinError::Incompatible`] —
+/// the heaps are keyed to different queries, so the caller must abort rather
+/// than score against the wrong ground truth. Bad magic / truncation / io are
+/// [`GtBinError::Corrupt`], safely recoverable by a replay rebuild.
+fn gt_bin_read(path: &str, n_queries: usize) -> Result<GtBin, GtBinError> {
+    let b = fs::read(path).map_err(|e| GtBinError::Corrupt(format!("read {path}: {e}")))?;
+    if b.get(0..4) != Some(b"GTB1".as_slice()) {
+        return Err(GtBinError::Corrupt(format!("{path}: bad magic")));
+    }
+    let p = parse_gt_bin(&b[4..])
+        .map_err(|e| GtBinError::Corrupt(format!("{path}: truncated ({e})")))?;
+    if p.version != GT_BIN_VERSION {
+        return Err(GtBinError::Incompatible(format!(
+            "{path}: format version {} != {GT_BIN_VERSION}",
+            p.version
+        )));
+    }
+    if p.n_queries != n_queries
+        || p.dim != DIM
+        || p.k != K
+        || p.vec_seed != VEC_SEED
+        || p.query_seed != QUERY_SEED
+    {
+        return Err(GtBinError::Incompatible(format!(
+            "{path}: built with n_queries={} dim={} k={} vseed={} qseed={}; \
+             this run uses n_queries={n_queries} dim={DIM} k={K} vseed={VEC_SEED} qseed={QUERY_SEED}",
+            p.n_queries, p.dim, p.k, p.vec_seed, p.query_seed
+        )));
+    }
+    Ok(GtBin {
+        m: p.m,
+        n_cent: p.n_cent,
+        heaps: p.heaps,
+    })
+}
+
+/// Per-checkpoint bin path: `{base}.M{count}.bin`, so the covered doc-count is
+/// visible in the filename (`ls`) without reading the header. Immutable per
+/// checkpoint (no overwrite) — a history of oracles like numbered manifests.
+fn gt_bin_ckpt_path(base: &str, count: usize) -> String {
+    format!("{base}.M{count}.bin")
+}
+
+/// Invoke `f(count, path)` for every persisted `{base}.M{count}.bin`. The
+/// dir-scan + filename parse lives here so latest-selection and prune share one
+/// definition — two copies of the parse is exactly the drift that bites later.
+fn for_each_bin(base: &str, mut f: impl FnMut(usize, PathBuf)) {
+    let base_path = Path::new(base);
+    let dir = base_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Some(stem) = base_path.file_name().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let prefix = format!("{stem}.M");
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(digits) = rest.strip_suffix(".bin") else {
+            continue;
+        };
+        let Ok(count) = digits.parse::<usize>() else {
+            continue;
+        };
+        f(count, entry.path());
+    }
+}
+
+/// Newest persisted bin for `base` — the `{base}.M{count}.bin` with the largest
+/// `count` — as `(count, full_path)`. `None` if none exist yet.
+fn gt_bin_latest(base: &str) -> Option<(usize, String)> {
+    let mut best: Option<(usize, String)> = None;
+    for_each_bin(base, |count, path| {
+        if best.as_ref().is_none_or(|(bc, _)| count > *bc) {
+            best = Some((count, path.to_string_lossy().into_owned()));
+        }
+    });
+    best
+}
+
+/// Delete every `{base}.M{count}.bin` except `keep` — the newest bin fully
+/// supersedes older ones (resume always loads the highest count). Call this
+/// only AFTER the `keep` bin is durably written, so a crash never leaves zero
+/// valid bins. Remove errors are ignored (a stray extra bin is harmless).
+fn gt_bin_prune(base: &str, keep: usize) {
+    for_each_bin(base, |count, path| {
+        if count != keep {
+            let _ = fs::remove_file(path);
+        }
+    });
 }
 
 // ─── Held-out queries + batch construction ──────────────────────────────────
@@ -515,7 +739,28 @@ pub fn run() {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&c| c > 0)
         .or(Some(engine_cap));
-    let n_cent = corpus::n_cent(total_docs);
+    // Optional on-disk ground-truth bin, given as a BASE prefix. Each
+    // checkpoint writes `{base}.M{count}.bin` (count = docs covered, visible in
+    // the filename); resume loads the highest-count one. Lets a grown/resumed
+    // run skip the [0, M) GT replay, and makes a crash mid-run cheap to recover.
+    let gt_bin_path = std::env::var("INFINO_BENCH_GT_BIN")
+        .ok()
+        .filter(|s| !s.is_empty());
+    // Resume against an existing table: gated on INFINO_BENCH_RESUME_INGEST.
+    // RESUME_INGEST set without a non-empty INFINO_BENCH_EXISTING_PREFIX is a
+    // hard error, NOT a silent fall-through to CREATE — the caller declared
+    // intent to resume, and CREATE would mint a fresh bucket and full-rebuild.
+    let resume = if std::env::var_os("INFINO_BENCH_RESUME_INGEST").is_some() {
+        let prefix = std::env::var("INFINO_BENCH_EXISTING_PREFIX").unwrap_or_default();
+        assert!(
+            !prefix.is_empty(),
+            "INFINO_BENCH_RESUME_INGEST is set but INFINO_BENCH_EXISTING_PREFIX is missing/empty; \
+             refusing to fall through to a fresh CREATE"
+        );
+        true
+    } else {
+        false
+    };
 
     let optimize_desc = if force_sync {
         "synchronous optimize() after each batch".to_string()
@@ -537,12 +782,14 @@ pub fn run() {
         );
     }
 
-    // Held-out queries + running ground-truth heaps.
-    let queries = build_queries(n_cent, n_queries);
-    let mut heaps: Vec<HeldTopK> = (0..n_queries).map(|_| HeldTopK::new()).collect();
-
     // Backing store (reuse the supertable fixture so INFINO_BENCH_STORE applies).
-    let fixture = tiers::block_on(tiers::supertable_storage_fixture());
+    // On resume, open the existing prefix instead of minting a fresh one.
+    let fixture = if resume {
+        tiers::block_on(tiers::existing_supertable_storage_fixture())
+            .expect("INFINO_BENCH_RESUME_INGEST requires a non-empty INFINO_BENCH_EXISTING_PREFIX")
+    } else {
+        tiers::block_on(tiers::supertable_storage_fixture())
+    };
     let storage = Arc::clone(&fixture.storage);
     eprintln!(
         "[recall_while_ingest] backing store: {}",
@@ -558,7 +805,11 @@ pub fn run() {
             .with_memory_budget(WRITER_MEMORY_BUDGET_BYTES)
             .with_cache_prepopulation(false)
     };
-    let mut st = Supertable::create(build_opts()).expect("create supertable");
+    let mut st = if resume {
+        Supertable::open(build_opts()).expect("open existing supertable for resume")
+    } else {
+        Supertable::create(build_opts()).expect("create supertable")
+    };
     let schema = ingest::schema_for(Modality::Vector);
 
     // Cron handles: created in both modes but consumed only by the wall-clock
@@ -571,6 +822,80 @@ pub fn run() {
     // Report table accumulated across checkpoints, emitted at the end.
     let mut report = Report::load("recall_while_ingest");
     let mut rows: Vec<Vec<Cell>> = Vec::new();
+
+    // On resume, discover the ORIGINAL build size from the committed row count
+    // (`m`) — we do NOT ask the caller to pass it. The corpus generator and
+    // held-out queries are keyed to the original build's cluster count, so the
+    // grid/query cluster count tracks `m` (self-discovered), not the possibly
+    // larger `total_docs` target. Non-resume keeps the original behavior:
+    // cluster count from `ingest::n_docs()`.
+    let resume_m: Option<usize> = if resume {
+        let reader = st.reader().expect("reader");
+        let batches = reader
+            .query_sql("SELECT COUNT(*) AS n FROM supertable")
+            .expect("COUNT(*) on resumed table");
+        let m = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("count column is Int64")
+            .value(0) as usize;
+        Some(m)
+    } else {
+        None
+    };
+    // Load the newest persisted GT bin up front (resume only): its header
+    // n_cent is the ORIGINAL build's cluster count — provenance a resume cannot
+    // re-derive from COUNT(*), since a run that crashed mid-target sits in a
+    // different doc-count band than its target. An Incompatible bin
+    // (version/dim/k/seeds/n_queries) is a hard error; Corrupt/absent degrades
+    // to a replay rebuild.
+    let resume_bin: Option<GtBin> = match (resume, &gt_bin_path) {
+        (true, Some(base)) => match gt_bin_latest(base) {
+            Some((_, path)) => match gt_bin_read(&path, n_queries) {
+                Ok(bin) => Some(bin),
+                Err(GtBinError::Incompatible(why)) => {
+                    panic!("resume: GT bin provenance conflicts with this run: {why}")
+                }
+                Err(GtBinError::Corrupt(why)) => {
+                    eprintln!(
+                        "[recall_while_ingest] GT bin unusable ({why}); rebuilding GT by replay"
+                    );
+                    None
+                }
+            },
+            None => None,
+        },
+        _ => None,
+    };
+    // Cluster count for the corpus generator + held-out queries. On resume the
+    // bin header is authoritative; without a bin, derive from COUNT(*) — sound
+    // only if the prior run FINISHED its target (a crashed cross-band run has no
+    // GT to restore anyway).
+    let n_cent = match (resume_m, &resume_bin) {
+        (Some(m), Some(bin)) => {
+            eprintln!(
+                "[recall_while_ingest] resume: n_cent={} from GT bin header (provenance) — \
+                 COUNT(*)={m} alone would derive {}",
+                bin.n_cent,
+                corpus::n_cent(m)
+            );
+            bin.n_cent
+        }
+        (Some(m), None) => {
+            eprintln!(
+                "[recall_while_ingest] WARNING: resuming without a usable GT bin; deriving n_cent \
+                 from COUNT(*)={m}. Valid only if the prior run finished its target; a crashed \
+                 cross-band run needs its GT bin for correct provenance."
+            );
+            corpus::n_cent(m)
+        }
+        (None, _) => corpus::n_cent(ingest::n_docs()),
+    };
+
+    // Held-out queries + running ground-truth heaps.
+    let queries = build_queries(n_cent, n_queries);
+    let mut heaps: Vec<HeldTopK> = (0..n_queries).map(|_| HeldTopK::new()).collect();
 
     // Streaming ingest + measure loop.
     let mut stream = SequentialSyntheticCorpus::new(n_cent, VEC_SEED, TEXT_SEED, true);
@@ -588,6 +913,89 @@ pub fn run() {
     let mut idx = 0usize;
     let mut docs_at_last_opt = 0usize;
     let mut reopened = false;
+
+    if let Some(m) = resume_m {
+        assert!(
+            m <= total_docs,
+            "resume: existing table has {m} docs > target {total_docs}; raise INFINO_BENCH_SUPERTABLE_DOCS"
+        );
+        eprintln!(
+            "[recall_while_ingest] RESUME: opened existing table at M={m} docs; \
+             restoring ground truth for [0, M) (no re-ingest), then ingesting [{m}, {total_docs})"
+        );
+        // Ground truth for [0, M): prefer a persisted bin (cheap), else
+        // rebuild by replaying the deterministic generator. Either way the
+        // generator is advanced over ALL of [0, M) so the subsequent ingest of
+        // [M, target) continues the same sequence; only the UNCOVERED portion
+        // [gt_covered, M) is scored into the heaps — re-scoring a doc already
+        // in a heap could insert a duplicate id and corrupt the top-k.
+        // Restore from the bin loaded up front (its n_cent already drove the
+        // generator/queries above). Bad/absent bins already degraded to a
+        // replay rebuild there; incompatible ones already aborted.
+        let mut gt_covered = 0usize;
+        match resume_bin {
+            Some(bin) if bin.m <= m => {
+                eprintln!(
+                    "[recall_while_ingest] GT bin covers M={} (index M={m}); query params verified, \
+                     bin CONTENTS assumed to match the indexed vectors (not verifiable)",
+                    bin.m
+                );
+                heaps = bin.heaps;
+                gt_covered = bin.m;
+                if bin.m < m {
+                    eprintln!(
+                        "[recall_while_ingest] GT bin behind index ({} < {m}); catching up [{}, {m})",
+                        bin.m, bin.m
+                    );
+                }
+            }
+            Some(bin) => eprintln!(
+                "[recall_while_ingest] WARNING: GT bin AHEAD of index ({} > {m}) — recomputing GT \
+                 for [0, {m}) (truncating a heap could drop a true neighbor)",
+                bin.m
+            ),
+            None if gt_bin_path.is_some() => eprintln!(
+                "[recall_while_ingest] no usable GT bin; building GT by replay, will persist"
+            ),
+            None => {}
+        }
+        let mut pos = 0usize;
+        while pos < m {
+            let sub = MAX_INGEST_BATCH_DOCS.min(m - pos);
+            stream.fill_chunk_modality(sub, &mut titles, &mut flat, false, true);
+            if pos + sub > gt_covered {
+                let skip = gt_covered.saturating_sub(pos);
+                update_heaps(
+                    &mut heaps,
+                    &queries,
+                    &flat[skip * DIM..sub * DIM],
+                    (pos + skip) as u32,
+                    sub - skip,
+                );
+            }
+            pos += sub;
+        }
+        n = m;
+        ingested.store(m, Ordering::Relaxed);
+
+        // Bank the just-restored GT for [0, M) NOW — before the crash-prone
+        // ingest begins — so a crash never forces re-replaying it. Skip if a
+        // loaded bin already covers exactly M (it's already on disk).
+        if gt_covered < m
+            && let Some(base) = &gt_bin_path
+        {
+            let path = gt_bin_ckpt_path(base, m);
+            match gt_bin_write(&path, &heaps, m, n_queries, n_cent) {
+                Ok(()) => {
+                    gt_bin_prune(base, m);
+                    eprintln!("[recall_while_ingest] GT bin persisted after replay: {path}");
+                }
+                Err(e) => eprintln!(
+                    "[recall_while_ingest] WARNING: post-replay GT bin persist to {path} failed: {e}"
+                ),
+            }
+        }
+    }
 
     eprintln!("[recall_while_ingest] idx  prefix  recall@10  drained%  cells  over_cap");
     while n < total_docs {
@@ -738,6 +1146,23 @@ pub fn run() {
             count_cell(stats.cells, Better::Higher),
             count_cell(stats.over_cap, Better::Lower),
         ]);
+
+        // Persist the running GT so a crash mid-run resumes cheaply and each
+        // checkpoint leaves a reusable oracle covering [0, n). The count is in
+        // the filename (`{base}.M{n}.bin`) so `ls` shows how far each covers.
+        if let Some(base) = &gt_bin_path {
+            let path = gt_bin_ckpt_path(base, n);
+            match gt_bin_write(&path, &heaps, n, n_queries, n_cent) {
+                Ok(()) => {
+                    // Durably written — now the older bins are superseded.
+                    gt_bin_prune(base, n);
+                    eprintln!("[recall_while_ingest] GT bin persisted: {path} (older bins pruned)");
+                }
+                Err(e) => {
+                    eprintln!("[recall_while_ingest] WARNING: GT bin persist to {path} failed: {e}")
+                }
+            }
+        }
     }
 
     // Tear down: stop the cron (if any), then clean up a remote prefix.
@@ -789,5 +1214,85 @@ pub fn run() {
     if let Some(cleanup) = &fixture.cleanup {
         eprintln!("[recall_while_ingest] cleaning up object-store prefix...");
         tiers::cleanup_prefix(cleanup);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh, unique scratch base path `<tmp>/rwi_gt_<pid>_<tag>/gt`.
+    fn tmp_base(tag: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("rwi_gt_{}_{tag}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mk scratch dir");
+        dir.join("gt").to_string_lossy().into_owned()
+    }
+
+    fn heap_with(entries: &[(u32, f32)]) -> HeldTopK {
+        let mut h = HeldTopK::new();
+        for &(id, score) in entries {
+            h.offer(score, id);
+        }
+        h
+    }
+
+    /// Heap contents as a sorted `(id, score_bits)` set — order-independent and
+    /// bit-exact (the bytes round-trip, so bit equality is the right check).
+    fn sorted(h: &HeldTopK) -> Vec<(u32, u32)> {
+        let mut v: Vec<(u32, u32)> = h
+            .entries()
+            .iter()
+            .map(|&(id, s)| (id, s.to_bits()))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn gt_bin_round_trips_header_and_heaps() {
+        let path = gt_bin_ckpt_path(&tmp_base("rt"), 12_345);
+        let heaps = vec![heap_with(&[(1, 0.9), (2, 0.8)]), heap_with(&[(3, 0.7)])];
+        // n_cent=777 is deliberately unrelated to any band — it must survive as
+        // provenance, not be re-derived on read.
+        gt_bin_write(&path, &heaps, 12_345, heaps.len(), 777).expect("write");
+        let bin = gt_bin_read(&path, heaps.len()).expect("read");
+        assert_eq!(bin.m, 12_345);
+        assert_eq!(bin.n_cent, 777, "n_cent is provenance and must round-trip");
+        assert_eq!(bin.heaps.len(), 2);
+        assert_eq!(sorted(&bin.heaps[0]), sorted(&heaps[0]));
+        assert_eq!(sorted(&bin.heaps[1]), sorted(&heaps[1]));
+    }
+
+    #[test]
+    fn gt_bin_refuses_mismatched_query_params() {
+        let path = gt_bin_ckpt_path(&tmp_base("mm"), 100);
+        gt_bin_write(&path, &[heap_with(&[(1, 0.5)])], 100, 1, 64).expect("write");
+        // Reading as if this run uses a different n_queries is a provenance
+        // conflict — Incompatible (fatal), never a silent rebuild.
+        assert!(
+            matches!(gt_bin_read(&path, 4), Err(GtBinError::Incompatible(_))),
+            "a different n_queries must be refused as Incompatible"
+        );
+    }
+
+    #[test]
+    fn gt_bin_reports_corruption_as_recoverable() {
+        let path = gt_bin_ckpt_path(&tmp_base("corrupt"), 1);
+        fs::write(&path, b"not a gt bin").expect("write");
+        assert!(
+            matches!(gt_bin_read(&path, 1), Err(GtBinError::Corrupt(_))),
+            "bad magic is Corrupt (replayable), not Incompatible"
+        );
+    }
+
+    #[test]
+    fn gt_bin_latest_picks_highest_count() {
+        let base = tmp_base("latest");
+        for n in [10usize, 200, 30] {
+            fs::write(gt_bin_ckpt_path(&base, n), b"").expect("touch");
+        }
+        // A non-`.M<digits>.bin` sibling must be ignored, not misparsed.
+        fs::write(format!("{base}.Mxx.bin"), b"").expect("touch");
+        assert_eq!(gt_bin_latest(&base).map(|(c, _)| c), Some(200));
     }
 }
