@@ -31,4 +31,5 @@ mod manifest;
 mod query;
 mod storage;
 mod update_crash_property;
+mod vector_law_serving;
 mod writer_mutations;

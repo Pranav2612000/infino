@@ -177,3 +177,120 @@ async fn drain_excludes_tombstoned_vectors_from_hidden_cells() {
         .expect("search survivor embedding");
     assert_eq!(hit_titles(&survivor)[0], TITLES[0]);
 }
+
+/// Rows per superfile in the multi-superfile pairing fixture.
+const PAIRING_ROWS_PER_BATCH: usize = 5;
+/// Superfiles (commits) in the pairing fixture.
+const PAIRING_BATCHES: usize = 3;
+/// Deleted rows as (batch, row-within-batch) — distinct bitmaps on
+/// distinct superfiles, so any cross-pairing changes the survivor set.
+const PAIRING_DELETED: &[(usize, usize)] = &[(0, 1), (2, 3)];
+
+fn pairing_title(batch: usize, row: usize) -> String {
+    format!("b{batch}r{row}")
+}
+
+fn pairing_batch(schema: Arc<Schema>, batch: usize) -> RecordBatch {
+    let mut flat = Vec::<f32>::with_capacity(PAIRING_ROWS_PER_BATCH * DIM);
+    let mut titles = Vec::with_capacity(PAIRING_ROWS_PER_BATCH);
+    for row in 0..PAIRING_ROWS_PER_BATCH {
+        let global = batch * PAIRING_ROWS_PER_BATCH + row;
+        for d in 0..DIM {
+            flat.push(if d == global % DIM { 1.0 } else { 0.0 });
+        }
+        titles.push(pairing_title(batch, row));
+    }
+    let fsl = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        DIM as i32,
+        Arc::new(Float32Array::from(flat)) as ArrayRef,
+        None,
+    )
+    .expect("FSL");
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(LargeStringArray::from(titles)) as ArrayRef,
+            Arc::new(fsl),
+        ],
+    )
+    .expect("batch")
+}
+
+/// Multi-superfile drains must pair each superfile's rows with ITS OWN
+/// tombstone bitmap. Before the `buffered` fix (#520), the batch-open
+/// fan-out collected readers in I/O-completion order and zipped them
+/// positionally against `batch_sources` — under reordering, one
+/// superfile's rows were filtered by ANOTHER superfile's bitmap (wrong
+/// rows dropped, deleted rows kept). Pinning the EXACT surviving
+/// membership across three superfiles with distinct per-file tombstones
+/// makes any cross-pairing visible; under `buffer_unordered` this fails
+/// whenever completion order scrambles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_pairs_each_superfile_with_its_own_tombstones() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st =
+        Supertable::create(vector_options().with_storage(Arc::clone(&storage))).expect("create");
+
+    let schema = st.options().schema.clone();
+    let mut w = st.writer().expect("writer");
+    for batch in 0..PAIRING_BATCHES {
+        w.append(&pairing_batch(schema.clone(), batch))
+            .expect("append");
+        w.commit().expect("commit");
+    }
+    for &(batch, row) in PAIRING_DELETED {
+        let pending = w
+            .delete(col("title").eq(lit(pairing_title(batch, row))))
+            .expect("delete");
+        assert_eq!(pending.matched, 1);
+        w.commit().expect("commit delete");
+    }
+    drop(w);
+
+    st.drain_vectors_to_cells_sync().expect("drain");
+
+    let n_total = PAIRING_BATCHES * PAIRING_ROWS_PER_BATCH;
+    let hidden = st.vector_index_table().expect("hidden index table");
+    assert_eq!(
+        hidden.reader().expect("hidden reader").n_docs_total(),
+        (n_total - PAIRING_DELETED.len()) as u64,
+        "exactly the tombstoned rows must be excluded"
+    );
+
+    // Exact membership: every survivor still ranks itself first under its
+    // own one-hot embedding; no deleted title surfaces anywhere. A
+    // mispaired bitmap fails both directions at once.
+    for batch in 0..PAIRING_BATCHES {
+        for row in 0..PAIRING_ROWS_PER_BATCH {
+            let global = batch * PAIRING_ROWS_PER_BATCH + row;
+            let title = pairing_title(batch, row);
+            let deleted = PAIRING_DELETED.contains(&(batch, row));
+            let hits = st
+                .vector_search(
+                    "emb",
+                    &one_hot(global),
+                    TOP_K,
+                    VectorSearchOptions::new(),
+                    None,
+                    Some(&["_id", "title", "score"]),
+                )
+                .expect("pairing search");
+            let titles = hit_titles(&hits);
+            if deleted {
+                assert!(
+                    !titles.contains(&title),
+                    "deleted {title} resurfaced: {titles:?}"
+                );
+            } else {
+                assert_eq!(
+                    titles.first().map(String::as_str),
+                    Some(title.as_str()),
+                    "survivor {title} must rank itself first"
+                );
+            }
+        }
+    }
+}
