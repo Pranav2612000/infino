@@ -23,6 +23,7 @@
 //! audit (`license_audit.rs`) stay at the top level of
 //! `tests/` because they need their own binary.
 
+mod bioasq_admit_diag;
 mod commit;
 mod compact_gc;
 mod disk_cache;

@@ -158,6 +158,14 @@ vector:
   # recall lever for large cells. Filtered queries ignore this.
   fine_nprobe_pct: 0.0
 
+  # Serve-time near-tie window on the exact-fine cell ranking, law-served
+  # default path only (#515): selection follows the ranking past the stamped
+  # width while each next cell's exact fine score stays within this relative
+  # window of the winner's. Decisive geometry cliffs below any sane value and
+  # serves identically; flat-scored corpora follow their own evidence. Default
+  # is the measured real-query truth-cell slack p99.
+  serve_near_tie_slack: 0.30
+
   # K-means training points per centroid for the drain's per-cell
   # sub-builds.
   kmeans_pts_per_centroid: 64

@@ -90,7 +90,7 @@ use super::{
 };
 pub use crate::superfile::reader::VectorSearchOptions;
 #[cfg(feature = "test-helpers")]
-use crate::test_helpers::served_shortlist_probe;
+use crate::test_helpers::{admit_trace, served_shortlist_probe};
 use crate::{
     config,
     storage::io_counters,
@@ -250,14 +250,23 @@ fn gate_fine_candidates_by_fragment(
     candidate_counts: &HashMap<(usize, u32), u64>,
     scored: &mut Vec<(usize, u32, f32)>,
     generation_of: Option<&[u64]>,
+    extension_depth: Option<(&HashSet<u32>, usize)>,
 ) -> Vec<(usize, u32, f32)> {
     // Fine runs kept per group scale with the group's size: a fraction of its
     // fine-cluster count, never below the floor. So large cells (more fine
     // clusters) are probed proportionally deeper while small cells hold at the
     // floor.
-    let fine_keep = |available: usize| -> usize {
+    //
+    // `extension_depth`: #515 serve-window extension cells and their bounded
+    // floor. On the law-pinned arm `keep_floor` is MAX (a probed law cell is
+    // read in full — that coverage is what the law certified), but cells the
+    // serve window added past the law's width are evidence picks, not law
+    // picks: they keep the bounded pre-pin depth so extending the served set
+    // never buys whole-cell reads. Only the per-`(cell, fragment)` arm
+    // consults it — the wave-pooled arm's depth is already bounded per wave.
+    let fine_keep = |available: usize, floor: usize| -> usize {
         ((keep_pct * available as f64).floor() as usize)
-            .max(keep_floor)
+            .max(floor)
             .max(1)
             .min(available)
     };
@@ -316,7 +325,7 @@ fn gate_fine_candidates_by_fragment(
                     .unwrap_or(Ordering::Equal)
                     .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
             });
-            let keep = fine_keep(fine.len());
+            let keep = fine_keep(fine.len(), keep_floor);
             let tail = fine.split_off(keep);
             gated.extend(
                 fine.into_iter()
@@ -340,6 +349,10 @@ fn gate_fine_candidates_by_fragment(
     let mut gated = Vec::new();
     let mut remaining = Vec::new();
     for &cell in selected_ordered {
+        let cell_floor = match extension_depth {
+            Some((extension, depth)) if extension.contains(&cell) => depth,
+            _ => keep_floor,
+        };
         let mut fragment_ids: Vec<usize> = fine_by_fragment
             .keys()
             .filter_map(|(candidate_cell, si)| (*candidate_cell == cell).then_some(*si))
@@ -354,7 +367,7 @@ fn gate_fine_candidates_by_fragment(
                     .unwrap_or(Ordering::Equal)
                     .then_with(|| a.0.cmp(&b.0))
             });
-            let keep = fine_keep(fine.len());
+            let keep = fine_keep(fine.len(), cell_floor);
             let tail = fine.split_off(keep);
             gated.extend(
                 fine.into_iter()
@@ -433,11 +446,90 @@ fn postings_by_cell_from_summaries(
 }
 
 /// 1-bit admit window for `ranked_cells` distinct tagged cells: the
-/// [`RABITQ_ADMIT_CELL_SHORTLIST_FRACTION`] slice of the ranked
-/// population, floored by [`RABITQ_ADMIT_CELL_SHORTLIST_MIN`].
+/// write-side
+/// [`crate::supertable::manifest::RABITQ_ADMIT_CELL_SHORTLIST_FRACTION`]
+/// slice of the ranked population, floored by
+/// [`RABITQ_ADMIT_CELL_SHORTLIST_MIN`] — the same window pre-#515
+/// serving always used. This is only round 0 of admission: on the
+/// law-served default path the #515 self-measured admit loop
+/// ([`admit_extension_round`]) extends it from the query's own
+/// evidence, with no query-side fraction of its own.
 fn admit_shortlist_window(ranked_cells: usize) -> usize {
     let scaled = (ranked_cells as f64 * RABITQ_ADMIT_CELL_SHORTLIST_FRACTION).ceil() as usize;
     scaled.max(RABITQ_ADMIT_CELL_SHORTLIST_MIN)
+}
+
+/// One round of the #515 self-measured admit extension: which
+/// not-yet-admitted cells could plausibly hold an exact fine score
+/// inside the serve window, judged by their 1-bit estimate shifted by
+/// the most favorable estimate-to-exact residual OBSERVED ON THIS
+/// QUERY. The shift is an empirical extrapolation, not a proven
+/// over-admit bound: the residual is SIGNED and measured only on the
+/// already-scored (best-estimate) cells, so a distant truth cell whose
+/// estimate is unusually pessimistic can sit outside the extension —
+/// the measured under-admit tail (the #515 diag reads 99% full admit
+/// coverage, not 100%). What does hold: the stamped width stays a
+/// served floor, so admission is expected/measured ≥ the stamped-width
+/// baseline, never below it. Decisive geometry: estimates cliff,
+/// nothing qualifies, admission stays at the write window. Flat-scored
+/// queries (question-vs-passage retrieval): the tie run qualifies and
+/// admission follows the evidence. The caller iterates — newly
+/// admitted cells' exact scores tighten/widen the measurement — until
+/// a round admits nothing; each round admits ≥ 1 new cell, so
+/// termination is bounded by the populated-cell count.
+fn admit_extension_round(
+    admit_ranking: &[(u32, f32)],
+    admitted: &HashSet<u32>,
+    exact_best_by_cell: &HashMap<u32, f32>,
+    serve_threshold: f32,
+) -> Vec<u32> {
+    let mut residual_floor = f32::INFINITY;
+    for (cell, estimate) in admit_ranking {
+        if let Some(exact) = exact_best_by_cell.get(cell) {
+            residual_floor = residual_floor.min(exact - estimate);
+        }
+    }
+    if !residual_floor.is_finite() {
+        return Vec::new();
+    }
+    admit_ranking
+        .iter()
+        .filter(|(cell, _)| !admitted.contains(cell))
+        .filter(|(_, estimate)| estimate + residual_floor <= serve_threshold)
+        .map(|(cell, _)| *cell)
+        .collect()
+}
+
+/// Cell selection for the law-served DEFAULT arm (#515): the stamped
+/// width is a SERVED FLOOR — the drain certified that many cells are
+/// needed for its coverage target, and serving fewer would break the
+/// law contract (planted-neighbor tests pin exactly the case where
+/// truth spans cells whose fine scores are not tied). Past the floor,
+/// selection follows the exact-fine ranking while the query's own
+/// scores stay inside the serve window; those extension cells are read
+/// at the bounded pre-pin depth (cells inside the floor keep
+/// whole-cell depth — that is what the walk certified). Returns the
+/// served cells in probe order (grid picks first, then fine) plus the
+/// extension set.
+fn law_floor_serve_selection(
+    fine_ranked: &[(u32, f32)],
+    grid_cells: &[u32],
+    fine_base: usize,
+    serve_threshold: f32,
+) -> (Vec<u32>, HashSet<u32>) {
+    let fine_cells: Vec<u32> = fine_ranked
+        .iter()
+        .enumerate()
+        .take_while(|(rank, (_, score))| *rank < fine_base || *score <= serve_threshold)
+        .map(|(_, (cell, _))| *cell)
+        .collect();
+    let extension: HashSet<u32> = fine_cells
+        .iter()
+        .skip(fine_base)
+        .copied()
+        .filter(|cell| !grid_cells.contains(cell))
+        .collect();
+    (union_cell_selection(grid_cells, &fine_cells), extension)
 }
 
 /// One admit fine-centroid candidate:
@@ -498,22 +590,77 @@ fn eligible_summary<'e>(
     }
 }
 
+/// Rank every eligible tagged cell by its best ESTIMATED fine-centroid
+/// score (1-bit XOR+popcount over the summary codes), ascending —
+/// better first, ties on lower cell id. The estimates never leave the
+/// admit stage: they bound which cells get exact-scored, and (#515)
+/// they carry the self-measured admit extension — the caller compares
+/// them against exact scores it already computed to measure this
+/// table's estimate-to-exact residual per query.
+fn estimate_admit_ranking(
+    superfiles: &[Arc<SuperfileEntry>],
+    column: &str,
+    query_len: usize,
+    metric: Metric,
+    admit_q: &RabitqAdmitQuery,
+    allow: Option<&HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
+    superseded: &BTreeMap<Uuid, BTreeSet<u32>>,
+) -> Result<Vec<(u32, f32)>, QueryError> {
+    let eligible = |entry: &Arc<SuperfileEntry>| allow.is_none_or(|m| m.contains_key(&entry.uri));
+    let is_superseded = |entry: &Arc<SuperfileEntry>, cell_id: u32| {
+        superseded
+            .get(&entry.superfile_id)
+            .is_some_and(|s| s.contains(&cell_id))
+    };
+    let mut cell_best: HashMap<u32, f32> = HashMap::new();
+    for entry in superfiles.iter().filter(|e| eligible(e)) {
+        let vs = eligible_summary(entry, column, query_len)?;
+        for cell in &vs.cells {
+            let Some(cell_id) = cell.cell_id else {
+                continue;
+            };
+            if is_superseded(entry, cell_id) {
+                continue;
+            }
+            let Some(est) = cell.clusters.estimate_min_admit_score(metric, admit_q) else {
+                continue;
+            };
+            cell_best
+                .entry(cell_id)
+                .and_modify(|best| {
+                    if est < *best {
+                        *best = est;
+                    }
+                })
+                .or_insert(est);
+        }
+    }
+    let mut ranked: Vec<(u32, f32)> = cell_best.into_iter().collect();
+    ranked.sort_unstable_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    Ok(ranked)
+}
+
 /// Score fine IVF centroids in the eligible superfile summaries.
 ///
-/// With `admit` set (`(prefilter query, must-include cells)`), a 1-bit
-/// XOR+popcount pass first ranks tagged cells by their best estimated
-/// fine-centroid score and keeps the [`admit_shortlist_window`] top
-/// slice plus the caller's grid picks; the exact fp32 scan below then
-/// skips instances outside that set. Every *emitted* score is exact
-/// fp32, so routing and near-tie logic never see 1-bit noise — the
-/// estimates only bound which cells get exact-scored. Untagged
-/// (`cell_id: None`) summaries are always exact-scored.
+/// With `admit` set (an explicit admitted-cell set), the exact fp32
+/// scan skips instances outside that set; the caller owns admission
+/// (write-window slice of [`estimate_admit_ranking`] plus grid picks,
+/// extended by the #515 self-measured admit loop). Every *emitted*
+/// score is exact fp32, so routing and near-tie logic never see 1-bit
+/// noise. Untagged (`cell_id: None`) summaries are exact-scored when
+/// `include_untagged` is set — round 0 only, so admit-extension rounds
+/// never re-emit them.
 fn score_fine_candidates(
     superfiles: &[Arc<SuperfileEntry>],
     column: &str,
     query: &[f32],
     metric: Metric,
-    admit: Option<(&RabitqAdmitQuery, &[u32])>,
+    admit: Option<&HashSet<u32>>,
+    include_untagged: bool,
     allow: Option<&HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
     superseded: &BTreeMap<Uuid, BTreeSet<u32>>,
 ) -> Result<(Vec<FineCandidate>, Vec<DeferredCellRescore>), QueryError> {
@@ -528,47 +675,7 @@ fn score_fine_candidates(
             .get(&entry.superfile_id)
             .is_some_and(|s| s.contains(&cell_id))
     };
-
-    let shortlist: Option<HashSet<u32>> = if let Some((admit_q, must_include)) = admit {
-        let mut cell_best: HashMap<u32, f32> = HashMap::new();
-        for entry in superfiles.iter().filter(|e| eligible(e)) {
-            let vs = eligible_summary(entry, column, query.len())?;
-            for cell in &vs.cells {
-                let Some(cell_id) = cell.cell_id else {
-                    continue;
-                };
-                if is_superseded(entry, cell_id) {
-                    continue;
-                }
-                let Some(est) = cell.clusters.estimate_min_admit_score(metric, admit_q) else {
-                    continue;
-                };
-                cell_best
-                    .entry(cell_id)
-                    .and_modify(|best| {
-                        if est < *best {
-                            *best = est;
-                        }
-                    })
-                    .or_insert(est);
-            }
-        }
-        let mut ranked: Vec<(u32, f32)> = cell_best.into_iter().collect();
-        ranked.sort_unstable_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        let mut keep: HashSet<u32> = ranked
-            .iter()
-            .take(admit_shortlist_window(ranked.len()))
-            .map(|(cell, _)| *cell)
-            .collect();
-        keep.extend(must_include.iter().copied());
-        Some(keep)
-    } else {
-        None
-    };
+    let shortlist: Option<&HashSet<u32>> = admit;
 
     let mut candidates: Vec<FineCandidate> = Vec::new();
     let mut deferred: Vec<DeferredCellRescore> = Vec::new();
@@ -582,8 +689,8 @@ fn score_fine_candidates(
             // Flat cluster ids must stay identical whether or not a cell is
             // skipped, so flat_base always advances.
             let skipped = cell.cell_id.is_some_and(|cid| is_superseded(entry, cid))
+                || (cell.cell_id.is_none() && !include_untagged)
                 || shortlist
-                    .as_ref()
                     .is_some_and(|keep| cell.cell_id.is_some_and(|cid| !keep.contains(&cid)));
             if !skipped {
                 if cell.clusters.vectors_resident() {
@@ -629,14 +736,40 @@ fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
     selected
 }
 
+// Serve-time near-tie window on the exact-fine cell ranking (#515),
+// law-pinned default path only. Past the law's width, selection keeps
+// following the ranking while each next cell's best exact fine score
+// stays within this relative window of the winner's. On decisive
+// geometry (synthetic, Cohere) fine scores cliff after the law's picks
+// and the window never opens — serving is byte-identical to the pin.
+// On flat-scored corpora (question-vs-passage retrieval: BioASQ
+// measured its truth cells at exact-fine ranks ≤ 48, already inside
+// the exactly-rescored admit window) the query's own evidence extends
+// the served set. Bounds are the evidence itself and the admit window
+// (only admitted cells are ranked) — deliberately no artificial cap: a
+// constant ceiling would silently truncate exactly the tail queries
+// this serves. Cost stays bounded per cell instead: extension cells
+// are read at the pre-pin fine depth (the stamped law's runs-per-cell
+// floor), never the pin's whole-cell depth. The window value comes
+// from `config.yaml` (`vector.serve_near_tie_slack`, default = the
+// measured real-query truth-cell slack p99, 0.287–0.294 across the
+// #515 BioASQ diag configs; the dial grid read 0.9617 at 0.25 vs
+// 0.9657 at 0.30 on the diag metric, Cohere controls unchanged at
+// both) — a config default rather than a per-table drain stamp
+// because the drain sample is corpus rows, which measure a different
+// slack distribution than real queries (the same mismatch that
+// under-stamped the width law on question-vs-passage corpora).
+
 /// Default-path cell selection, shared by the hidden (post-drain) and user
 /// (pre-drain) branches: probe the fine-ranked top cell, adding the grid's
 /// top cell only when its own fine score is a genuine near-tie of the fine
 /// winner (same relative window replica closure uses at drain time, so
 /// probing and replication agree on what counts as a boundary). At the
 /// shipped grid shapes (256/1024 cells) fine p1 coverage measures 1.000
-/// (drain-diag, 1M–100M), so a second unconditional pick only multiplies
-/// the probed-cell fan without recall to show for it.
+/// (drain-diag, 1M–100M) on row-like queries. The #515 serve window
+/// deliberately does NOT apply here: this arm gates wave-pooled, where
+/// widening the cell sweep alone cannot deepen the read, so following
+/// the ranking would add cells without adding recall.
 fn fine_first_cell_selection(fine_ranked: &[(u32, f32)], grid_top: Option<u32>) -> Vec<u32> {
     let Some(&(fine_top, fine_top_score)) = fine_ranked.first() else {
         return grid_top.into_iter().collect();
@@ -1281,13 +1414,18 @@ impl SupertableReader {
         // budget then resolved the ORIGINAL options and the served
         // default silently reverted to the constant (measured as
         // default == rm=256 on a law-stamped table).
-        let options = match rerank_mult_from_law(
+        let law_rerank = rerank_mult_from_law(
             hidden_vector_index,
             filtered,
             options.rerank_mult(),
             hidden_routing.as_ref(),
             k,
-        ) {
+        );
+        // Whether the rerank budget below is the LAW's (scalable with the
+        // served width, #515) or an explicit caller value (exact request,
+        // never scaled).
+        let law_rerank_served = law_rerank.is_some();
+        let options = match law_rerank {
             Some(mult) => options.with_rerank_mult(mult),
             None => options,
         };
@@ -1387,6 +1525,12 @@ impl SupertableReader {
         // Assigned in both admit arms; used below for the posting-aware
         // budget expand (keep scoring until we cover ≥ k postings).
         let candidate_counts: HashMap<(usize, u32), u64>;
+        // (#515) Served cells over stamped width, set by the law-served
+        // union arm when the serve window extends past the stamp; scales
+        // the pooled rerank budget below so the pool grows with the cells
+        // the evidence actually serves. (1, 1) everywhere else — decisive
+        // geometry, explicit caller values, filtered search.
+        let mut served_cells_over_width: (usize, usize) = (1, 1);
         if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
             // Base routing shape first (per branch), then one shared caller
             // override on top.
@@ -1452,6 +1596,12 @@ impl SupertableReader {
                 } else {
                     None
                 };
+            // Depth the DEFAULT (unpinned) path would read per cell — the
+            // stamped fine-depth law over the routing base. Captured before
+            // the pin lifts `fine_nprobe` to MAX: #515 serve-window
+            // extension cells are gated at this bounded depth, not the
+            // pin's whole-cell depth.
+            let prepin_fine_depth = cell_routing.fine_nprobe;
             let populated_cells = postings_by_cell.len().max(1);
             sweep_width = apply_width_pin(
                 &mut cell_routing,
@@ -1472,6 +1622,12 @@ impl SupertableReader {
             } else {
                 config::global().vector.fine_nprobe_pct
             };
+            // #515 near-tie serve window, config-defaulted like the
+            // fraction above (config.yaml / ./infino.yaml — no env var,
+            // no rebuild); see the serve-window doc at the top of the
+            // file for why this is a config default and not a drain
+            // stamp.
+            let serve_near_tie_slack = config::global().vector.serve_near_tie_slack;
             let ranked_for_beam: Vec<(u32, f32)> = ranked_scored
                 .iter()
                 .filter(|(cell, _)| postings_by_cell.contains_key(cell))
@@ -1496,12 +1652,30 @@ impl SupertableReader {
                 .iter()
                 .map(|(cell, _)| *cell)
                 .collect();
+            // Round 0: the pre-#515 write-window slice plus the grid's
+            // must-include picks, exactly scored.
+            let admit_ranking = estimate_admit_ranking(
+                &superfiles,
+                column,
+                query.len(),
+                metric,
+                &admit_q,
+                allow_ref,
+                superseded,
+            )?;
+            let mut admitted: HashSet<u32> = admit_ranking
+                .iter()
+                .take(admit_shortlist_window(admit_ranking.len()))
+                .map(|(cell, _)| *cell)
+                .collect();
+            admitted.extend(must_include.iter().copied());
             let (mut candidates, deferred) = score_fine_candidates(
                 &superfiles,
                 column,
                 query,
                 metric,
-                Some((&admit_q, must_include.as_slice())),
+                Some(&admitted),
+                true,
                 allow_ref,
                 superseded,
             )?;
@@ -1516,6 +1690,61 @@ impl SupertableReader {
                 )
                 .await?;
             }
+            // #515 self-measured admit loop, law-served default path only
+            // (explicit caller `nprobe` is an exact request; filtered
+            // search keeps its own floors; width-1 stamps take fine-first
+            // where estimates cliff and the loop would admit nothing).
+            // Each round measures the estimate-to-exact residual from the
+            // cells already exactly scored and admits the cells whose
+            // estimates could plausibly land inside the serve window;
+            // admission is evidence-bounded, no query-side fraction.
+            let law_default = !filtered && options.nprobe.is_none() && law_width.is_some();
+            if law_default {
+                loop {
+                    let fine_ranked_now = cells_ranked_by_fine_score(&candidates);
+                    let Some(&(_, best_exact)) = fine_ranked_now.first() else {
+                        break;
+                    };
+                    let serve_threshold = relative_score_window(best_exact, serve_near_tie_slack);
+                    let exact_best_by_cell: HashMap<u32, f32> =
+                        fine_ranked_now.into_iter().collect();
+                    let round = admit_extension_round(
+                        &admit_ranking,
+                        &admitted,
+                        &exact_best_by_cell,
+                        serve_threshold,
+                    );
+                    if round.is_empty() {
+                        break;
+                    }
+                    let delta: HashSet<u32> = round.into_iter().collect();
+                    admitted.extend(delta.iter().copied());
+                    let (mut delta_candidates, delta_deferred) = score_fine_candidates(
+                        &superfiles,
+                        column,
+                        query,
+                        metric,
+                        Some(&delta),
+                        false,
+                        allow_ref,
+                        superseded,
+                    )?;
+                    if !delta_deferred.is_empty() {
+                        self.rescore_deferred_cells(
+                            &superfiles,
+                            column,
+                            query,
+                            metric,
+                            &mut delta_candidates,
+                            delta_deferred,
+                        )
+                        .await?;
+                    }
+                    candidates.extend(delta_candidates);
+                }
+            }
+            #[cfg(feature = "test-helpers")]
+            admit_trace::record_admit(admitted.iter().copied().collect());
             candidate_counts = candidates
                 .iter()
                 .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
@@ -1525,27 +1754,69 @@ impl SupertableReader {
                 .expect("ranked cell ids exist with scored ranking");
             if hidden_vector_index {
                 let fine_ranked = cells_ranked_by_fine_score(&candidates);
+                #[cfg(feature = "test-helpers")]
+                admit_trace::record_fine(fine_ranked.clone());
                 // Default path: fine-first p=1, the same selection the user
                 // (pre-drain) branch ships. Filtered search and explicit
                 // caller nprobe keep the wider grid/fine union.
                 let default_p1 = !filtered && options.nprobe.is_none() && cutoff == 1;
-                let selected_cells_ordered: Vec<u32> = if default_p1 {
-                    fine_first_cell_selection(
-                        &fine_ranked,
-                        ranked_for_beam.first().map(|(cell, _)| *cell),
-                    )
-                } else {
-                    let grid_cells: Vec<u32> = ranked_for_beam[..cutoff]
-                        .iter()
-                        .map(|(cell, _)| *cell)
-                        .collect();
-                    let fine_cells: Vec<u32> = fine_ranked
-                        .iter()
-                        .take(cutoff.max(UNION_FINE_PICKS_MIN))
-                        .map(|(cell, _)| *cell)
-                        .collect();
-                    union_cell_selection(&grid_cells, &fine_cells)
-                };
+                let (selected_cells_ordered, extension_cells): (Vec<u32>, HashSet<u32>) =
+                    if default_p1 {
+                        (
+                            fine_first_cell_selection(
+                                &fine_ranked,
+                                ranked_for_beam.first().map(|(cell, _)| *cell),
+                            ),
+                            HashSet::new(),
+                        )
+                    } else if law_default {
+                        // #515 law arm: the stamped width is a SERVED floor
+                        // (the law contract); the serve window follows the
+                        // exact-fine ranking beyond it while the query's own
+                        // scores stay near-tied — flat-scored queries widen
+                        // themselves, cliff-scored queries serve exactly the
+                        // law width, byte-identical to before. Extension
+                        // cells read at the bounded pre-pin fine depth.
+                        let grid_cells: Vec<u32> = ranked_for_beam[..cutoff]
+                            .iter()
+                            .map(|(cell, _)| *cell)
+                            .collect();
+                        match fine_ranked
+                            .first()
+                            .map(|(_, score)| relative_score_window(*score, serve_near_tie_slack))
+                        {
+                            Some(threshold) => law_floor_serve_selection(
+                                &fine_ranked,
+                                &grid_cells,
+                                cutoff.max(UNION_FINE_PICKS_MIN),
+                                threshold,
+                            ),
+                            None => (grid_cells, HashSet::new()),
+                        }
+                    } else {
+                        // Explicit caller `nprobe` / filtered search: the
+                        // exact-request grid/fine union, pre-#515 shape —
+                        // no serve window, no extension.
+                        let grid_cells: Vec<u32> = ranked_for_beam[..cutoff]
+                            .iter()
+                            .map(|(cell, _)| *cell)
+                            .collect();
+                        let fine_cells: Vec<u32> = fine_ranked
+                            .iter()
+                            .take(cutoff.max(UNION_FINE_PICKS_MIN))
+                            .map(|(cell, _)| *cell)
+                            .collect();
+                        (
+                            union_cell_selection(&grid_cells, &fine_cells),
+                            HashSet::new(),
+                        )
+                    };
+                if law_default {
+                    served_cells_over_width = (
+                        selected_cells_ordered.len().max(1),
+                        sweep_width.unwrap_or(1).max(1),
+                    );
+                }
                 let selected_cells: HashSet<u32> = selected_cells_ordered.iter().copied().collect();
                 // Wave-pooled depth is the p=1 read-volume model: keep runs
                 // per drain wave so reads track wave count, not probed-cell
@@ -1573,6 +1844,7 @@ impl SupertableReader {
                     &candidate_counts,
                     &mut scored,
                     generation_of,
+                    (!extension_cells.is_empty()).then_some((&extension_cells, prepin_fine_depth)),
                 );
             } else {
                 // Fine-first p=1 over all scored fines. Explicit nprobe /
@@ -1615,6 +1887,7 @@ impl SupertableReader {
                     &candidate_counts,
                     &mut scored,
                     None,
+                    None,
                 );
             }
         } else {
@@ -1628,6 +1901,7 @@ impl SupertableReader {
                 query,
                 metric,
                 None,
+                true,
                 allow_ref,
                 superseded,
             )?;
@@ -1988,15 +2262,41 @@ impl SupertableReader {
                 // stamped width and run floor-free: at law widths the
                 // floor measured +0.0001 recall for ~3.4 ms of extra
                 // rerank at k=100 (Cohere-1M), and at width 1-2 it is a
-                // near-no-op by construction. Floor = k when it applies:
+                // near-no-op by construction. Re-measured at the WIDENED
+                // widths the #515 admit extension serves (Cohere defaults
+                // with the loop active, diffuse stamps both k): still
+                // floor-free, 0.9955 @ k=100 and 0.9940 @ k=10 — above
+                // the stamped-width baseline, no inversion dip. If a
+                // future gate dips, the targeted fix is arming floor = k
+                // on the extension subset only, not on the law's picks.
+                // Floor = k when it applies:
                 // even if the entire true top-k concentrates in one probed
                 // cell, that cell's floor carries it into the exact rerank
                 // (replicas never collide inside one cell, so the floor
                 // needs no replica overhead).
                 let cell_floor = if options.nprobe.is_some() { k } else { 0 };
-                let shortlist_limit = k
-                    .saturating_add(replica_overhead)
-                    .saturating_mul(rerank_mult);
+                // (#515) The LAW's rerank budget is calibrated on drain
+                // rows at the stamped width; when the serve window extends
+                // serving past that width, the same budget starves the
+                // widened candidate set — measured at true defaults on
+                // BioASQ-1M: stamped budget serves 0.9510 where the knee
+                // sits at ~3-6x (rm=32 → 0.9820, rm=64 → 0.9880, flat by
+                // 128). Scale the pooled budget by served-cells over
+                // stamped-width, so the pool grows exactly with the cells
+                // the evidence serves: BioASQ lands at the measured knee;
+                // decisive geometry serves width == stamp and is
+                // unchanged. Explicit caller rerank_mult stays an exact,
+                // unscaled request.
+                let (served, stamped_width) = served_cells_over_width;
+                let shortlist_limit = if law_rerank_served && options.nprobe.is_none() {
+                    k.saturating_add(replica_overhead)
+                        .saturating_mul(rerank_mult)
+                        .saturating_mul(served)
+                        .div_ceil(stamped_width)
+                } else {
+                    k.saturating_add(replica_overhead)
+                        .saturating_mul(rerank_mult)
+                };
                 // Regression probe for the serve-the-law scope bug: recall
                 // floors can't see a re-shadowed `options` (the constant
                 // budget only ADDS survivors); the served limit can.
@@ -2486,6 +2786,82 @@ impl SupertableReader {
     ) -> Result<PreparedGlobalAllow, QueryError> {
         self.prepare_vector_stable_allow_inner(allow_stable_ids)
             .await
+    }
+
+    /// Test-only diagnostic (#515): map every drained row's stable id to
+    /// its hidden cell. Packed hidden superfiles are cell-contiguous in
+    /// local-doc order, so walking each superfile's local-order stable
+    /// ids against its summary's per-cell counts recovers the assignment
+    /// without touching posting payloads beyond the routing-id reads the
+    /// filtered path already performs.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn diag_hidden_stable_cell_map(
+        &self,
+        column: &str,
+    ) -> Result<HashMap<i128, u32>, QueryError> {
+        let Some(vit) = self.vector_index_table() else {
+            return Ok(HashMap::new());
+        };
+        let hidden_reader = vit.pinned_reader();
+        let hidden_manifest = Arc::clone(hidden_reader.manifest());
+        let superfiles = hidden_manifest
+            .get_all_superfiles_loaded()
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        let map = Arc::new(Mutex::new(HashMap::new()));
+        let column_owned = column.to_string();
+        let map_for_fanout = Arc::clone(&map);
+        let manifest_for_ids = Arc::clone(&hidden_manifest);
+        let _ = hidden_reader
+            .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
+                let map = Arc::clone(&map_for_fanout);
+                let manifest_for_ids = Arc::clone(&manifest_for_ids);
+                let column = column_owned.clone();
+                async move {
+                    let stable_ids =
+                        stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r).await?;
+                    if let Some(vs) = entry.vector_summary.get(&column) {
+                        let mut idx = 0usize;
+                        let mut guard = map.lock().expect("diag cell-map lock");
+                        for cell in &vs.cells {
+                            let n: u64 = cell.clusters.counts.iter().map(|&c| u64::from(c)).sum();
+                            for _ in 0..n {
+                                if idx >= stable_ids.len() {
+                                    break;
+                                }
+                                if let Some(cid) = cell.cell_id {
+                                    guard.insert(stable_ids[idx], cid);
+                                }
+                                idx += 1;
+                            }
+                        }
+                    }
+                    Ok(RoaringBitmap::new())
+                }
+            })
+            .await?;
+        let map = Arc::try_unwrap(map)
+            .map(|m| m.into_inner().expect("diag cell-map lock"))
+            .unwrap_or_default();
+        Ok(map)
+    }
+
+    /// Test-only diagnostic (#515): the hidden table's stamped probe
+    /// laws — `(width_for_k, fine_for_k, rerank_for_k)` — read from the
+    /// hidden manifest's partition strategy, exactly as the bench's
+    /// hidden-stats line reports them. `None` when there is no hidden
+    /// index or no cell strategy.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn diag_hidden_probe_laws(&self) -> Option<(Vec<u32>, Vec<u32>, Vec<u32>)> {
+        let vit = self.vector_index_table()?;
+        match vit.pinned_reader().manifest().get_partition_strategy() {
+            PartitionStrategy::VectorCell { routing, .. } => Some((
+                routing.width_for_k.to_vec(),
+                routing.fine_for_k.to_vec(),
+                routing.rerank_for_k.to_vec(),
+            )),
+            _ => None,
+        }
     }
 
     async fn prepare_vector_stable_allow_inner(
@@ -3362,10 +3738,11 @@ mod tests {
 
     use super::{
         RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
-        VectorSearchOptions, admit_shortlist_window, apply_width_pin, calibrated_query_for,
-        cells_ranked_by_fine_score, gate_fine_candidates_by_fragment, hidden_hits_user_ids,
-        is_hidden_vector_manifest, postings_by_cell_from_summaries, projection_is_id_score_only,
-        rerank_mult_from_law, score_fine_candidates, select_global_shortlist, union_cell_selection,
+        VectorSearchOptions, admit_extension_round, admit_shortlist_window, apply_width_pin,
+        calibrated_query_for, cells_ranked_by_fine_score, gate_fine_candidates_by_fragment,
+        hidden_hits_user_ids, is_hidden_vector_manifest, law_floor_serve_selection,
+        postings_by_cell_from_summaries, projection_is_id_score_only, rerank_mult_from_law,
+        score_fine_candidates, select_global_shortlist, union_cell_selection,
         vector_read_query_error,
     };
     use crate::{
@@ -3419,10 +3796,11 @@ mod tests {
         ));
     }
 
-    /// The admit window scales with the ranked cell population (20%
-    /// slice) and never narrows below the validated floor: small tables
-    /// degenerate to exact-everything, the 256-cell shape widens just
-    /// past its measured 48, and larger grids grow proportionally.
+    /// The admit window scales with the ranked cell population (the
+    /// write-side 20% slice — round 0 of admission) and never narrows
+    /// below the validated floor: small tables degenerate to
+    /// exact-everything, the 256-cell shape widens just past its
+    /// measured 48, and larger grids grow proportionally.
     #[test]
     fn admit_shortlist_window_scales_with_cell_population() {
         assert_eq!(admit_shortlist_window(0), RABITQ_ADMIT_CELL_SHORTLIST_MIN);
@@ -3433,6 +3811,67 @@ mod tests {
         assert_eq!(admit_shortlist_window(1024), 205);
         // Ceil, not floor: a fractional slice rounds up.
         assert_eq!(admit_shortlist_window(241), 49);
+    }
+
+    /// The self-measured admit extension (#515) follows the query's own
+    /// evidence: with a flat estimate spectrum and an observed
+    /// estimate-to-exact residual, the near-tie run past the write
+    /// window qualifies; a cliff-scored spectrum admits nothing. The
+    /// residual floor is measured from already-scored cells, so with no
+    /// exact scores in hand the round admits nothing (no guess).
+    #[test]
+    fn admit_extension_round_follows_evidence() {
+        // Cells 1..=6 ranked by estimate; 1-3 admitted and exactly
+        // scored. Exact = estimate + 0.05 everywhere (residual floor
+        // 0.05). Winner exact 0.15 → serve threshold 0.30 (window 100%
+        // for arithmetic clarity).
+        let ranking = vec![
+            (1u32, 0.10f32),
+            (2, 0.12),
+            (3, 0.14),
+            (4, 0.20),
+            (5, 0.24),
+            (6, 0.80),
+        ];
+        let admitted: HashSet<u32> = [1, 2, 3].into_iter().collect();
+        let exacts: HashMap<u32, f32> = [(1u32, 0.15f32), (2, 0.17), (3, 0.19)].into();
+        // Flat spectrum: cells 4 and 5 could land inside the window
+        // (estimate + 0.05 ≤ 0.30); the far cell 6 cannot.
+        assert_eq!(
+            admit_extension_round(&ranking, &admitted, &exacts, 0.30),
+            vec![4, 5]
+        );
+        // Cliff: a tight threshold admits nothing.
+        assert!(admit_extension_round(&ranking, &admitted, &exacts, 0.16).is_empty());
+        // No exact scores observed → no residual measurement → nothing.
+        assert!(admit_extension_round(&ranking, &admitted, &HashMap::new(), 0.30).is_empty());
+    }
+
+    /// The law arm (#515) serves the stamped width as a FLOOR — cliff
+    /// scores never shrink it (the law contract) — and follows the
+    /// near-tie run beyond it: extension cells (past the floor, not
+    /// grid picks) read at bounded pre-pin depth, floor cells at
+    /// whole-cell depth as certified.
+    #[test]
+    fn law_floor_serve_selection_extends_past_the_served_floor() {
+        // Cliff after the floor: exactly the floor is served (grid
+        // first in probe order), no extension.
+        let cliff = vec![(7u32, 0.10f32), (8, 0.90), (9, 0.95)];
+        let (cells, ext) = law_floor_serve_selection(&cliff, &[7, 8], 2, 0.20);
+        assert_eq!(cells, vec![7, 8]);
+        assert!(ext.is_empty());
+        // Flat run: the near-tie run past the floor is served and lands
+        // in the extension set; floor cells do not.
+        let flat = vec![(7u32, 0.10f32), (8, 0.11), (9, 0.12)];
+        let (cells, ext) = law_floor_serve_selection(&flat, &[7, 8], 2, 0.20);
+        assert_eq!(cells, vec![7, 8, 9]);
+        assert_eq!(ext, [9u32].into_iter().collect());
+        // A grid pick past the floor's fine ranks is served via the
+        // union but never depth-bounded (it is a law pick, not
+        // evidence): extension excludes grid cells.
+        let (cells, ext) = law_floor_serve_selection(&flat, &[9], 2, 0.20);
+        assert_eq!(cells, vec![9, 7, 8]);
+        assert!(ext.is_empty());
     }
 
     /// Union keeps grid picks first (probe priority), appends fine picks
@@ -3539,6 +3978,7 @@ mod tests {
             &candidate_counts,
             &mut scored,
             None,
+            None,
         );
         // The small fragment (si=1) is probed despite its worse score.
         assert!(
@@ -3547,6 +3987,63 @@ mod tests {
         );
         // The large fragment keeps exactly keep_per_fragment=2 of its 3 runs.
         assert_eq!(gated.iter().filter(|(si, _, _)| *si == 0).count(), 2);
+    }
+
+    /// #515 serve-window extension cells never inherit the pin's whole-cell
+    /// depth: under a MAX `keep_floor` (the law-pinned arm), a cell named in
+    /// `extension_depth` keeps only its bounded floor while pinned cells are
+    /// still read in full. This is the regression guard for the defect where
+    /// evidence extension silently multiplied whole-cell reads.
+    #[test]
+    fn extension_cells_keep_bounded_depth_under_pin() {
+        // Cell 0 (law-pinned): three runs. Cell 1 (serve-window extension):
+        // three runs, slightly worse scores.
+        let candidates = vec![
+            (0usize, 10u32, 0.10f32, Some(0u32), 5u64),
+            (0, 11, 0.11, Some(0), 5),
+            (0, 12, 0.12, Some(0), 5),
+            (0, 20, 0.20, Some(1), 5),
+            (0, 21, 0.21, Some(1), 5),
+            (0, 22, 0.22, Some(1), 5),
+        ];
+        let selected: HashSet<u32> = [0, 1].into_iter().collect();
+        let selected_ordered = [0u32, 1];
+        let extension: HashSet<u32> = [1].into_iter().collect();
+        let candidate_counts: HashMap<(usize, u32), u64> = candidates
+            .iter()
+            .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
+            .collect();
+        let mut scored = Vec::new();
+        let gated = gate_fine_candidates_by_fragment(
+            candidates,
+            &selected,
+            &selected_ordered,
+            usize::MAX, // keep_floor: the pin's whole-cell depth
+            0.0,        // keep_pct: floor-only for this test
+            1,          // gated_target: tiny so the refill can't mask the bound
+            &candidate_counts,
+            &mut scored,
+            None,
+            Some((&extension, 1)), // extension cell bounded to one run
+        );
+        // The pinned cell is read in full (all three runs).
+        let pinned: HashSet<u32> = gated
+            .iter()
+            .filter(|(_, c, _)| *c < 20)
+            .map(|(_, c, _)| *c)
+            .collect();
+        assert_eq!(pinned, [10u32, 11, 12].into_iter().collect());
+        // The extension cell keeps exactly its bounded floor: its best run.
+        let extended: Vec<u32> = gated
+            .iter()
+            .filter(|(_, c, _)| *c >= 20)
+            .map(|(_, c, _)| *c)
+            .collect();
+        assert_eq!(
+            extended,
+            vec![20],
+            "extension cell read past its bounded depth: {gated:?}"
+        );
     }
 
     /// Hidden path (`generation_of = Some`): the fine-run keep is bounded per
@@ -3584,6 +4081,7 @@ mod tests {
             &candidate_counts,
             &mut scored,
             Some(&birth_versions),
+            None,
         );
         // Bounded per wave across both cells: 2 total, not 2 per cell (=4).
         assert_eq!(
@@ -3628,6 +4126,7 @@ mod tests {
             &candidate_counts,
             &mut scored,
             Some(&birth_versions),
+            None,
         );
         assert_eq!(gated.len(), 3, "fraction keep miscounted: {gated:?}");
         // The three globally-best runs win the slots.
@@ -3666,6 +4165,7 @@ mod tests {
             &candidate_counts,
             &mut scored,
             Some(&birth_versions),
+            None,
         );
         // The delta wave (si=1) is probed despite its worse score.
         assert!(
@@ -4299,6 +4799,7 @@ mod tests {
                 &query,
                 Metric::L2Sq,
                 None,
+                true,
                 None,
                 superseded,
             )

@@ -274,6 +274,11 @@ const DEFAULT_VECTOR_FINE_NPROBE_FLOOR: usize = 4;
 /// the probe is the fixed floor. `> 0` probes `floor(pct × cell fine clusters)`
 /// so depth tracks cell size (recall lever for large cells).
 const DEFAULT_VECTOR_FINE_NPROBE_PCT: f64 = 0.0;
+/// Default serve-time near-tie window on the exact-fine cell ranking
+/// (#515): the measured truth-cell slack p99 on real query sets
+/// (0.287–0.294 across the BioASQ diag configs; decisive-geometry
+/// controls cliff shut below it, so they are unaffected by the value).
+const DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK: f32 = 0.30;
 /// Default user superfiles the hidden-index drain materializes per batch.
 const DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES: i64 = 64;
 /// Default boundary-replication budget (commit + drain). `<= 1.0` disables
@@ -362,6 +367,18 @@ pub struct VectorSettings {
     /// with cell size. `0.0` (the default) turns the proportional depth
     /// off, leaving the fixed floor. Filtered queries always ignore it.
     pub fine_nprobe_pct: f64,
+    /// Serve-time near-tie window on the exact-fine cell ranking, for
+    /// the law-served DEFAULT path (#515): selection keeps following
+    /// the ranking past the stamped width while each next cell's exact
+    /// fine score stays within this relative window of the winner's.
+    /// Decisive geometry cliffs below any sane value and serves
+    /// byte-identically; flat-scored corpora (question-vs-passage
+    /// retrieval) follow their own evidence. The default is the
+    /// measured real-query truth-cell slack p99 — a per-deployment
+    /// lever here because the drain sample (corpus rows) cannot
+    /// measure real-query slack, the same distribution mismatch that
+    /// under-stamped the width law on such corpora.
+    pub serve_near_tie_slack: f32,
     /// Default rerank codec for cosine vector columns. Non-cosine
     /// metrics still use locally fitted [`RerankCodec::Sq8Residual`]
     /// at column construction time. Per-column overrides at table
@@ -436,6 +453,7 @@ impl Default for VectorSettings {
             inner_budget: None,
             fine_nprobe_floor: DEFAULT_VECTOR_FINE_NPROBE_FLOOR,
             fine_nprobe_pct: DEFAULT_VECTOR_FINE_NPROBE_PCT,
+            serve_near_tie_slack: DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK,
             rerank_codec: RerankCodec::default(),
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,

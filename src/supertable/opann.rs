@@ -741,6 +741,17 @@ const LAW_STAGE_TARGET_COVERAGE: f64 = 0.997;
 /// actually serving, both of which carry the margin now.
 const WIDTH_LAW_TARGET_COVERAGE: f64 = 0.99;
 
+/// One-sided 95% normal bound (z ≈ 1.645) for the width crossing's
+/// lower confidence bound — a statistical convention, not a tuned
+/// value. The width walk samples [`WIDTH_LAW_QUERY_SAMPLE`] queries;
+/// its mean-coverage estimate at a marginal crossing carries sampling
+/// error, and stamping on the raw mean turned that error into a
+/// run-to-run serving lottery (measured at 10M post-compact: width-1
+/// draws served 0.980–0.991, width-2 draws 0.994, identical corpus).
+/// The bound makes the sample prove the narrower width or stamp the
+/// wider one.
+const WIDTH_LAW_CONFIDENCE_Z: f64 = 1.645;
+
 /// Rerank-law distractor pool: each calibration query counts 1-bit-estimate
 /// distractors only within its `RERANK_LAW_POOL_CELLS` grid-nearest cells —
 /// the pool a width-law sweep would actually scan. A `k` point whose
@@ -1361,6 +1372,10 @@ impl WidthLawCalibration {
         // fresh drains, the normal calibration moment, have neither.
         let mut law = [0u32; WIDTH_LAW_KS.len()];
         let mut coverage_sums: Vec<Vec<f64>> = vec![vec![0f64; n_cells]; WIDTH_LAW_KS.len()];
+        // Per-query squared coverages alongside the sums: the crossing
+        // rule needs the sample's own variance to know when its mean is
+        // trustworthy (see the confidence note at the crossing below).
+        let mut coverage_sq_sums: Vec<Vec<f64>> = vec![vec![0f64; n_cells]; WIDTH_LAW_KS.len()];
         let mut support = [0usize; WIDTH_LAW_KS.len()];
         // Depth: same prefix-walk over fine-centroid ranks. A candidate
         // whose rank was never observed counts as uncoverable (conservative
@@ -1435,7 +1450,9 @@ impl WidthLawCalibration {
                 let mut covered = 0u32;
                 for (rank, count) in per_rank.iter().enumerate() {
                     covered += count;
-                    coverage_sums[ki][rank] += f64::from(covered) / k as f64;
+                    let x = f64::from(covered) / k as f64;
+                    coverage_sums[ki][rank] += x;
+                    coverage_sq_sums[ki][rank] += x * x;
                 }
                 let mut per_fine_rank = vec![0u32; max_fine];
                 for (_, cell, id, _) in &sorted[..k] {
@@ -1473,8 +1490,27 @@ impl WidthLawCalibration {
             if support[ki] == 0 {
                 continue;
             }
-            let target = WIDTH_LAW_TARGET_COVERAGE * support[ki] as f64;
-            if let Some(rank) = sums.iter().position(|&s| s >= target) {
+            // Width crossing with the sample's own confidence: stamp the
+            // smallest width whose coverage LOWER BOUND (mean − z·SE, SE
+            // measured from this sample's per-query coverage variance)
+            // clears the target — not the raw mean. The raw-mean crossing
+            // measured as a run-to-run lottery on marginal geometry: the
+            // post-compact 3.5K-cell grid sits with true width-1 coverage
+            // near the 0.99 target, so identical corpora stamped width 1
+            // (serving 0.980–0.991) or width 2 (serving 0.994) depending
+            // on the reservoir draw. Under uncertainty the stamp must
+            // round UP — the sample has to PROVE the narrower width. A
+            // uniform sample (every query fully covered, variance zero —
+            // all synthetic post-drain shapes) has SE = 0 and stamps
+            // exactly as before; only genuinely marginal crossings widen.
+            let n = support[ki] as f64;
+            let target = WIDTH_LAW_TARGET_COVERAGE * n;
+            if let Some(rank) = sums.iter().enumerate().position(|(rank, &s)| {
+                let mean = s / n;
+                let var = (coverage_sq_sums[ki][rank] / n - mean * mean).max(0.0);
+                let se = (var / n).sqrt();
+                (mean - WIDTH_LAW_CONFIDENCE_Z * se) * n >= target
+            }) {
                 law[ki] = (rank + 1) as u32;
             }
             let stage_target = LAW_STAGE_TARGET_COVERAGE * support[ki] as f64;

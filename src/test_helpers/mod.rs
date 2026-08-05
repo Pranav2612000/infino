@@ -35,6 +35,37 @@ pub mod fault_storage;
 /// stays equal-or-better and only latency regresses), but the served
 /// budget is not. The pooled warm arm records the limit and cell floor
 /// it passes to the global shortlist; tests read them after a query.
+/// Observability probes for the hidden vector path's two routing stages
+/// (#515 diagnosis): the 1-bit admit window (which cells get exact fine
+/// rescoring) and the exact-fine cell ranking selection serves from.
+/// Append logs — drain between queries; race-tolerant under test
+/// parallelism (a concurrent test adds entries, never removes yours).
+pub mod admit_trace {
+    use std::sync::Mutex;
+
+    static ADMITS: Mutex<Vec<Vec<u32>>> = Mutex::new(Vec::new());
+    static FINES: Mutex<Vec<Vec<(u32, f32)>>> = Mutex::new(Vec::new());
+
+    /// The admit shortlist (global cell ids) chosen by the 1-bit window.
+    pub fn record_admit(cells: Vec<u32>) {
+        ADMITS.lock().expect("admit probe lock").push(cells);
+    }
+
+    /// The exact-fine cell ranking (cell id, best exact fine score).
+    pub fn record_fine(ranked: Vec<(u32, f32)>) {
+        FINES.lock().expect("fine probe lock").push(ranked);
+    }
+
+    /// Drain both logs recorded since the last drain.
+    #[allow(clippy::type_complexity)]
+    pub fn drain() -> (Vec<Vec<u32>>, Vec<Vec<(u32, f32)>>) {
+        (
+            std::mem::take(&mut *ADMITS.lock().expect("admit probe lock")),
+            std::mem::take(&mut *FINES.lock().expect("fine probe lock")),
+        )
+    }
+}
+
 pub mod served_shortlist_probe {
     use std::sync::Mutex;
 
