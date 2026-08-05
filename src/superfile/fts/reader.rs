@@ -1545,6 +1545,155 @@ impl FtsReader {
         self.iter_terms_with_prefix(column, b"")
     }
 
+    /// Stream a column's postings for the FTS compaction merge: for every term
+    /// (lex order) and every doc in its posting list (doc_ids ascending),
+    /// invoke `emit(term_bytes, local_doc_id, tf, positions)`. Reuses the
+    /// query-path [`TermCursor`] block decode for doc_ids/tfs and the
+    /// positional `decode_run` for positions, so what is streamed is exactly
+    /// what a fresh build produced. `positions` is empty for a non-positional
+    /// column; otherwise it holds the `tf` token offsets for this `(term, doc)`
+    /// (borrowed from a reused buffer — copy it if you need to retain it past
+    /// the call). Tombstone filtering is the caller's job — this streams every
+    /// stored posting.
+    ///
+    /// Synchronous: compaction opens its inputs over resident bytes, so every
+    /// range resolves without a runtime. `emit` may return an error to abort.
+    pub(crate) fn for_each_term_posting(
+        &self,
+        column_id: u32,
+        mut emit: impl FnMut(&[u8], u32, u32, &[u32]) -> Result<(), FtsError>,
+    ) -> Result<(), FtsError> {
+        let col_meta = &self.columns[column_id as usize];
+        let positional = col_meta.positions;
+        let n_docs = u64::from(self.n_docs);
+        let column_name = col_meta.name.clone();
+        let region_base = self.postings_range.start;
+        let positions_region = self.positions_range.clone();
+
+        let fst_bytes = self.dict_bytes()?;
+        let dict = DictReader::open(&fst_bytes).map_err(|e| {
+            FtsError::Read(ReadError::MalformedVersion(format!(
+                "FST parse failed: {e}"
+            )))
+        })?;
+
+        // Column-scoped FST keys are `column_name <FST_SEPARATOR> term`;
+        // `iter_prefix` yields `(key, packed_value)` in lex term order, so we
+        // read the posting metadata straight from the value — no re-lookup.
+        let mut column_prefix = column_name.as_bytes().to_vec();
+        column_prefix.push(FST_SEPARATOR);
+        let prefix_len = column_prefix.len();
+
+        // Reused across (term, doc) to hold the decoded position run.
+        let mut positions_buf: Vec<u32> = Vec::new();
+
+        for (key, packed) in dict.iter_prefix(&column_prefix) {
+            let term = &key[prefix_len..];
+            match FstValue::unpack(packed) {
+                FstValue::Inline { doc_id, tf } => {
+                    // A positional column only inlines tf == 1 postings; the
+                    // slot then carries the term's single position and tf is
+                    // implied 1. Non-positional: `tf` is the frequency, no
+                    // positions.
+                    if positional {
+                        emit(term, doc_id, 1, &[tf])?;
+                    } else {
+                        emit(term, doc_id, tf, &[])?;
+                    }
+                }
+                FstValue::Pfor {
+                    metadata_offset,
+                    postings_length_hint,
+                } => {
+                    let start = region_base + metadata_offset as usize;
+                    let postings_length = match postings_length_hint {
+                        Some(len) => len as usize,
+                        None => {
+                            let header = fetch_source_range(
+                                &self.source,
+                                start..start + TERM_META_SIZE,
+                                "fts/merge header",
+                            )?;
+                            header_postings_length(header.as_ref())?
+                        }
+                    };
+                    let term_bytes = fetch_source_range(
+                        &self.source,
+                        start..start + postings_length,
+                        "fts/merge postings",
+                    )?;
+
+                    // For a positional column, this term's position runs live
+                    // contiguously in the positions region at `positions_offset`,
+                    // one `decode_run` per doc in posting order. Read the slice
+                    // once and walk it in lockstep with the doc cursor.
+                    let position_bytes = if positional {
+                        let meta = TermMeta::parse(term_bytes.as_ref(), 0, true)?;
+                        let region = positions_region.as_ref().ok_or_else(|| {
+                            FtsError::Read(ReadError::MalformedVersion(
+                                "positional column missing a positions region".into(),
+                            ))
+                        })?;
+                        let pstart = region.start + meta.positions_offset as usize;
+                        let pend = pstart + meta.positions_length as usize;
+                        Some(fetch_source_range(
+                            &self.source,
+                            pstart..pend,
+                            "fts/merge positions",
+                        )?)
+                    } else {
+                        None
+                    };
+                    let mut pos_at = 0usize;
+
+                    let mut cursor = TermCursor::new(term_bytes, n_docs, positional, None)?;
+                    while !cursor.is_exhausted() {
+                        while cursor.pos < cursor.block_n {
+                            let doc_id = cursor.block_doc_ids[cursor.pos];
+                            let tf = cursor.block_tfs[cursor.pos];
+                            let positions: &[u32] = match &position_bytes {
+                                Some(bytes) => {
+                                    positions_buf.clear();
+                                    decode_run(bytes.as_ref(), &mut pos_at, tf, &mut positions_buf)
+                                        .ok_or_else(|| {
+                                            FtsError::Read(ReadError::MalformedVersion(
+                                                "truncated position run in merge read".into(),
+                                            ))
+                                        })?;
+                                    &positions_buf
+                                }
+                                None => &[],
+                            };
+                            emit(term, doc_id, tf, positions)?;
+                            cursor.pos += 1;
+                        }
+                        cursor.next();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read a column's stored per-doc lengths (token counts), one `u32` per
+    /// local doc-id in `0..n_docs`. The FTS compaction merge carries these
+    /// forward (with the input's doc-id remap) rather than recomputing them
+    /// from text. These are the already-clamped values written at build time.
+    pub(crate) fn read_doc_lengths(&self, column_id: u32) -> Result<Vec<u32>, FtsError> {
+        let n = self.n_docs as usize;
+        let range = self.columns[column_id as usize].doc_lengths_range.clone();
+        let bytes = fetch_source_range(&self.source, range, "fts/merge doc_lengths")?;
+        let region = bytes.as_ref();
+        if region.len() < n * U32_BYTES {
+            return Err(FtsError::Read(ReadError::MalformedVersion(
+                "doc-lengths region shorter than n_docs entries".into(),
+            )));
+        }
+        Ok((0..n)
+            .map(|d| read_u32_le(&region[d * U32_BYTES..d * U32_BYTES + U32_BYTES]))
+            .collect())
+    }
+
     /// Walk the FST and collect every term registered under
     /// `column` whose bytes begin with `term_prefix`, in lex order.
     ///
@@ -5450,6 +5599,208 @@ mod tests {
         assert_eq!(r.n_docs(), 3);
         assert!(r.n_terms() > 0);
         assert_eq!(r.fts_columns().collect::<Vec<_>>(), vec!["body"]);
+    }
+
+    #[test]
+    fn for_each_term_posting_round_trips_doc_ids_and_tfs() {
+        use std::collections::BTreeMap;
+        // Docs (from build_blob): 0 "rust async runtime", 1 "tokio is a rust
+        // runtime", 2 "java spring boot".
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+
+        let mut got: BTreeMap<Vec<u8>, Vec<(u32, u32)>> = BTreeMap::new();
+        r.for_each_term_posting(0, |term, doc_id, tf, positions| {
+            assert!(
+                positions.is_empty(),
+                "non-positional column yields no positions"
+            );
+            got.entry(term.to_vec()).or_default().push((doc_id, tf));
+            Ok(())
+        })
+        .expect("stream postings");
+
+        // doc_ids ascending within each term's list.
+        for postings in got.values() {
+            assert!(
+                postings.windows(2).all(|w| w[0].0 < w[1].0),
+                "doc_ids must be ascending"
+            );
+        }
+        let t = |s: &str| s.as_bytes().to_vec();
+        assert_eq!(
+            got.get(&t("rust")).expect("term streamed").as_slice(),
+            &[(0, 1), (1, 1)]
+        );
+        assert_eq!(
+            got.get(&t("runtime")).expect("term streamed").as_slice(),
+            &[(0, 1), (1, 1)]
+        );
+        assert_eq!(
+            got.get(&t("async")).expect("term streamed").as_slice(),
+            &[(0, 1)]
+        );
+        assert_eq!(
+            got.get(&t("tokio")).expect("term streamed").as_slice(),
+            &[(1, 1)]
+        );
+        assert_eq!(
+            got.get(&t("java")).expect("term streamed").as_slice(),
+            &[(2, 1)]
+        );
+        assert_eq!(
+            got.get(&t("boot")).expect("term streamed").as_slice(),
+            &[(2, 1)]
+        );
+        // Every stored term was streamed exactly once.
+        assert_eq!(got.len() as u32, r.n_terms());
+    }
+
+    #[test]
+    fn for_each_term_posting_round_trips_positions() {
+        use std::collections::BTreeMap;
+        // doc 0 "a b a", doc 1 "b a c". "a"/"b" are df=2 (PFOR path); "c" is
+        // df=1 (inline path). Positions are token offsets within each doc.
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), true)
+            .expect("register positional column");
+        b.add_doc(0, 0, "a b a").expect("add doc 0");
+        b.add_doc(0, 1, "b a c").expect("add doc 1");
+        let bytes = b.finish().expect("finish");
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
+
+        let mut got: BTreeMap<Vec<u8>, Vec<(u32, u32, Vec<u32>)>> = BTreeMap::new();
+        r.for_each_term_posting(0, |term, doc_id, tf, positions| {
+            got.entry(term.to_vec())
+                .or_default()
+                .push((doc_id, tf, positions.to_vec()));
+            Ok(())
+        })
+        .expect("stream positional postings");
+
+        let t = |s: &str| s.as_bytes().to_vec();
+        // PFOR positional: multi-doc terms, tf and positions per doc.
+        assert_eq!(
+            got.get(&t("a")).expect("term streamed").as_slice(),
+            &[(0, 2, vec![0, 2]), (1, 1, vec![1])]
+        );
+        assert_eq!(
+            got.get(&t("b")).expect("term streamed").as_slice(),
+            &[(0, 1, vec![1]), (1, 1, vec![0])]
+        );
+        // Inline positional (df=1): the single position comes from the slot.
+        assert_eq!(
+            got.get(&t("c")).expect("term streamed").as_slice(),
+            &[(1, 1, vec![2])]
+        );
+    }
+
+    #[test]
+    fn add_prebuilt_term_posting_round_trips_read_to_write() {
+        use std::collections::BTreeMap;
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+
+        // Build A from text.
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut a = FtsBuilder::new(tok.clone());
+        a.register_column("body".into(), true).expect("register a");
+        a.add_doc(0, 0, "a b a").expect("a doc 0");
+        a.add_doc(0, 1, "b a c").expect("a doc 1");
+        let ra = FtsReader::open(Bytes::from(a.finish().expect("finish a")), json).expect("open a");
+
+        // Build B by streaming A's postings straight into the prebuilt path —
+        // no re-tokenization. Doc lengths carried over ("a b a"/"b a c" = 3/3).
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), true).expect("register b");
+        ra.for_each_term_posting(0, |term, doc_id, tf, positions| {
+            let term_str = std::str::from_utf8(term).expect("utf8 term");
+            b.add_prebuilt_term_posting(0, term_str, doc_id, tf, positions)
+                .expect("prebuilt push");
+            Ok(())
+        })
+        .expect("feed prebuilt postings");
+        b.set_prebuilt_doc_lengths(0, ra.read_doc_lengths(0).expect("doc lengths"));
+        let rb = FtsReader::open(Bytes::from(b.finish().expect("finish b")), json).expect("open b");
+
+        // The two readers must expose identical postings (doc_ids, tfs,
+        // positions) for every term.
+        let collect = |r: &FtsReader| {
+            let mut m: BTreeMap<Vec<u8>, Vec<(u32, u32, Vec<u32>)>> = BTreeMap::new();
+            r.for_each_term_posting(0, |t, d, tf, p| {
+                m.entry(t.to_vec()).or_default().push((d, tf, p.to_vec()));
+                Ok(())
+            })
+            .expect("collect");
+            m
+        };
+        assert_eq!(
+            collect(&ra),
+            collect(&rb),
+            "prebuilt-fed postings must match"
+        );
+        assert_eq!(rb.n_docs(), 2);
+        assert_eq!(rb.n_terms(), ra.n_terms());
+    }
+
+    #[test]
+    fn add_prebuilt_term_posting_spilled_round_trips() {
+        use std::collections::BTreeMap;
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut a = FtsBuilder::new(tok.clone());
+        a.register_column("body".into(), true).expect("register a");
+        a.add_doc(0, 0, "a b c a").expect("a doc 0");
+        a.add_doc(0, 1, "b c d").expect("a doc 1");
+        a.add_doc(0, 2, "a d e").expect("a doc 2");
+        let ra = FtsReader::open(Bytes::from(a.finish().expect("finish a")), json).expect("open a");
+
+        // Force the spilled accumulator with a 1-byte threshold: the first
+        // prebuilt push spills the column, so the rest exercise the transition
+        // + push_prebuilt_spilled (partition + position-blob writes).
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), true).expect("register b");
+        b.set_spill_threshold_bytes(1);
+        ra.for_each_term_posting(0, |term, doc_id, tf, positions| {
+            let term_str = std::str::from_utf8(term).expect("utf8 term");
+            b.add_prebuilt_term_posting(0, term_str, doc_id, tf, positions)
+                .expect("prebuilt push (spilled)");
+            Ok(())
+        })
+        .expect("feed prebuilt postings");
+        b.set_prebuilt_doc_lengths(0, ra.read_doc_lengths(0).expect("doc lengths"));
+        let rb = FtsReader::open(Bytes::from(b.finish().expect("finish b")), json).expect("open b");
+
+        let collect = |r: &FtsReader| {
+            let mut m: BTreeMap<Vec<u8>, Vec<(u32, u32, Vec<u32>)>> = BTreeMap::new();
+            r.for_each_term_posting(0, |t, d, tf, p| {
+                m.entry(t.to_vec()).or_default().push((d, tf, p.to_vec()));
+                Ok(())
+            })
+            .expect("collect");
+            m
+        };
+        assert_eq!(
+            collect(&ra),
+            collect(&rb),
+            "spilled prebuilt-fed postings must match a fresh build"
+        );
+        assert_eq!(rb.n_docs(), 3);
+        assert_eq!(rb.n_terms(), ra.n_terms());
+    }
+
+    #[test]
+    fn read_doc_lengths_returns_token_counts() {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        b.add_doc(0, 0, "a b a").expect("doc 0"); // 3 tokens
+        b.add_doc(0, 1, "b a c d").expect("doc 1"); // 4 tokens
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        assert_eq!(r.read_doc_lengths(0).expect("doc lengths"), vec![3, 4]);
     }
 
     #[test]
