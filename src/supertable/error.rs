@@ -310,7 +310,7 @@ pub enum OpenError {
     ManifestListParse(String),
 
     /// ManifestSnapshot load error.
-    #[error("manifest load error")]
+    #[error("manifest load error: {0}")]
     ManifestLoadError(#[from] ManifestLoadError),
 
     /// ManifestSnapshot part load or parse failed during open or
