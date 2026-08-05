@@ -715,9 +715,11 @@ enum TextLifecyclePhase {
 const SHARED_CONSUMER_CACHE_INDEX_FACTOR: u64 = 2;
 
 /// What the shared FTS/SQL lifecycle hands back: the compaction window's
-/// stats plus the settled local disk-cache footprint of the lifecycle
-/// consumer, sampled after the post-compact battery (just before the
-/// consumer drops) — the cost model's provisioned-occupancy NVMe basis.
+/// stats plus the serving NVMe working set — the disk-cache footprint of
+/// a FRESH consumer that replayed the caller's default battery against
+/// the settled post-compact layout (the cost model's
+/// provisioned-occupancy NVMe basis; the lifecycle consumer itself
+/// accumulates both generations and would overstate it).
 struct TextLifecycleStats {
     compaction: CompactionStats,
     disk_cache_bytes: Option<u64>,
@@ -736,6 +738,7 @@ fn run_metered_text_lifecycle(
     modality: Modality,
     built: &supertable::IngestResult,
     mut on_phase: impl FnMut(TextLifecyclePhase, &Supertable, &storage_meter::MeteredStorage),
+    serve_for_working_set: impl FnOnce(&Supertable),
 ) -> TextLifecycleStats {
     let meter = storage_meter::wrap(Arc::clone(&built.storage));
     let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
@@ -755,9 +758,20 @@ fn run_metered_text_lifecycle(
     on_phase(TextLifecyclePhase::PreCompact, &consumer, &meter);
     let compaction = run_metered_optimize(label, &consumer, &meter);
     on_phase(TextLifecyclePhase::Compacted, &consumer, &meter);
-    let disk_cache_bytes = consumer_disk_cache_bytes(&consumer);
     drop(consumer);
     drop(cache_dir);
+    // Serving NVMe working set — same basis as the vector battery: what a
+    // QUERY-ONLY node retains. The lifecycle consumer above is the wrong
+    // sample: its cache accumulated BOTH generations (the pre- and
+    // post-compact batteries ran through it — measured FTS-10M: 16 GiB
+    // cached for an 8.35 GiB table). A fresh consumer replays the
+    // caller's default battery against the settled post-compact layout;
+    // its cache is the priced working set.
+    let (serving_cache_dir, serving) = open_consumer(modality, built);
+    serve_for_working_set(&serving);
+    let disk_cache_bytes = consumer_disk_cache_bytes(&serving);
+    drop(serving);
+    drop(serving_cache_dir);
     TextLifecycleStats {
         compaction,
         disk_cache_bytes,
@@ -1776,6 +1790,24 @@ pub mod fts {
                     }
                     warm_post = warm;
                     cold_post = cold;
+                },
+                |serving| {
+                    // Default FTS battery, one pass — the serving
+                    // working set a query-only node retains.
+                    let reader = serving.reader().expect("serving reader");
+                    for q in FTS_BATTERY {
+                        let query = q.terms.join(" ");
+                        let _ = reader
+                            .bm25_search(
+                                supertable::TEXT_COLUMN,
+                                &query,
+                                TOP_K,
+                                exec_fts::to_infino_mode(q.mode),
+                                infino::Bm25Stats::PerSuperfile,
+                                None,
+                            )
+                            .expect("serving working-set bm25_search");
+                    }
                 },
             );
             drop(corpus.take());
@@ -4766,6 +4798,29 @@ pub mod vector {
                         .flatten()
                         .map(routing_cold_to_measurement)
                 };
+                // Serving NVMe working set for the occupancy / keep-warm
+                // policy rows: what a QUERY-ONLY node retains. The
+                // lifecycle consumer's cache is the wrong basis — by this
+                // point it has absorbed drain/compaction traffic and the
+                // all-cells oracle sweeps (whole-index reads no serving
+                // node performs; maintenance runs on separate machines in
+                // production). Replay the default-path battery queries on
+                // a fresh consumer + cache and sample what it kept.
+                let serving_disk_cache_bytes = {
+                    let (_serving_cache_dir, serving) = open_consumer(Modality::Vector, &built);
+                    let serving_reader = serving.reader().expect("serving consumer reader");
+                    for q in q_correct.iter().chain(q_cal.iter()) {
+                        let _ = serving_reader.vector_search(
+                            supertable::VEC_COLUMN,
+                            q,
+                            TOP_K,
+                            exec_vec::default_search_opts(),
+                            None,
+                            None,
+                        );
+                    }
+                    consumer_disk_cache_bytes(&serving)
+                };
                 let store = cost::StorePhases {
                     drain: drain_stats.map(|(_, io, _, _)| io),
                     drain_wall_s: drain_stats.map(|(wall_s, _, _, _)| wall_s),
@@ -4786,7 +4841,7 @@ pub mod vector {
                     query_states: query_state_costs(&routing_states),
                     filtered_query: filtered_stats.map(|(io, _)| io),
                     filtered_query_iters: filtered_stats.map(|(_, n)| n).unwrap_or(0),
-                    disk_cache_bytes: consumer_disk_cache_bytes(&consumer),
+                    disk_cache_bytes: serving_disk_cache_bytes,
                     ..store_phases_from_measurement(cold_measured)
                 };
                 let warm_pre_vec = pre_search_rows
@@ -5045,6 +5100,17 @@ pub mod sql {
                     }
                     warm_sets_post = warm;
                     cold_post = cold;
+                },
+                |serving| {
+                    // Default SQL battery, one pass — the serving
+                    // working set a query-only node retains.
+                    let _ = exec_sql::measure_query_sets(
+                        serving,
+                        &inputs,
+                        1,
+                        "supertable_sql serving-working-set",
+                        &[],
+                    );
                 },
             );
             drop(corpus.take());

@@ -667,13 +667,22 @@ fn egress_usd(payload_bytes: f64) -> f64 {
     payload_bytes / BYTES_PER_GB * egress_usd_per_gb()
 }
 
-/// Marks a serving family whose result size scales with the match set
-/// (`O(selectivity × corpus)`) rather than with `k`. Such a shape has no
-/// meaningful per-query rate — its cost is per GB returned — so it is kept
-/// out of every per-query monthly average and billed per event instead.
-/// Matched on the family label the runners construct.
+/// Marks a serving family that must stay OUT of the bounded-result
+/// monthly mean and be billed per event instead. Two classes qualify,
+/// matched on the family label the runners construct:
+///
+/// * **Bulk row sets** — result size scales with the match set
+///   (`O(selectivity × corpus)`), so the cost is per GB returned and a
+///   per-query rate is meaningless.
+/// * **Scan-backed aggregates** — whole-corpus CPU per query. Averaged
+///   into the blend at equal weight they dominate it: at 10M a scan
+///   aggregate prices in the $100s/1M while the selective shapes sit at
+///   $1–5/1M, dragging the "SQL COGS" headline to ~$160/1M when the
+///   selective serving mix it is quoted against costs a few dollars.
+///   Scan work is real Infino capability — priced per event, according
+///   to the work, never silently averaged into retrieval pricing.
 fn is_bulk_group(label: &str) -> bool {
-    label.starts_with("Bulk")
+    label.starts_with("Bulk") || label.starts_with("Aggregates — scan-backed")
 }
 
 /// "$X/1M" cell text for one query's egress, from its payload bytes. Battery
@@ -2475,15 +2484,15 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             Some(month)
         }
     };
-    // Bulk shapes as per-event rates: the cost of ONE such query, which the
-    // reader multiplies by however many they actually run. Not folded into the
-    // monthly total — the run rate is a workload property, not a bench
-    // constant.
+    // Bulk row sets and scan-backed aggregates as per-event rates: the cost
+    // of ONE such query, which the reader multiplies by however many they
+    // actually run. Not folded into the monthly total — the run rate is a
+    // workload property, not a bench constant.
     for (name, warm_usd, payload) in &monthly_bulk_shapes {
         let per_event = warm_usd + egress_usd(*payload as f64);
         summary_rows.push(vec![
             text(format!(
-                "Bulk (per event, not in Total) — {name} ({} result)",
+                "Per event (not in Total) — {name} ({} result)",
                 fmt_bytes(*payload)
             )),
             text(format!("{}/query", usd(per_event))),
