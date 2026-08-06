@@ -51,8 +51,6 @@ use serde::{
     ser::Serializer,
 };
 
-use crate::superfile::vector::rerank_codec::RerankCodec;
-
 /// Embedded baseline. Compiled in via `include_str!`.
 const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
 
@@ -379,11 +377,6 @@ pub struct VectorSettings {
     /// measure real-query slack, the same distribution mismatch that
     /// under-stamped the width law on such corpora.
     pub serve_near_tie_slack: f32,
-    /// Default rerank codec for cosine vector columns. Non-cosine
-    /// metrics still use locally fitted [`RerankCodec::Sq8Residual`]
-    /// at column construction time. Per-column overrides at table
-    /// create win over this default.
-    pub rerank_codec: RerankCodec,
     /// K-means training points per centroid for the drain's per-cell
     /// sub-builds. Higher trains on more points (slower, tighter
     /// clusters).
@@ -454,7 +447,6 @@ impl Default for VectorSettings {
             fine_nprobe_floor: DEFAULT_VECTOR_FINE_NPROBE_FLOOR,
             fine_nprobe_pct: DEFAULT_VECTOR_FINE_NPROBE_PCT,
             serve_near_tie_slack: DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK,
-            rerank_codec: RerankCodec::default(),
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
             cell_split_modality_d: DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D,
@@ -1226,7 +1218,6 @@ supertable:
         assert_eq!(cfg.vector.cell_split_doc_cap, 500_000);
         assert_eq!(cfg.vector.user_centroids, CentroidAlignment::Local);
         assert_eq!(cfg.vector.drain_consolidate, DrainConsolidate::Kmeans);
-        assert_eq!(cfg.vector.rerank_codec, RerankCodec::Sq16);
         assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Auto);
     }
 
@@ -1246,7 +1237,6 @@ vector:
   cell_split_doc_cap: 100000
   user_centroids: global
   drain_consolidate: splice
-  rerank_codec: sq8_residual
   drain_replica_target_factor: 1.25
   drain_read_concurrency: 12
 "#;
@@ -1258,7 +1248,6 @@ vector:
         assert_eq!(cfg.vector.cell_split_doc_cap, 100_000);
         assert_eq!(cfg.vector.user_centroids, CentroidAlignment::Global);
         assert_eq!(cfg.vector.drain_consolidate, DrainConsolidate::Splice);
-        assert_eq!(cfg.vector.rerank_codec, RerankCodec::Sq8Residual);
         assert_eq!(cfg.vector.drain_replica_target_factor, 1.25);
         assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Fixed(12));
         // Untouched keys fall through to the embedded default.

@@ -23,36 +23,33 @@ use std::{
 use rayon::prelude::*;
 use tempfile::{tempdir, tempdir_in};
 
-use crate::{
-    config,
-    superfile::{
-        BuildError,
-        format::{
-            self, FST_SEPARATOR, RESERVED_PREFIX,
-            checksum::{crc32c, crc32c_append},
-            vec::{
-                CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES,
-                MAGIC_BYTES, U32_BYTES, U64_BYTES, cell_dir_entry, sub_hdr,
-            },
+use crate::superfile::{
+    BuildError,
+    format::{
+        self, FST_SEPARATOR, RESERVED_PREFIX,
+        checksum::{crc32c, crc32c_append},
+        vec::{
+            CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES,
+            U32_BYTES, U64_BYTES, cell_dir_entry, sub_hdr,
         },
-        vector::{
-            cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
-            distance::{
-                Metric, distance, encode_sq16_row, mean_f32_cluster_major, normalize,
-                sq16_decoded_norm_sq,
-            },
-            ivf_merge::MergedIvfSubsection,
-            kmeans::{assign_to_centroids, kmeans, kmeans_with_assignments},
-            quant::BitQuantizer,
-            rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
-            reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
-            rotation::RandomRotation,
-            spill::{
-                ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
-                SpilledCellRows,
-            },
-            sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row, update_min_max},
+    },
+    vector::{
+        cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
+        distance::{
+            Metric, distance, encode_sq16_row, mean_f32_cluster_major, normalize,
+            sq16_decoded_norm_sq,
         },
+        ivf_merge::MergedIvfSubsection,
+        kmeans::{assign_to_centroids, kmeans, kmeans_with_assignments},
+        quant::BitQuantizer,
+        rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
+        reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
+        rotation::RandomRotation,
+        spill::{
+            ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
+            SpilledCellRows,
+        },
+        sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row, update_min_max},
     },
 };
 
@@ -217,17 +214,18 @@ pub struct VectorConfig {
 /// time overrides this default.
 fn default_rerank_codec_for(metric: Metric) -> RerankCodec {
     if metric == Metric::Cosine {
-        config::global().vector.rerank_codec
+        RerankCodec::default()
     } else {
         RerankCodec::Sq8Residual
     }
 }
 
 impl VectorConfig {
-    /// Construct a config with the configured cosine default codec
-    /// ([`crate::config::VectorSettings::rerank_codec`] — `Sq16`) and locally
-    /// fitted residual encoding ([`RerankCodec::Sq8Residual`]) for metrics
-    /// whose values are not bounded to [-1, 1]. Override per column with
+    /// Construct a config with the engine's cosine default codec
+    /// ([`RerankCodec::default`] — `Sq16`) and locally fitted residual
+    /// encoding ([`RerankCodec::Sq8Residual`]) for metrics whose values
+    /// are not bounded to [-1, 1]. The codec is internal — not a config
+    /// knob, not part of the public spec; tests override per column with
     /// [`Self::with_rerank_codec`].
     pub fn new(column: String, dim: usize, rot_seed: u64, metric: Metric) -> Self {
         Self {
@@ -1130,13 +1128,15 @@ pub(crate) mod build_phase_timers {
         time::Instant,
     };
 
+    use crate::config;
+
     pub static TRAIN_US: AtomicU64 = AtomicU64::new(0);
     pub static ASSIGN_US: AtomicU64 = AtomicU64::new(0);
     pub static CALIB_US: AtomicU64 = AtomicU64::new(0);
 
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| crate::config::global().diagnostics.drain_build_timers)
+        *ON.get_or_init(|| config::global().diagnostics.drain_build_timers)
     }
 
     /// Run `f`, adding its elapsed micros to `counter` when timing is enabled.
