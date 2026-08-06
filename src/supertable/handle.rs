@@ -317,7 +317,7 @@ impl Supertable {
     /// via the same `Handle::try_current() + block_in_place` pattern
     /// as the rest of the supertable's sync surface.
     fn open(options: SupertableOptions) -> Result<Self, OpenError> {
-        bridge_sync_to_async(Self::open_async(options))
+        bridge_on_runtime(Self::open_async(options), &shared_io_runtime())
     }
     }
 
@@ -684,7 +684,7 @@ impl Supertable {
         if !self.pointer_refresh_due() {
             return Ok(());
         }
-        if let Err(e) = bridge_sync_to_async(self.refresh()) {
+        if let Err(e) = bridge_on_runtime(self.refresh(), &self.query_runtime()) {
             if self.inner.options.read_consistency == Consistency::Strong {
                 return Err(e);
             }
@@ -713,7 +713,7 @@ impl Supertable {
         if self.inner.options.storage.is_none() {
             return Ok(());
         }
-        bridge_sync_to_async(self.refresh())?;
+        bridge_on_runtime(self.refresh(), &self.query_runtime())?;
         Ok(())
     }
 

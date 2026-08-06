@@ -487,8 +487,9 @@ impl Connection {
                     return Ok(handle);
                 }
 
-                let (body, _etag) = bridge_sync_to_async(read_catalog(root.as_ref()))
-                    .map_err(|e| e.with_context("open_table", Some(name)))?;
+                let (body, _etag) =
+                    bridge_on_runtime(read_catalog(root.as_ref()), &shared_io_runtime())
+                        .map_err(|e| e.with_context("open_table", Some(name)))?;
                 let entry = body.tables.get(name).ok_or_else(|| {
                     InfinoError::NotFound(name.to_string()).with_context("open_table", Some(name))
                 })?;
