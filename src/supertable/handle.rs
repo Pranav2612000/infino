@@ -41,6 +41,7 @@ use super::{
 use crate::{
     config,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
+    runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::{PrefixedStorageProvider, StorageError},
     superfile::{
         builder::VectorConfig,
@@ -604,13 +605,33 @@ impl Supertable {
     /// Pin the current in-memory manifest without a storage freshness check.
     /// Hidden vector queries use this for slow-state residency while their
     /// fast delete/watermark refresh runs concurrently with data I/O.
+    ///
+    /// Consults the caller's [`with_op_stats`] scope — valid only on the
+    /// thread that opened the scope, which the public search entry points
+    /// (reader mint on the caller's thread) satisfy. Mid-query mints run
+    /// on runtime threads where the scope's thread-local is invisible, so
+    /// they go through [`Self::pinned_reader_with`] and inherit the outer
+    /// reader's collector instead.
     fn pinned_reader(&self) -> SupertableReader {
+        self.pinned_reader_with(op_stats::current())
+    }
+    }
+
+    /// [`Self::pinned_reader`] with an explicitly supplied per-query
+    /// collector — the mint for readers created *mid-query* (the hidden
+    /// vector-index legs), which must inherit the driving reader's
+    /// collector rather than consult a thread-local that runtime threads
+    /// never see.
+    pub(crate) fn pinned_reader_with(
+        &self,
+        op_stats: Option<Arc<OpStatsCollector>>,
+    ) -> SupertableReader {
         SupertableReader {
             manifest: self.inner.manifest.load_full(),
             tombstone_cache: self.inner.tombstone_cache.clone(),
             inner: Arc::clone(&self.inner),
+            op_stats,
         }
-    }
     }
 
     test_visible! {
@@ -1794,6 +1815,12 @@ pub struct SupertableReader {
     /// keeps the runtime alive for the reader's lifetime, so a reader
     /// captured before its parent `Supertable` drops can still query.
     inner: Arc<SupertableInner>,
+    /// Per-query work collector, picked up from the caller's active
+    /// [`with_op_stats`](crate::runtime_metrics::op_stats::with_op_stats)
+    /// scope at mint time. `None` (the default) makes every counter
+    /// flush a no-op branch. Query kernels clone the `Arc` into their
+    /// fan-out bodies; the thread-local is never consulted past mint.
+    pub(crate) op_stats: Option<Arc<OpStatsCollector>>,
 }
 
 /// A non-owning handle to a pinned reader snapshot, held by the SQL
@@ -1813,6 +1840,12 @@ pub(crate) struct WeakReader {
     inner: Weak<SupertableInner>,
     manifest: Arc<ManifestSnapshot>,
     tombstone_cache: Option<Arc<SidecarCache>>,
+    /// Per-query work collector carried through the weak round-trip. Safe
+    /// because TVF exec plans are built per query; state that outlives a
+    /// query (the cached SQL `SessionContext`) is constructed under
+    /// [`op_stats::suppressed`] and from a detached reader, so no
+    /// long-lived `WeakReader` ever holds a scope's collector.
+    op_stats: Option<Arc<OpStatsCollector>>,
 }
 
 impl fmt::Debug for WeakReader {
@@ -1828,6 +1861,7 @@ impl WeakReader {
             inner: Arc::downgrade(reader.inner_arc()),
             manifest: Arc::clone(reader.manifest()),
             tombstone_cache: reader.tombstone_cache.clone(),
+            op_stats: reader.op_stats.clone(),
         }
     }
 
@@ -1839,6 +1873,7 @@ impl WeakReader {
             inner,
             Arc::clone(&self.manifest),
             self.tombstone_cache.clone(),
+            self.op_stats.clone(),
         )))
     }
 }
@@ -1913,11 +1948,13 @@ impl SupertableReader {
         inner: Arc<SupertableInner>,
         manifest: Arc<ManifestSnapshot>,
         tombstone_cache: Option<Arc<SidecarCache>>,
+        op_stats: Option<Arc<OpStatsCollector>>,
     ) -> Self {
         Self {
             manifest,
             tombstone_cache,
             inner,
+            op_stats,
         }
     }
 

@@ -70,7 +70,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
     future::Future,
     mem,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{self, AtomicU64},
+    },
     time::Instant,
 };
 
@@ -93,6 +96,7 @@ pub use crate::superfile::reader::VectorSearchOptions;
 use crate::test_helpers::{admit_trace, served_shortlist_probe};
 use crate::{
     config,
+    runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::io_counters,
     superfile::{
         SuperfileReader,
@@ -845,6 +849,7 @@ pub(crate) struct PreparedGlobalAllow {
 async fn lookup_user_placements_by_id(
     manifest: &ManifestSnapshot,
     user_row_ids: &[i128],
+    op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Vec<(Arc<SuperfileEntry>, u32)>, QueryError> {
     if user_row_ids.is_empty() {
         return Ok(Vec::new());
@@ -889,7 +894,7 @@ async fn lookup_user_placements_by_id(
         // Cell-packed user files carry stable ids inline in Parquet row order.
         // Read each compact cell region once instead of decoding the full
         // Parquet `_id` column to place a top-k scalar projection.
-        let ids = read_ids_for_locals(manifest, &entry, &locals, id_column, true).await?;
+        let ids = read_ids_for_locals(manifest, &entry, &locals, id_column, true, op_stats).await?;
         Ok::<_, QueryError>((entry, ids))
     }))
     .await?;
@@ -965,6 +970,7 @@ pub(crate) async fn stable_ids_by_local_for_routing(
     manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
     reader: &SuperfileReader,
+    op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Vec<i128>, QueryError> {
     if row_id_from_manifest_entry(entry, 0).is_some() {
         return Ok((0..entry.n_docs as u32)
@@ -988,7 +994,7 @@ pub(crate) async fn stable_ids_by_local_for_routing(
             .map_err(|e| QueryError::Execute(e.to_string()))?;
         return id_values_from_batch(&batch);
     }
-    read_ids_for_locals(manifest, entry, &locals, id_column, true).await
+    read_ids_for_locals(manifest, entry, &locals, id_column, true, op_stats).await
 }
 
 /// Read the `_id` column values at `local_ids` (in caller order) from one
@@ -1006,6 +1012,7 @@ async fn read_ids_for_locals(
     local_ids: &[u32],
     id_column: &str,
     allow_inline_region: bool,
+    op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Vec<i128>, QueryError> {
     // Storage is optional: store-only tables (no object-store backend) serve
     // the superfile bytes from the in-memory reader cache. Cell-ordered
@@ -1022,12 +1029,17 @@ async fn read_ids_for_locals(
     // real Parquet rows, so the counts (and orders) match.
     let inline_is_parquet_ordered = reader.vec().is_none_or(|v| v.n_docs() == reader.n_docs());
     if allow_inline_region && inline_is_parquet_ordered {
+        // The inline-region read is one planned range per file — the plan
+        // requests it identically whether it resolves resident or cold.
         // Hidden cell superfiles inline the stable `_id` in the IVF blob — resolve
         // straight from it (resident; no scalar `_id` column read) when available.
         if let Some(ids) = reader
             .vec()
             .and_then(|v| v.inline_stable_ids_for_locals(local_ids))
         {
+            if let Some(stats) = op_stats {
+                stats.add_planned_read_ranges(1);
+            }
             return Ok(ids);
         }
         // Cold path: fetch the inline region async when present but not resident.
@@ -1037,14 +1049,22 @@ async fn read_ids_for_locals(
                 .await
                 .map_err(|e| QueryError::Execute(e.to_string()))?
         {
+            if let Some(stats) = op_stats {
+                stats.add_planned_read_ranges(1);
+            }
             return Ok(ids);
         }
     }
     if reader.parquet_bytes().is_some() {
-        let batch = reader
-            .take_by_local_doc_ids(local_ids, &[id_column])
-            .map_err(|e| QueryError::Execute(e.to_string()))?;
-        return id_values_from_batch(&batch);
+        let (batch, decode_ns) = op_stats::timed_section(|| {
+            reader
+                .take_by_local_doc_ids(local_ids, &[id_column])
+                .map_err(|e| QueryError::Execute(e.to_string()))
+        });
+        if let Some(stats) = op_stats {
+            stats.add_kernel_cpu_ns(decode_ns);
+        }
+        return id_values_from_batch(&batch?);
     }
     let batch = take_rows_byte_source(&reader, local_ids, &[id_column])
         .await
@@ -1066,6 +1086,7 @@ async fn hidden_hits_user_ids(
     hidden_manifest: &ManifestSnapshot,
     hidden_hits: &[SuperfileHit],
     id_column: &str,
+    op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Vec<i128>, QueryError> {
     let mut ids = vec![0i128; hidden_hits.len()];
     let mut by_superfile: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
@@ -1098,7 +1119,8 @@ async fn hidden_hits_user_ids(
         }
         // Gapped span → one resident read of just the rows these hits touch.
         let locals: Vec<u32> = idxs.iter().map(|&i| hidden_hits[i].local_doc_id).collect();
-        let vals = read_ids_for_locals(hidden_manifest, &entry, &locals, id_column, true).await?;
+        let vals = read_ids_for_locals(hidden_manifest, &entry, &locals, id_column, true, op_stats)
+            .await?;
         for (j, &i) in idxs.iter().enumerate() {
             ids[i] = vals[j];
         }
@@ -1156,12 +1178,17 @@ pub(crate) async fn user_placement_for_scalar_resolve(
     }
     let user_manifest = user_reader.manifest();
     let id_column = user_reader.options().id_column.as_str();
-    let hidden_manifest = user_reader
-        .vector_index_table()
-        .map(|vit| Arc::clone(vit.pinned_reader().manifest()));
-    let deleted = user_reader
-        .vector_index_table()
-        .and_then(|vit| vit.pinned_reader().hidden_deleted_ids().ok());
+    let hidden_manifest = user_reader.vector_index_table().map(|vit| {
+        Arc::clone(
+            vit.pinned_reader_with(user_reader.op_stats.clone())
+                .manifest(),
+        )
+    });
+    let deleted = user_reader.vector_index_table().and_then(|vit| {
+        vit.pinned_reader_with(user_reader.op_stats.clone())
+            .hidden_deleted_ids()
+            .ok()
+    });
     let mut out: Vec<Option<SuperfileHit>> = vec![None; hits.len()];
     let mut placement_requests: Vec<(usize, i128)> = Vec::new();
     for (i, hit) in hits.iter().enumerate() {
@@ -1177,7 +1204,13 @@ pub(crate) async fn user_placement_for_scalar_resolve(
         let user_row_id = if let Some(id) = hit.stable_id {
             id
         } else if let Some(ref hm) = hidden_manifest {
-            hidden_hits_user_ids(hm, std::slice::from_ref(hit), id_column).await?[0]
+            hidden_hits_user_ids(
+                hm,
+                std::slice::from_ref(hit),
+                id_column,
+                &user_reader.op_stats,
+            )
+            .await?[0]
         } else {
             return Err(QueryError::Execute(format!(
                 "hit superfile {:?} missing from manifests",
@@ -1193,7 +1226,8 @@ pub(crate) async fn user_placement_for_scalar_resolve(
         placement_requests.push((i, user_row_id));
     }
     let requested_ids: Vec<i128> = placement_requests.iter().map(|(_, id)| *id).collect();
-    let placements = lookup_user_placements_by_id(user_manifest, &requested_ids).await?;
+    let placements =
+        lookup_user_placements_by_id(user_manifest, &requested_ids, &user_reader.op_stats).await?;
     for ((index, stable_id), (entry, local_doc_id)) in
         placement_requests.into_iter().zip(placements)
     {
@@ -1306,23 +1340,37 @@ impl SupertableReader {
         let deferred = if deferred.is_empty() {
             deferred
         } else if let Some(section) = self.centroid_section().await {
-            let mut leftovers = Vec::new();
-            for d in deferred {
-                let entry = &superfiles[d.si];
-                let read = section
-                    .read_cell(entry.superfile_id, column, d.cell_id)
-                    .map_err(|e| {
-                        QueryError::Execute(format!("centroid section spill read: {e}"))
-                    })?;
-                let Some(fp32) = read else {
-                    leftovers.push(d);
-                    continue;
-                };
-                if !score_cell_fp32(superfiles, column, &d, &fp32, query, metric, candidates) {
-                    leftovers.push(d);
+            // Sync section: the preads block the thread (off-CPU), so one
+            // bracket around the whole loop attributes only the fp32
+            // scoring. Each successful cell read is one planned range —
+            // a real per-query pread of the hydrated section, identical
+            // at any cache temperature.
+            let mut cells_read = 0u64;
+            let (leftovers, rescore_ns) = op_stats::timed_section(|| {
+                let mut leftovers = Vec::new();
+                for d in deferred {
+                    let entry = &superfiles[d.si];
+                    let read = section
+                        .read_cell(entry.superfile_id, column, d.cell_id)
+                        .map_err(|e| {
+                            QueryError::Execute(format!("centroid section spill read: {e}"))
+                        })?;
+                    let Some(fp32) = read else {
+                        leftovers.push(d);
+                        continue;
+                    };
+                    cells_read += 1;
+                    if !score_cell_fp32(superfiles, column, &d, &fp32, query, metric, candidates) {
+                        leftovers.push(d);
+                    }
                 }
+                Ok::<_, QueryError>(leftovers)
+            });
+            if let Some(stats) = &self.op_stats {
+                stats.add_planned_read_ranges(cells_read);
+                stats.add_kernel_cpu_ns(rescore_ns);
             }
-            leftovers
+            leftovers?
         } else {
             deferred
         };
@@ -1332,24 +1380,32 @@ impl SupertableReader {
         let deferred = if deferred.is_empty() {
             deferred
         } else if let Some(cache) = self.manifest().user_centroids_for_rescore().await {
-            let mut leftovers = Vec::new();
-            for d in deferred {
-                let entry = &superfiles[d.si];
-                let Some(fp32) = cache.cell(entry.superfile_id, column, d.cell_id) else {
-                    leftovers.push(d);
-                    continue;
-                };
-                if !score_cell_fp32(
-                    superfiles,
-                    column,
-                    &d,
-                    fp32.as_slice(),
-                    query,
-                    metric,
-                    candidates,
-                ) {
-                    leftovers.push(d);
+            // RAM-hydrated per-generation cache: no read to count, only
+            // the fp32 scoring CPU.
+            let (leftovers, rescore_ns) = op_stats::timed_section(|| {
+                let mut leftovers = Vec::new();
+                for d in deferred {
+                    let entry = &superfiles[d.si];
+                    let Some(fp32) = cache.cell(entry.superfile_id, column, d.cell_id) else {
+                        leftovers.push(d);
+                        continue;
+                    };
+                    if !score_cell_fp32(
+                        superfiles,
+                        column,
+                        &d,
+                        fp32.as_slice(),
+                        query,
+                        metric,
+                        candidates,
+                    ) {
+                        leftovers.push(d);
+                    }
                 }
+                leftovers
+            });
+            if let Some(stats) = &self.op_stats {
+                stats.add_kernel_cpu_ns(rescore_ns);
             }
             leftovers
         } else {
@@ -1480,8 +1536,12 @@ impl SupertableReader {
         // gate. Phase timers (INFINO_TRACE_VECTOR_WARM_PHASES): admit covers
         // that work; fanout_wall is probe+rerank+remap wall.
         let admit_t0 = io_counters::phase_start();
+        // The grid/centroid ranking is the admit stage's kernel section —
+        // pure CPU over manifest summaries on this thread.
         let ranked_cells_scored: Option<Vec<(u32, f32)>> =
-            grid.map(|grid| grid.rank_cells(metric, query));
+            op_stats::timed_kernel(&self.op_stats, || {
+                grid.map(|grid| grid.rank_cells(metric, query))
+            });
         let ranked_cells: Option<Vec<u32>> = ranked_cells_scored
             .as_ref()
             .map(|cells| cells.iter().map(|(cell, _)| *cell).collect());
@@ -2065,6 +2125,11 @@ impl SupertableReader {
         } else {
             None
         };
+        // The PLAN's rerank multiplier — post-law, pre-width-divide. The
+        // canonical rerank-row pricing and phase C's selection cap both
+        // read this value; the divided cold budget below is an execution
+        // detail that must never leak into the priced count.
+        let (_, plan_rerank_mult) = options.resolve(filtered);
         let mut cold_rerank_mult = 0;
         let options = match sweep_width {
             // (#537) An explicit caller nprobe keeps the FULL per-cell
@@ -2108,6 +2173,7 @@ impl SupertableReader {
         let query_arc = Arc::new(query.to_vec());
         let column_arc2 = Arc::clone(&column_arc);
         let query_arc2 = Arc::clone(&query_arc);
+        let op_stats_scan = self.op_stats.clone();
         let reader_pool = Arc::clone(&manifest.options.reader_pool);
         // Per-connection memory budget: gates each superfile's cold cluster-block fetch.
         let budget = Some(Arc::clone(&manifest.options.connection_memory_budget));
@@ -2126,6 +2192,11 @@ impl SupertableReader {
         let scan_pool: Arc<Mutex<Vec<(usize, u64, usize, Vec<ScanCandidate>)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let scan_pool_body = Arc::clone(&scan_pool);
+        // Widest replica overhead across every scanned unit — phase C's
+        // selection cap reads it so pooled-set membership (which shifts
+        // with cache temperature) can never shrink the cap.
+        let max_replica_overhead = Arc::new(AtomicU64::new(0));
+        let max_replica_overhead_body = Arc::clone(&max_replica_overhead);
         let body =
             move |reader: Arc<SuperfileReader>,
                   entry: Arc<SuperfileEntry>,
@@ -2138,6 +2209,8 @@ impl SupertableReader {
                 let budget = budget.clone();
                 let storage = storage.clone();
                 let scan_pool = Arc::clone(&scan_pool_body);
+                let max_replica_overhead = Arc::clone(&max_replica_overhead_body);
+                let op_stats = op_stats_scan.clone();
                 async move {
                     // Unfiltered user path on row-addressable locals: resolve the
                     // bitmap once (warm after the orchestrator's prefetch) and
@@ -2181,6 +2254,18 @@ impl SupertableReader {
                             )
                             .await
                             .map_err(vector_read_query_error)?;
+                        if let Some(stats) = &op_stats {
+                            stats.add_vector_scan(scan.cells_scanned, scan.candidates_scanned);
+                            // Request-shaped ranges only (cluster index +
+                            // prefixes/blocks + Sq8 meta). Rerank rows are
+                            // diagnostics; their cost rides the priced
+                            // CPU watermark.
+                            stats.add_planned_read_ranges(scan.ranges_requested);
+                            stats.add_vector_rows_reranked(scan.rows_reranked);
+                            stats.add_kernel_cpu_ns(scan.kernel_cpu_ns);
+                        }
+                        max_replica_overhead
+                            .fetch_max(replica_overhead as u64, atomic::Ordering::Relaxed);
                         if !scan.candidates.is_empty() {
                             scan_pool
                                 .lock()
@@ -2189,19 +2274,37 @@ impl SupertableReader {
                         }
                         scan.hits
                     } else {
-                        reader
+                        let (hits, tally) = reader
                             .vector_search_clusters_filtered(
                                 &column, &query, k_fetch, &ids, options, bitmap, deny, pool, budget,
                             )
                             .await
-                            .map_err(vector_read_query_error)?
+                            .map_err(vector_read_query_error)?;
+                        if let Some(stats) = &op_stats {
+                            stats.add_vector_scan(tally.cells_scanned, tally.candidates_scanned);
+                            // Request-shaped ranges only — rerank rows are
+                            // diagnostics; their cost rides the priced CPU
+                            // watermark (survivor fetches coalesce into a
+                            // handful of real requests, so counting one
+                            // range per row would not be request-shaped).
+                            stats.add_planned_read_ranges(tally.ranges_requested);
+                            stats.add_vector_rows_reranked(tally.rows_reranked);
+                            stats.add_kernel_cpu_ns(tally.kernel_cpu_ns);
+                        }
+                        hits
                     };
                     let mut tagged = dispatch::tag_hits(&entry, hits);
                     // Prefer manifest span arithmetic; only touch `_id` pages /
                     // inline IVF regions when the layout is cell-packed or gapped.
                     io_counters::phase_timed_async("vec.stable_id", async {
-                        dispatch::attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false)
-                            .await
+                        dispatch::attach_stable_ids(
+                            &reader_for_ids,
+                            &entry,
+                            &mut tagged,
+                            false,
+                            &op_stats,
+                        )
+                        .await
                     })
                     .await?;
                     if !hidden_vector_index && !deny_pushdown {
@@ -2214,6 +2317,7 @@ impl SupertableReader {
                             &entry,
                             &mut tagged,
                             now,
+                            &op_stats,
                         )
                         .await?;
                     }
@@ -2249,6 +2353,14 @@ impl SupertableReader {
         // column, table-wide — asserted here at the only place different
         // units' estimates ever meet.
         if global_shortlist_width.is_some() {
+            // Rerank rows are deliberately NOT in the priced range
+            // counter: `planned_read_ranges` is request-shaped (numbers
+            // commensurate with real object-store requests, which
+            // coalesce survivor rows into a handful of GETs), and the
+            // platform prices it at a per-request rate. The rerank leg's
+            // cost is CPU-dominated and carried by the priced CPU
+            // watermark; the row counts stay visible in the
+            // rows-reranked / candidates diagnostics.
             let pooled = {
                 let mut guard = scan_pool.lock().unwrap_or_else(PoisonError::into_inner);
                 mem::take(&mut *guard)
@@ -2265,12 +2377,20 @@ impl SupertableReader {
                         "pooled 1-bit estimates require one rotation seed per column".into(),
                     ));
                 }
-                let (_, rerank_mult) = options.resolve(filtered);
                 // Mirror phase A/C's `k_fetch = k + replica_overhead` in the
                 // global cut so boundary replicas (dormant today: overhead
                 // is 0 with replication off) cannot take shortlist slots
-                // from distinct rows before the stable-id dedup.
-                let replica_overhead = pooled.iter().map(|(_, _, o, _)| *o).max().unwrap_or(0);
+                // from distinct rows before the stable-id dedup. Taken
+                // over ALL scanned units — not just the pooled (warm)
+                // ones — so under replication the selection cap is
+                // temperature-invariant and always agrees with the
+                // canonical priced budget above, which uses the same max.
+                // (Pooled membership shifts with cache temperature: a
+                // fully cold unit reranks in-scan and pools nothing, so
+                // a pooled-only max could shrink the cap on cold runs.)
+                let replica_overhead =
+                    usize::try_from(max_replica_overhead.load(atomic::Ordering::Relaxed))
+                        .unwrap_or(0);
                 let mut flat: Vec<(usize, ScanCandidate)> = pooled
                     .into_iter()
                     .flat_map(|(si, _, _, cands)| cands.into_iter().map(move |c| (si, c)))
@@ -2313,7 +2433,7 @@ impl SupertableReader {
                 // is linear in the width the caller asked for — the pin
                 // arm's stated semantics.
                 let cell_floor = if options.nprobe.is_some() {
-                    k.saturating_mul(rerank_mult)
+                    k.saturating_mul(plan_rerank_mult)
                 } else {
                     0
                 };
@@ -2329,16 +2449,14 @@ impl SupertableReader {
                 // decisive geometry serves width == stamp and is
                 // unchanged. Explicit caller rerank_mult stays an exact,
                 // unscaled request.
-                let (served, stamped_width) = served_cells_over_width;
-                let shortlist_limit = if law_rerank_served && options.nprobe.is_none() {
-                    k.saturating_add(replica_overhead)
-                        .saturating_mul(rerank_mult)
-                        .saturating_mul(served)
-                        .div_ceil(stamped_width)
-                } else {
-                    k.saturating_add(replica_overhead)
-                        .saturating_mul(rerank_mult)
-                };
+                let shortlist_limit = deferred_shortlist_limit(
+                    k,
+                    replica_overhead,
+                    plan_rerank_mult,
+                    law_rerank_served,
+                    options.nprobe.is_some(),
+                    served_cells_over_width,
+                );
                 // Regression probe for the serve-the-law scope bug: recall
                 // floors can't see a re-shadowed `options` (the constant
                 // budget only ADDS survivors); the served limit can.
@@ -2358,9 +2476,17 @@ impl SupertableReader {
                             .map(|sel| (Arc::clone(entry), sel))
                     })
                     .collect();
+                if let Some(stats) = &self.op_stats {
+                    // Actual winner rows; their planned ranges were priced
+                    // canonically above, from the budget these winners were
+                    // selected under.
+                    let rows: u64 = rerank_units.iter().map(|(_, sel)| sel.len() as u64).sum();
+                    stats.add_vector_rows_reranked(rows);
+                }
                 let column = Arc::clone(&column_arc2);
                 let query = Arc::clone(&query_arc2);
                 let reader_pool = Arc::clone(&manifest.options.reader_pool);
+                let op_stats_c = self.op_stats.clone();
                 let body_c = move |reader: Arc<SuperfileReader>,
                                    entry: Arc<SuperfileEntry>,
                                    _tombstone_cache: Option<Arc<SidecarCache>>,
@@ -2369,6 +2495,7 @@ impl SupertableReader {
                     let column = Arc::clone(&column);
                     let query = Arc::clone(&query);
                     let reader_pool = Arc::clone(&reader_pool);
+                    let op_stats = op_stats_c.clone();
                     async move {
                         // Hidden-path invariants: no tombstone sidecars (the
                         // manifest's deletes apply after the stable-id
@@ -2379,7 +2506,7 @@ impl SupertableReader {
                             .unwrap_or(0);
                         let k_fetch = k.saturating_add(replica_overhead);
                         let reader_for_ids = Arc::clone(&reader);
-                        let hits = reader
+                        let (hits, rerank_kernel_ns) = reader
                             .vector_rerank_selected(
                                 &column,
                                 &query,
@@ -2389,10 +2516,19 @@ impl SupertableReader {
                             )
                             .await
                             .map_err(vector_read_query_error)?;
+                        if let Some(stats) = &op_stats {
+                            stats.add_kernel_cpu_ns(rerank_kernel_ns);
+                        }
                         let mut tagged = dispatch::tag_hits(&entry, hits);
                         io_counters::phase_timed_async("vec.stable_id", async {
-                            dispatch::attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false)
-                                .await
+                            dispatch::attach_stable_ids(
+                                &reader_for_ids,
+                                &entry,
+                                &mut tagged,
+                                false,
+                                &op_stats,
+                            )
+                            .await
                         })
                         .await?;
                         Ok::<Vec<SuperfileHit>, QueryError>(tagged)
@@ -2523,15 +2659,25 @@ impl SupertableReader {
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
         let filter_col_arc = Arc::new(filter_col.to_owned());
         let tokens_arc: Arc<Vec<String>> = Arc::new(tokens.to_vec());
+        let op_stats = self.op_stats.clone();
         self.fanout_candidate_bitmaps(superfiles, move |r, _entry| {
             let filter_col_arc = Arc::clone(&filter_col_arc);
             let tokens_arc = Arc::clone(&tokens_arc);
+            let op_stats = op_stats.clone();
             async move {
                 let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
-                r.token_match(&filter_col_arc, &refs, mode)
+                let (docs, work) = r
+                    .token_match(&filter_col_arc, &refs, mode)
                     .await
-                    .map_err(|e| QueryError::Parquet(e.to_string()))
-                    .map(|docs| docs.into_iter().collect::<RoaringBitmap>())
+                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                // The predicate-resolution leg of filtered vector search
+                // is FTS work like any other; flush it per superfile.
+                if let Some(stats) = &op_stats {
+                    stats.add_fts_postings_bytes(work.postings_bytes);
+                    stats.add_planned_read_ranges(work.planned_ranges);
+                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+                }
+                Ok(docs.into_iter().collect::<RoaringBitmap>())
             }
         })
         .await
@@ -2614,7 +2760,9 @@ impl SupertableReader {
                 continue;
             }
             let locals: Vec<u32> = bm.iter().collect();
-            let ids = read_ids_for_locals(manifest, &entry, &locals, id_column, false).await?;
+            let ids =
+                read_ids_for_locals(manifest, &entry, &locals, id_column, false, &self.op_stats)
+                    .await?;
             out.extend(ids);
         }
         Ok(out.into_iter().collect())
@@ -2637,7 +2785,12 @@ impl SupertableReader {
         }
         let drained = self
             .vector_index_table()
-            .map(|hidden| hidden.pinned_reader().manifest().get_drained_ranges())
+            .map(|hidden| {
+                hidden
+                    .pinned_reader_with(self.op_stats.clone())
+                    .manifest()
+                    .get_drained_ranges()
+            })
             .unwrap_or_default();
         let mut drained_allow = HashMap::new();
         let mut undrained_user = Vec::new();
@@ -2721,7 +2874,7 @@ impl SupertableReader {
             });
         }
         if let Some(vit) = self.vector_index_table() {
-            let hidden_reader = vit.pinned_reader();
+            let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
             let hidden_manifest = Arc::clone(hidden_reader.manifest());
             let drained = hidden_manifest.get_drained_ranges();
             let superfiles = hidden_manifest
@@ -2731,14 +2884,20 @@ impl SupertableReader {
             if !superfiles.is_empty() {
                 let allow_for_cell = Arc::clone(&allow_global);
                 let manifest_for_ids = Arc::clone(&hidden_manifest);
+                let routing_stats = hidden_reader.op_stats.clone();
                 let allow_by_uri = hidden_reader
                     .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
                         let allow_for_cell = Arc::clone(&allow_for_cell);
                         let manifest_for_ids = Arc::clone(&manifest_for_ids);
+                        let routing_stats = routing_stats.clone();
                         async move {
-                            let stable_ids =
-                                stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r)
-                                    .await?;
+                            let stable_ids = stable_ids_by_local_for_routing(
+                                &manifest_for_ids,
+                                &entry,
+                                &r,
+                                &routing_stats,
+                            )
+                            .await?;
                             let mut local = RoaringBitmap::new();
                             for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
                                 if let Ok(global_id) = u32::try_from(stable_id)
@@ -2844,7 +3003,7 @@ impl SupertableReader {
         let Some(vit) = self.vector_index_table() else {
             return Ok(HashMap::new());
         };
-        let hidden_reader = vit.pinned_reader();
+        let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
         let hidden_manifest = Arc::clone(hidden_reader.manifest());
         let superfiles = hidden_manifest
             .get_all_superfiles_loaded()
@@ -2854,14 +3013,21 @@ impl SupertableReader {
         let column_owned = column.to_string();
         let map_for_fanout = Arc::clone(&map);
         let manifest_for_ids = Arc::clone(&hidden_manifest);
+        let routing_stats = hidden_reader.op_stats.clone();
         let _ = hidden_reader
             .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
                 let map = Arc::clone(&map_for_fanout);
                 let manifest_for_ids = Arc::clone(&manifest_for_ids);
                 let column = column_owned.clone();
+                let routing_stats = routing_stats.clone();
                 async move {
-                    let stable_ids =
-                        stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r).await?;
+                    let stable_ids = stable_ids_by_local_for_routing(
+                        &manifest_for_ids,
+                        &entry,
+                        &r,
+                        &routing_stats,
+                    )
+                    .await?;
                     if let Some(vs) = entry.vector_summary.get(&column) {
                         let mut idx = 0usize;
                         let mut guard = map.lock().expect("diag cell-map lock");
@@ -2896,7 +3062,11 @@ impl SupertableReader {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn diag_hidden_probe_laws(&self) -> Option<(Vec<u32>, Vec<u32>, Vec<u32>)> {
         let vit = self.vector_index_table()?;
-        match vit.pinned_reader().manifest().get_partition_strategy() {
+        match vit
+            .pinned_reader_with(self.op_stats.clone())
+            .manifest()
+            .get_partition_strategy()
+        {
             PartitionStrategy::VectorCell { routing, .. } => Some((
                 routing.width_for_k.to_vec(),
                 routing.fine_for_k.to_vec(),
@@ -2919,7 +3089,7 @@ impl SupertableReader {
         let allow_set: Arc<HashSet<i128>> =
             Arc::new(allow_stable_ids.iter().copied().collect::<HashSet<i128>>());
         if let Some(vit) = self.vector_index_table() {
-            let hidden_reader = vit.pinned_reader();
+            let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
             let hidden_manifest = Arc::clone(hidden_reader.manifest());
             let drained = hidden_manifest.get_drained_ranges();
             let superfiles = hidden_manifest
@@ -2929,14 +3099,20 @@ impl SupertableReader {
             if !superfiles.is_empty() {
                 let allow_for_cell = Arc::clone(&allow_set);
                 let manifest_for_ids = Arc::clone(&hidden_manifest);
+                let routing_stats = hidden_reader.op_stats.clone();
                 let allow_by_uri = hidden_reader
                     .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
                         let allow_for_cell = Arc::clone(&allow_for_cell);
                         let manifest_for_ids = Arc::clone(&manifest_for_ids);
+                        let routing_stats = routing_stats.clone();
                         async move {
-                            let stable_ids =
-                                stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r)
-                                    .await?;
+                            let stable_ids = stable_ids_by_local_for_routing(
+                                &manifest_for_ids,
+                                &entry,
+                                &r,
+                                &routing_stats,
+                            )
+                            .await?;
                             let mut local = RoaringBitmap::new();
                             for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
                                 if allow_for_cell.contains(&stable_id) {
@@ -2978,13 +3154,20 @@ impl SupertableReader {
         }
         let allow_for_user = Arc::clone(&allow_set);
         let manifest_for_ids = Arc::clone(manifest);
+        let routing_stats = self.op_stats.clone();
         let allow_by_uri = self
             .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
                 let allow_for_user = Arc::clone(&allow_for_user);
                 let manifest_for_ids = Arc::clone(&manifest_for_ids);
+                let routing_stats = routing_stats.clone();
                 async move {
-                    let stable_ids =
-                        stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r).await?;
+                    let stable_ids = stable_ids_by_local_for_routing(
+                        &manifest_for_ids,
+                        &entry,
+                        &r,
+                        &routing_stats,
+                    )
+                    .await?;
                     let mut local = RoaringBitmap::new();
                     for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
                         if allow_for_user.contains(&stable_id) {
@@ -3049,7 +3232,7 @@ impl SupertableReader {
             let vit = self.vector_index_table().ok_or_else(|| {
                 QueryError::Execute("prepared hidden allow-set but no hidden index table".into())
             })?;
-            let hidden_reader = vit.pinned_reader();
+            let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
             let superfiles = hidden_reader
                 .manifest()
                 .get_all_superfiles_loaded()
@@ -3105,17 +3288,27 @@ impl SupertableReader {
         plan: &CandidatePlan,
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
         let plan_arc = Arc::new(plan.clone());
+        let op_stats = self.op_stats.clone();
         self.fanout_candidate_bitmaps(superfiles, move |r, _entry| {
             let plan = Arc::clone(&plan_arc);
+            let op_stats = op_stats.clone();
             async move {
-                plan.evaluate(r.as_ref())
+                let (bitmap, work) = plan
+                    .evaluate(r.as_ref())
                     .await
-                    .map_err(|e| QueryError::Parquet(e.to_string()))?
-                    .ok_or_else(|| {
-                        QueryError::Execute(
-                            "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
-                        )
-                    })
+                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                // The SQL predicate's posting walks, summed across the
+                // plan tree — the pushdown leg of the vector TVF.
+                if let Some(stats) = &op_stats {
+                    stats.add_fts_postings_bytes(work.postings_bytes);
+                    stats.add_planned_read_ranges(work.planned_ranges);
+                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+                }
+                bitmap.ok_or_else(|| {
+                    QueryError::Execute(
+                        "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
+                    )
+                })
             }
         })
         .await
@@ -3207,7 +3400,7 @@ impl SupertableReader {
         // Wave 1: search the pinned hidden slow state while refreshing only the
         // fast delete state and loading any user parts known to be newer than
         // this exact hidden residency watermark.
-        let hidden_reader = vit.pinned_reader();
+        let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
         let hidden_manifest = Arc::clone(hidden_reader.manifest());
         let drained = hidden_manifest.get_drained_ranges();
         let hidden_entries = hidden_manifest
@@ -3225,7 +3418,7 @@ impl SupertableReader {
         };
         let fast_state = async {
             vit.ensure_fresh_async().await;
-            vit.pinned_reader()
+            vit.pinned_reader_with(self.op_stats.clone())
                 .hidden_deleted_ids()
                 .map_err(|error| QueryError::Execute(error.to_string()))
         };
@@ -3511,6 +3704,33 @@ fn apply_width_pin(
         Some(width.min(populated_cells))
     } else {
         None
+    }
+}
+
+/// The deferred-rerank plan's global shortlist budget. Phase C's selection
+/// cap and the canonical priced rerank-row count both derive from this one
+/// formula so the two can never drift: `(k + replica_overhead) x
+/// rerank_mult`, scaled by served-cells-over-stamped-width when the LAW's
+/// budget (not an explicit caller request) is serving a widened sweep.
+fn deferred_shortlist_limit(
+    k: usize,
+    replica_overhead: usize,
+    rerank_mult: usize,
+    law_rerank_served: bool,
+    caller_nprobe: bool,
+    served_cells_over_width: (usize, usize),
+) -> usize {
+    let base = k
+        .saturating_add(replica_overhead)
+        .saturating_mul(rerank_mult);
+    if law_rerank_served && !caller_nprobe {
+        let (served, stamped_width) = served_cells_over_width;
+        // Total over a degenerate zero stamp: the law path never
+        // produces one today ((1, 1) default, `.max(1)` at assignment),
+        // but a plain helper must not be able to panic.
+        base.saturating_mul(served).div_ceil(stamped_width.max(1))
+    } else {
+        base
     }
 }
 
@@ -3960,12 +4180,14 @@ mod tests {
             stable_id: Some(sid),
         };
         let hits = [mk(42)];
-        let ids = block_on(hidden_hits_user_ids(manifest, &hits, "_id")).expect("resolve one id");
+        let ids =
+            block_on(hidden_hits_user_ids(manifest, &hits, "_id", &None)).expect("resolve one id");
         assert_eq!(ids, vec![42], "single inline stable id returned verbatim");
 
         // Order is preserved across multiple stamped hits.
         let hits = [mk(42), mk(7)];
-        let ids = block_on(hidden_hits_user_ids(manifest, &hits, "_id")).expect("resolve two ids");
+        let ids =
+            block_on(hidden_hits_user_ids(manifest, &hits, "_id", &None)).expect("resolve two ids");
         assert_eq!(ids, vec![42, 7], "inline stable ids returned in hit order");
     }
 

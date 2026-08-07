@@ -15,7 +15,7 @@
 //!
 //! [`SuperfileReader::take_by_local_doc_ids`]: crate::superfile::SuperfileReader::take_by_local_doc_ids
 
-use std::{ops::Range, sync::Arc};
+use std::{collections::HashSet, ops::Range, sync::Arc};
 
 use arrow::compute::{concat_batches, interleave_record_batch, take};
 use arrow_array::{ArrayRef, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions};
@@ -24,6 +24,7 @@ use bytes::Bytes;
 use datafusion::{
     error::{DataFusionError, Result as DfResult},
     logical_expr::Expr,
+    physical_plan::ExecutionPlan,
     scalar::ScalarValue,
 };
 use futures::{
@@ -44,6 +45,7 @@ use rayon::prelude::*;
 
 use crate::{
     runtime_bridge::run_on_pool,
+    runtime_metrics::op_stats::{OpStatsCollector, timed_section},
     superfile::{
         SuperfileReader,
         lazy_source::Source,
@@ -87,6 +89,56 @@ pub(crate) fn search_query_df_error(e: QueryError) -> DataFusionError {
 /// by every public row-returning search method (`bm25_search`,
 /// `vector_search`, `token_match`, `exact_match`); `what` labels error
 /// messages with the calling method.
+/// Fold DataFusion's own operator instrumentation into the per-query
+/// stats after a SQL plan has executed. Every operator's
+/// `elapsed_compute` (DataFusion brackets its synchronous poll sections
+/// with an `Instant` timer — approximately on-CPU for compute-bound
+/// operators, and excluding async I/O waits) sums into the kernel
+/// counter; leaf (source) operators' `output_rows` sum into
+/// `rows_materialized` — the rows the scans decoded from storage.
+/// Infino's own TVF exec nodes report no DataFusion metrics (their
+/// kernels bracket and flush internally), so nothing double-counts.
+pub(crate) fn harvest_datafusion_metrics(
+    plan: &Arc<dyn ExecutionPlan>,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) {
+    // Deduped by node identity: plans are trees in practice, but nothing
+    // forbids an operator `Arc` appearing under two parents, and a shared
+    // node's metrics must not be added once per path.
+    fn walk(
+        node: &Arc<dyn ExecutionPlan>,
+        seen: &mut HashSet<usize>,
+        compute_ns: &mut u64,
+        leaf_rows: &mut u64,
+    ) {
+        if !seen.insert(Arc::as_ptr(node) as *const () as usize) {
+            return;
+        }
+        if let Some(metrics) = node.metrics() {
+            if let Some(ns) = metrics.elapsed_compute() {
+                *compute_ns += ns as u64;
+            }
+            if node.children().is_empty()
+                && let Some(rows) = metrics.output_rows()
+            {
+                *leaf_rows += rows as u64;
+            }
+        }
+        for child in node.children() {
+            walk(child, seen, compute_ns, leaf_rows);
+        }
+    }
+    let Some(stats) = op_stats else {
+        return;
+    };
+    let mut seen = HashSet::new();
+    let mut compute_ns = 0u64;
+    let mut leaf_rows = 0u64;
+    walk(plan, &mut seen, &mut compute_ns, &mut leaf_rows);
+    stats.add_kernel_cpu_ns(compute_ns);
+    stats.add_rows_materialized(leaf_rows);
+}
+
 pub(crate) async fn resolve_hits_named(
     reader: &SupertableReader,
     hits: &[SuperfileHit],
@@ -511,7 +563,7 @@ async fn resolve_columns(
 
     let warm_wave = async {
         if warm_inputs.is_empty() {
-            return Ok::<Vec<(usize, RecordBatch)>, DataFusionError>(Vec::new());
+            return Ok::<Vec<((usize, RecordBatch), u64)>, DataFusionError>(Vec::new());
         }
         // Owned inputs so the rayon closure is `'static`.
         let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
@@ -522,11 +574,14 @@ async fn resolve_columns(
             "resolve decode: reader pool dropped result",
             move || {
                 let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
-                let result: Result<Vec<(usize, RecordBatch)>, _> = inputs
+                let result: Result<Vec<((usize, RecordBatch), u64)>, _> = inputs
                     .into_par_iter()
                     .map(|(i, sf, locals)| {
-                        sf.take_by_local_doc_ids(&locals, &name_refs)
-                            .map(|batch| (i, batch))
+                        // Per-superfile bracket: the resident decode is
+                        // this wave's kernel section, one chunk per file.
+                        let (batch, ns) =
+                            timed_section(|| sf.take_by_local_doc_ids(&locals, &name_refs));
+                        batch.map(|batch| ((i, batch), ns))
                     })
                     .collect();
                 result
@@ -537,18 +592,22 @@ async fn resolve_columns(
         .map_err(|e| DataFusionError::Execution(e.to_string()))
     };
 
-    let cold_wave = try_join_all(
-        cold_units
-            .into_iter()
-            .map(|(i, reader, locals)| async move {
-                take_rows_byte_source(reader, locals, names)
-                    .await
-                    .map(|batch| (i, batch))
-            }),
-    );
+    let cold_wave = try_join_all(cold_units.into_iter().map(|(i, rd, locals)| async move {
+        take_rows_byte_source(rd, locals, names)
+            .await
+            .map(|batch| (i, batch))
+    }));
 
     let (warm_done, cold_done) = tokio::join!(warm_wave, cold_wave);
-    for (i, batch) in warm_done?.into_iter().chain(cold_done?) {
+    let warm_done = warm_done?;
+    if let Some(stats) = &reader.op_stats {
+        stats.add_kernel_cpu_ns(warm_done.iter().map(|(_, ns)| *ns).sum());
+    }
+    for (i, batch) in warm_done
+        .into_iter()
+        .map(|(item, _)| item)
+        .chain(cold_done?)
+    {
         decoded_cache.insert(seg_order[i], &seg_locals[i], names, batch.clone());
         slots[i] = Some(batch);
     }
@@ -560,6 +619,12 @@ async fn resolve_columns(
     // gathers from the per-superfile arrays in one pass; the old
     // concatenate-then-take path allocated and copied every projected column
     // twice before producing the same top-k-sized output.
+    // Every hit row was decoded from stored columns (cache hits included:
+    // the decoded-scalar cache is per reader generation, so a served batch
+    // is still this query's planned materialization).
+    if let Some(stats) = &reader.op_stats {
+        stats.add_rows_materialized(hits.len() as u64);
+    }
     let batches: Vec<&RecordBatch> = per_superfile.iter().collect();
     interleave_record_batch(&batches, &placement)
         .map_err(|error| DataFusionError::Execution(error.to_string()))
@@ -621,6 +686,12 @@ impl AsyncFileReader for ByteSourceAsyncReader {
 }
 
 /// Stream projected rows through a reader's cache-aware byte source.
+///
+/// Deliberately reports NO planned ranges: whether a take streams page
+/// ranges (lazy reader) or decodes resident bytes in place (promoted
+/// reader) is reader-cache state, so counting the streamed ranges would
+/// make the priced counter cache-dependent. The invariant materialization
+/// signals are `rows_materialized` and the decode CPU brackets.
 pub(crate) async fn take_rows_byte_source(
     reader: &SuperfileReader,
     local_doc_ids: &[u32],

@@ -67,6 +67,7 @@ use datafusion::{
 
 use crate::{
     memory::budgeted_session_context,
+    runtime_metrics::op_stats,
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
@@ -206,6 +207,13 @@ impl SupertableReader {
     /// Sync API. The first call allocates a tokio Runtime
     /// (single worker thread) cached on the `SupertableInner`;
     /// subsequent calls reuse it.
+    ///
+    /// Not metered: this entry runs on the cached, collector-detached
+    /// [`SessionContext`] (see [`Self::sql_session_context`]), so a
+    /// surrounding `with_op_stats` scope reports zero SQL work for it.
+    /// The metered SQL surface is the catalog `Connection::query_sql`,
+    /// which builds a fresh per-query provider that carries the scope's
+    /// collector.
     // Single-table SQL — off the public surface; catalog-level SQL is the
     // public entry point. Reachable from tests/benches via `test-helpers`.
     #[cfg(any(test, feature = "test-helpers"))]
@@ -290,8 +298,14 @@ impl SupertableReader {
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     fn sql_session_context(&self) -> Result<SessionContext, QueryError> {
         // This reader already pins the snapshot; clone is a handful of
-        // Arc refcount bumps.
-        let reader = Arc::new(self.clone());
+        // Arc refcount bumps. Detach any per-query work collector: this
+        // context is CACHED across queries, and a collector riding into it
+        // would bill later queries into this scope. The whole build below
+        // runs under `op_stats::suppressed` for the same reason (provider
+        // and TVF constructions capture the thread-local).
+        let mut detached = self.clone();
+        detached.op_stats = None;
+        let reader = Arc::new(detached);
         let manifest = Arc::clone(reader.manifest());
 
         let mut guard = self
@@ -309,13 +323,15 @@ impl SupertableReader {
         // Cached per-table schemas: the provider scans the string-viewed `scan`
         // schema; the TVFs bind to the plain `scalar` schema.
         let schemas = self.sql_schemas();
-        let provider = SupertableProvider::new(
-            schemas.scan().clone(),
-            Arc::clone(&manifest),
-            store,
-            disk_cache,
-            reader.tombstone_cache.clone(),
-        );
+        let provider = op_stats::suppressed(|| {
+            SupertableProvider::new(
+                schemas.scan().clone(),
+                Arc::clone(&manifest),
+                store,
+                disk_cache,
+                reader.tombstone_cache.clone(),
+            )
+        });
 
         // Gate SQL heap on the connection budget (shared across contexts, so
         // this reader's SQL counts against the same ceiling as the rest).

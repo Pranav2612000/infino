@@ -117,12 +117,16 @@ pub use crate::superfile::fts::reader::BoolMode;
 use crate::{
     InfinoError,
     runtime_bridge::run_on_pool,
+    runtime_metrics::op_stats,
     superfile::{
         SuperfileReader,
         error::{FtsError, ReadError},
         fts::{
             bm25,
-            reader::{Bm25Stats, ClauseLists, GlobalTermIdf, OR_WINDOW_MIN_TERMS, OrCursorSet},
+            reader::{
+                Bm25Stats, ClauseLists, GlobalTermIdf, OR_WINDOW_MIN_TERMS, OrCursorSet,
+                PreparedClauses,
+            },
         },
     },
     supertable::{
@@ -454,6 +458,7 @@ impl SupertableReader {
         // excluded from the merge so deleted rows never raise the bar.
         let shared = SharedTopK::new(k);
         let tombstones = self.tombstone_cache.clone();
+        let op_stats = self.op_stats.clone();
         let now = Instant::now();
 
         // Ranged units are slices of ONE superfile: share its cursor build
@@ -493,6 +498,7 @@ impl SupertableReader {
             let reader_pool = Arc::clone(&reader_pool);
             let tombstones = tombstones.clone();
             let global_idf = global_idf.clone();
+            let op_stats = op_stats.clone();
             async move {
                 // Share the global kth-best floor with every superfile —
                 // single-term queries included — so each prunes its scored
@@ -524,14 +530,22 @@ impl SupertableReader {
                             .get_or_try_init(|| async {
                                 let should_refs: Vec<&str> =
                                     should_arc.iter().map(|s| s.as_str()).collect();
-                                r.bm25_or_cursor_set(
-                                    &column_arc,
-                                    &should_refs,
-                                    global_idf.as_deref(),
-                                )
-                                .await
-                                .map(Arc::new)
-                                .map_err(fts_read_error)
+                                let set = r
+                                    .bm25_or_cursor_set(
+                                        &column_arc,
+                                        &should_refs,
+                                        global_idf.as_deref(),
+                                    )
+                                    .await
+                                    .map_err(fts_read_error)?;
+                                // Flushed inside the OnceCell init so slices
+                                // sharing this superfile's cursor set count
+                                // its posting bytes exactly once.
+                                if let Some(stats) = &op_stats {
+                                    stats.add_fts_postings_bytes(set.postings_bytes());
+                                    stats.add_planned_read_ranges(set.planned_ranges());
+                                }
+                                Ok(Arc::new(set))
                             })
                             .await?;
                         // Heavy kernels go to the reader pool; trivial ones
@@ -540,25 +554,30 @@ impl SupertableReader {
                         if should_arc.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
                             let kernel_reader = Arc::clone(&r);
                             let kernel_set = Arc::clone(set);
+                            let kernel_stats = op_stats.clone();
                             run_on_pool(
                                 Some(&reader_pool),
                                 "ranged fts kernel: reader pool dropped result",
                                 move || {
-                                    kernel_reader.bm25_search_or_range_prebuilt(
-                                        &kernel_set,
-                                        k,
-                                        start,
-                                        end,
-                                        floor,
-                                    )
+                                    op_stats::timed_kernel(&kernel_stats, || {
+                                        kernel_reader.bm25_search_or_range_prebuilt(
+                                            &kernel_set,
+                                            k,
+                                            start,
+                                            end,
+                                            floor,
+                                        )
+                                    })
                                 },
                             )
                             .await
                             .map_err(|e| QueryError::Execute(e.to_string()))?
                             .map_err(fts_read_error)?
                         } else {
-                            r.bm25_search_or_range_prebuilt(set, k, start, end, floor)
-                                .map_err(fts_read_error)?
+                            op_stats::timed_kernel(&op_stats, || {
+                                r.bm25_search_or_range_prebuilt(set, k, start, end, floor)
+                            })
+                            .map_err(fts_read_error)?
                         }
                     }
                     None => {
@@ -583,21 +602,44 @@ impl SupertableReader {
                             )
                             .await
                             .map_err(fts_read_error)?;
-                        // Gate on posting mass, not term count: this scan
-                        // isn't sliced, so a rare-term query with many
-                        // terms can be cheaper than a common-term pair.
-                        if prep.posting_mass() >= UNRANGED_KERNEL_POOL_MIN_MASS {
-                            let kernel_reader = Arc::clone(&r);
-                            run_on_pool(
-                                Some(&reader_pool),
-                                "un-ranged fts kernel: reader pool dropped result",
-                                move || kernel_reader.run_prepared(prep),
-                            )
-                            .await
-                            .map_err(|e| QueryError::Execute(e.to_string()))?
-                            .map_err(fts_read_error)?
-                        } else {
-                            r.run_prepared(prep).map_err(fts_read_error)?
+                        if let Some(stats) = &op_stats {
+                            stats.add_fts_postings_bytes(prep.postings_bytes());
+                            stats.add_planned_read_ranges(prep.planned_ranges());
+                            // Single-term / phrase shapes finish inside
+                            // `prepare_clauses`; their walk's on-CPU time
+                            // rides the `Done` (0 for cursor shapes, whose
+                            // kernels are bracketed below).
+                            stats.add_kernel_cpu_ns(prep.inline_kernel_cpu_ns());
+                        }
+                        match prep {
+                            // Already-final shapes: the walk (and its
+                            // kernel time) happened inside
+                            // `prepare_clauses`; `run_prepared` would be
+                            // a no-op move and the bracket two wasted
+                            // schedstat reads.
+                            PreparedClauses::Done { hits, .. } => hits,
+                            // Gate on posting mass, not term count: this
+                            // scan isn't sliced, so a rare-term query
+                            // with many terms can be cheaper than a
+                            // common-term pair.
+                            prep if prep.posting_mass() >= UNRANGED_KERNEL_POOL_MIN_MASS => {
+                                let kernel_reader = Arc::clone(&r);
+                                let kernel_stats = op_stats.clone();
+                                run_on_pool(
+                                    Some(&reader_pool),
+                                    "un-ranged fts kernel: reader pool dropped result",
+                                    move || {
+                                        op_stats::timed_kernel(&kernel_stats, || {
+                                            kernel_reader.run_prepared(prep)
+                                        })
+                                    },
+                                )
+                                .await
+                                .map_err(|e| QueryError::Execute(e.to_string()))?
+                                .map_err(fts_read_error)?
+                            }
+                            prep => op_stats::timed_kernel(&op_stats, || r.run_prepared(prep))
+                                .map_err(fts_read_error)?,
                         }
                     }
                 };
@@ -649,6 +691,7 @@ impl SupertableReader {
         let column_arc = Arc::new(column.to_owned());
         let terms_arc: Arc<Vec<String>> = Arc::new(terms.to_vec());
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
+        let op_stats = self.op_stats.clone();
         let per_sf: Vec<Vec<u64>> = dispatch::fanout_with(
             self,
             units,
@@ -657,15 +700,24 @@ impl SupertableReader {
             move |r, _entry, _sidecars, _now, _params: ()| {
                 let column_arc = Arc::clone(&column_arc);
                 let terms_arc = Arc::clone(&terms_arc);
+                let op_stats = op_stats.clone();
                 async move {
                     // One FST parse + one coalesced header fetch for all
                     // scored terms in this superfile, rather than a parse
                     // and fetch per term.
                     let refs: Vec<&str> = terms_arc.iter().map(String::as_str).collect();
-                    let dfs = r
+                    let (dfs, work) = r
                         .term_dfs(&column_arc, &refs)
                         .await
                         .map_err(fts_read_error)?;
+                    // The global-stats pre-pass reads real header ranges;
+                    // it is part of the query's plan and counts like any
+                    // other posting work.
+                    if let Some(stats) = &op_stats {
+                        stats.add_fts_postings_bytes(work.postings_bytes);
+                        stats.add_planned_read_ranges(work.planned_ranges);
+                        stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+                    }
                     Ok::<Vec<u64>, QueryError>(dfs)
                 }
             },
@@ -759,11 +811,13 @@ impl SupertableReader {
 
         // Shared fan-out — see `bm25_search` for the rationale; the
         // kernel differs only in calling the prefix search variants.
+        let op_stats = self.op_stats.clone();
         let kernel = move |r: Arc<SuperfileReader>, (range, suid): (Option<(u32, u32)>, Uuid)| {
             let column_arc = Arc::clone(&column_arc);
             let prefix_arc = Arc::clone(&prefix_arc);
             let cursor_sets = Arc::clone(&cursor_sets);
             let reader_pool = Arc::clone(&reader_pool);
+            let op_stats = op_stats.clone();
             async move {
                 match range {
                     Some((start, end)) => {
@@ -774,40 +828,68 @@ impl SupertableReader {
                         };
                         let set = cell
                             .get_or_try_init(|| async {
-                                r.bm25_prefix_cursor_set(&column_arc, &prefix_arc)
+                                let set = r
+                                    .bm25_prefix_cursor_set(&column_arc, &prefix_arc)
                                     .await
-                                    .map(Arc::new)
-                                    .map_err(fts_read_error)
+                                    .map_err(fts_read_error)?;
+                                // Flushed inside the OnceCell init so slices
+                                // sharing this superfile's expansion count
+                                // its posting work exactly once — the same
+                                // contract as the exact-term ranged path.
+                                if let Some(stats) = &op_stats {
+                                    stats.add_fts_postings_bytes(set.postings_bytes());
+                                    stats.add_planned_read_ranges(set.planned_ranges());
+                                }
+                                Ok(Arc::new(set))
                             })
                             .await?;
                         if set.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
                             let kernel_reader = Arc::clone(&r);
                             let kernel_set = Arc::clone(set);
+                            let kernel_stats = op_stats.clone();
                             run_on_pool(
                                 Some(&reader_pool),
                                 "ranged prefix kernel: reader pool dropped result",
                                 move || {
-                                    kernel_reader.bm25_search_or_range_prebuilt(
-                                        &kernel_set,
-                                        k,
-                                        start,
-                                        end,
-                                        f32::NEG_INFINITY,
-                                    )
+                                    op_stats::timed_kernel(&kernel_stats, || {
+                                        kernel_reader.bm25_search_or_range_prebuilt(
+                                            &kernel_set,
+                                            k,
+                                            start,
+                                            end,
+                                            f32::NEG_INFINITY,
+                                        )
+                                    })
                                 },
                             )
                             .await
                             .map_err(|e| QueryError::Execute(e.to_string()))?
                             .map_err(fts_read_error)
                         } else {
-                            r.bm25_search_or_range_prebuilt(set, k, start, end, f32::NEG_INFINITY)
-                                .map_err(fts_read_error)
+                            op_stats::timed_kernel(&op_stats, || {
+                                r.bm25_search_or_range_prebuilt(
+                                    set,
+                                    k,
+                                    start,
+                                    end,
+                                    f32::NEG_INFINITY,
+                                )
+                            })
+                            .map_err(fts_read_error)
                         }
                     }
-                    None => r
-                        .bm25_search_prefix(&column_arc, &prefix_arc, k)
-                        .await
-                        .map_err(fts_read_error),
+                    None => {
+                        let (hits, work) = r
+                            .bm25_search_prefix(&column_arc, &prefix_arc, k)
+                            .await
+                            .map_err(fts_read_error)?;
+                        if let Some(stats) = &op_stats {
+                            stats.add_fts_postings_bytes(work.postings_bytes);
+                            stats.add_planned_read_ranges(work.planned_ranges);
+                            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+                        }
+                        Ok(hits)
+                    }
                 }
             }
         };
@@ -953,18 +1035,20 @@ impl SupertableReader {
         let phrase_arc: Arc<Vec<Vec<String>>> = Arc::new(match_set.phrases);
         let neg_arc: Arc<Vec<String>> = Arc::new(negatives.terms);
         let neg_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(negatives.phrases);
+        let op_stats = self.op_stats.clone();
         let kernel = move |r: Arc<SuperfileReader>, _: ()| {
             let column_arc = Arc::clone(&column_arc);
             let term_arc = Arc::clone(&term_arc);
             let phrase_arc = Arc::clone(&phrase_arc);
             let neg_arc = Arc::clone(&neg_arc);
             let neg_ph_arc = Arc::clone(&neg_ph_arc);
+            let op_stats = op_stats.clone();
             async move {
                 let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
                 // Any phrase atom (match or negated) takes the
                 // phrase-aware walk; plain-token queries keep the
                 // optimized token_match path unchanged.
-                let docs = match phrase_involved {
+                let (docs, mut work) = match phrase_involved {
                     true => r
                         .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
                         .await
@@ -980,7 +1064,7 @@ impl SupertableReader {
                 // materialized walk over both sets.
                 let docs = if has_negatives {
                     let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                    let excluded: RoaringBitmap = match neg_ph_arc.is_empty() {
+                    let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
                         true => r
                             .token_match(&column_arc, &neg_refs, BoolMode::Or)
                             .await
@@ -989,15 +1073,21 @@ impl SupertableReader {
                             .atoms_match_ids(&column_arc, &neg_refs, &neg_ph_arc, BoolMode::Or)
                             .await
                             .map_err(fts_read_error)?,
-                    }
-                    .into_iter()
-                    .collect();
+                    };
+                    work.merge(neg_work);
+                    let excluded: RoaringBitmap = neg_docs.into_iter().collect();
                     docs.into_iter()
                         .filter(|d| !excluded.contains(*d))
                         .collect::<Vec<_>>()
                 } else {
                     docs
                 };
+                // One flush per superfile: positive + negation walks.
+                if let Some(stats) = &op_stats {
+                    stats.add_fts_postings_bytes(work.postings_bytes);
+                    stats.add_planned_read_ranges(work.planned_ranges);
+                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+                }
                 Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
             }
         };
@@ -1057,12 +1147,14 @@ impl SupertableReader {
         // spawns + opens each superfile concurrently, and short-circuits
         // on the first error. The per-superfile body returns this
         // superfile's match count; the totals are summed.
+        let op_stats = self.op_stats.clone();
         let per_superfile = dispatch::fanout_with(
             self,
             units,
             true,
             true,
             move |r, entry, tombstone_cache, now, _params: ()| {
+                let op_stats = op_stats.clone();
                 let column_arc = Arc::clone(&column_arc);
                 let term_arc = Arc::clone(&term_arc);
                 let phrase_arc = Arc::clone(&phrase_arc);
@@ -1086,7 +1178,7 @@ impl SupertableReader {
                     // matches, then drop any doc carrying a negated term
                     // (union of the negatives) or a tombstone.
                     if has_negatives || tomb.is_some() {
-                        let docs = match phrase_involved {
+                        let (docs, mut work) = match phrase_involved {
                             true => r
                                 .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
                                 .await
@@ -1098,7 +1190,7 @@ impl SupertableReader {
                         };
                         let excluded: RoaringBitmap = if has_negatives {
                             let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                            match neg_ph_arc.is_empty() {
+                            let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
                                 true => r
                                     .token_match(&column_arc, &neg_refs, BoolMode::Or)
                                     .await
@@ -1112,12 +1204,17 @@ impl SupertableReader {
                                     )
                                     .await
                                     .map_err(fts_read_error)?,
-                            }
-                            .into_iter()
-                            .collect()
+                            };
+                            work.merge(neg_work);
+                            neg_docs.into_iter().collect()
                         } else {
                             RoaringBitmap::new()
                         };
+                        if let Some(stats) = &op_stats {
+                            stats.add_fts_postings_bytes(work.postings_bytes);
+                            stats.add_planned_read_ranges(work.planned_ranges);
+                            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+                        }
                         let n = docs
                             .iter()
                             .filter(|d| {
@@ -1131,7 +1228,7 @@ impl SupertableReader {
                     // without materializing ids — a single token resolves
                     // O(1) from the stored df, multi-token tallies the
                     // match walk through the counting sink.
-                    let n = if single_term {
+                    let (n, work) = if single_term {
                         r.term_df(&column_arc, &term_arc[0])
                             .await
                             .map_err(fts_read_error)?
@@ -1144,6 +1241,11 @@ impl SupertableReader {
                             .await
                             .map_err(fts_read_error)?
                     };
+                    if let Some(stats) = &op_stats {
+                        stats.add_fts_postings_bytes(work.postings_bytes);
+                        stats.add_planned_read_ranges(work.planned_ranges);
+                        stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+                    }
                     Ok(n)
                 }
             },
@@ -1190,6 +1292,7 @@ impl SupertableReader {
         let column_arc = Arc::new(column.to_owned());
         let value_arc = Arc::new(value.to_owned());
         let tokens_arc = Arc::new(term_strings);
+        let op_stats = self.op_stats.clone();
         let body = move |r: Arc<SuperfileReader>,
                          entry: Arc<SuperfileEntry>,
                          tombstone_cache: Option<Arc<SidecarCache>>,
@@ -1198,14 +1301,25 @@ impl SupertableReader {
             let column_arc = Arc::clone(&column_arc);
             let value_arc = Arc::clone(&value_arc);
             let tokens_arc = Arc::clone(&tokens_arc);
+            let op_stats = op_stats.clone();
             async move {
                 let candidates: Vec<u32> = if tokens_arc.is_empty() {
                     (0..r.n_docs() as u32).collect()
                 } else {
                     let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
-                    r.token_match(&column_arc, &refs, BoolMode::And)
+                    let (docs, work) = r
+                        .token_match(&column_arc, &refs, BoolMode::And)
                         .await
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?
+                        .map_err(fts_read_error)?;
+                    // The prune pass's posting walk. The verify pass's
+                    // row reads count through the take path's own
+                    // collector accounting below.
+                    if let Some(stats) = &op_stats {
+                        stats.add_fts_postings_bytes(work.postings_bytes);
+                        stats.add_planned_read_ranges(work.planned_ranges);
+                        stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+                    }
+                    docs
                 };
                 if candidates.is_empty() {
                     return Ok(Vec::new());
@@ -2543,7 +2657,9 @@ mod tests {
         }
 
         let oracle = build_oracle_superfile(&titles);
-        let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5)).expect("oracle");
+        let oracle_hits = block_on(oracle.bm25_search_prefix("title", "rust", 5))
+            .expect("oracle")
+            .0;
         let oracle_globals: HashSet<u32> = oracle_hits.iter().map(|(d, _)| *d).collect();
 
         let st_reader = st.reader().expect("reader");

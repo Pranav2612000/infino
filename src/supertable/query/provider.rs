@@ -96,6 +96,7 @@ use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use crate::{
+    runtime_metrics::op_stats,
     superfile::{
         SuperfileReader,
         fts::{
@@ -301,13 +302,20 @@ impl SupertableProvider {
     /// segment) scan. Gets its own object-store registry key so the
     /// restricted scan's registration can't collide with the parent's.
     pub(crate) fn restricted_to(&self, segments: HashSet<Uuid>) -> Self {
-        let mut restricted = Self::new(
-            Arc::clone(&self.schema),
-            Arc::clone(&self.manifest),
-            Arc::clone(&self.store),
-            self.disk_cache.clone(),
-            self.tombstone_cache.clone(),
-        );
+        // Suppressed: `Self::new` mints a transient scan store that
+        // captures the thread-local collector, but the restricted scan
+        // reuses the PARENT's store (replaced just below) — this clone
+        // runs mid-query on whatever thread drives the rewrite, and no
+        // mid-query code may consult the scope's thread-local.
+        let mut restricted = op_stats::suppressed(|| {
+            Self::new(
+                Arc::clone(&self.schema),
+                Arc::clone(&self.manifest),
+                Arc::clone(&self.store),
+                self.disk_cache.clone(),
+                self.tombstone_cache.clone(),
+            )
+        });
         restricted.segment_filter = Some(segments);
         restricted.prepared_scan_files = Arc::clone(&self.prepared_scan_files);
         restricted.scan_store = Arc::clone(&self.scan_store);
@@ -480,7 +488,16 @@ impl SupertableProvider {
                 let path = ObjPath::from(entry.uri.storage_path());
                 let source = reader.byte_source();
                 let size = source.size();
-                let parquet_meta = Arc::clone(reader.parquet_metadata());
+                // Index-complete metadata (column + offset page indexes),
+                // loaded through the reader's own byte source. Serving
+                // DataFusion a footer-only parse would make its opener
+                // fetch the page-index bytes through the metered store on
+                // predicated scans — but only for lazily-opened readers,
+                // making `sql_page_bytes` depend on reader-cache state.
+                let parquet_meta = reader
+                    .parquet_metadata_with_page_index()
+                    .await
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
                 let row_counts: Arc<[u32]> = parquet_meta
                     .row_groups()
                     .iter()
@@ -820,21 +837,31 @@ impl TableProvider for SupertableProvider {
             // overhead. The floor keeps the pushdown active on small
             // superfiles; the density cap binds even under the floor so
             // an all-matching predicate never takes the index path.
-            let est = candidate_plan
+            let (est, est_work) = candidate_plan
                 .estimate(prepared.reader.as_ref())
                 .await
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             let gate = ((prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION) as u64)
                 .max(PUSHDOWN_MIN_ROWS);
             let density_cap = (prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_DENSITY) as u64;
+            let mut predicate_work = est_work;
             let candidates = if est > gate || est >= density_cap {
                 None
             } else {
-                candidate_plan
+                let (bitmap, eval_work) = candidate_plan
                     .evaluate(prepared.reader.as_ref())
                     .await
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                predicate_work.merge(eval_work);
+                bitmap
             };
+            // The pushdown predicate's df probes + posting walks, flushed
+            // through the same collector that meters this scan's pages.
+            if let Some(stats) = self.scan_store.op_stats() {
+                stats.add_fts_postings_bytes(predicate_work.postings_bytes);
+                stats.add_planned_read_ranges(predicate_work.planned_ranges);
+                stats.add_kernel_cpu_ns(predicate_work.kernel_cpu_ns);
+            }
 
             // This superfile's tombstoned rows (empty when no overlay).
             let tombstones = match self.tombstone_cache.as_ref() {
@@ -913,10 +940,12 @@ impl TableProvider for SupertableProvider {
                 .with_pushdown_filters(true)
                 .with_reorder_filters(true);
         }
-        // Serve DataFusion's opener the footers the readers already
-        // parsed — without this the opener re-reads + re-parses every
-        // superfile's footer on every query (~half the warm flat cost
-        // at 256 superfiles).
+        // Serve DataFusion's opener the index-complete footers the
+        // readers already parsed — without this the opener re-reads +
+        // re-parses every superfile's footer on every query (~half the
+        // warm flat cost at 256 superfiles), and on predicated scans it
+        // would fetch page-index bytes through the metered store for
+        // lazily-opened readers (a cache-state-dependent priced counter).
         source = source.with_parquet_file_reader_factory(Arc::new(CachedMetadataReaderFactory {
             store: Arc::clone(&store),
             metas: Arc::clone(&self.scan_metas),

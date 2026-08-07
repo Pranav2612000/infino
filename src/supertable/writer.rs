@@ -3541,9 +3541,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             )
                         }
                     };
-                    let stable_ids = stable_ids_by_local_for_routing(&manifest, &entry, &reader)
-                        .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?;
+                    // Write-path materialization: no per-query collector.
+                    let stable_ids =
+                        stable_ids_by_local_for_routing(&manifest, &entry, &reader, &None)
+                            .await
+                            .map_err(|e| BuildError::Store(e.to_string()))?;
                     Ok::<_, BuildError>((reader, stable_ids))
                 }
             }))
@@ -4300,7 +4302,8 @@ async fn load_materialized_rows_from_ivf_superfile(
     }
 
     let manifest = inner.manifest.load_full();
-    let stable_ids = stable_ids_by_local_for_routing(&manifest, entry, &reader)
+    // Write-path materialization: no per-query collector.
+    let stable_ids = stable_ids_by_local_for_routing(&manifest, entry, &reader, &None)
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
     materialized_ivf_rows_in_doc_order(vec_reader, column, &stable_ids, bitmap.as_deref()).await
@@ -9637,8 +9640,10 @@ mod tests {
                 && cell.clusters.centroids.len() == cell.clusters.n_cent as usize * dim
         }));
         // Every Parquet row lands in at least one cluster; boundary
-        // replication (on by default) may add stub copies up to the
-        // configured storage-amplification budget on top.
+        // replication (off by default: drain_replica_target_factor <= 1.0
+        // disables it) may add stub copies up to the configured
+        // storage-amplification budget on top. The assertions tolerate
+        // both states, so the test holds under any configured factor.
         let total: u64 = vs
             .cells
             .iter()
@@ -9702,11 +9707,13 @@ mod tests {
             .expect("decimal ids")
             .values()
             .to_vec();
-        // Parquet stores each row once, in vector (cell) order. The IVF
-        // additionally carries boundary-replica stubs (replication is on by
-        // default), so the inline id stream is the parquet order plus stub
-        // duplicates: first occurrences must line up 1:1 with parquet, and
-        // every remaining inline id must duplicate some parquet row.
+        // Parquet stores each row once, in vector (cell) order. When
+        // boundary replication is enabled (off by default; the
+        // drain_replica_target_factor knob), the IVF additionally carries
+        // stub copies, so the inline id stream is the parquet order plus
+        // stub duplicates: first occurrences must line up 1:1 with
+        // parquet, and every remaining inline id must duplicate some
+        // parquet row. Both checks also hold in the stub-free default.
         let mut seen = HashSet::new();
         let first_occurrence: Vec<i128> = vector_ids
             .iter()

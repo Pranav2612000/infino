@@ -25,29 +25,35 @@ use std::{
 use bytes::Bytes;
 use serde::Deserialize;
 
-use crate::superfile::{
-    ReadError,
-    error::FtsError,
-    format::{
-        self, FST_SEPARATOR,
-        checksum::crc32c,
+use crate::{
+    runtime_metrics::{
+        cpu::{thread_cpu_delta_ns, thread_cpu_ns},
+        op_stats::{metering_active, timed_section},
+    },
+    superfile::{
+        ReadError,
+        error::FtsError,
+        format::{
+            self, FST_SEPARATOR,
+            checksum::crc32c,
+            fts::{
+                HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, hdr,
+                skip_entry, term_meta,
+            },
+        },
         fts::{
-            HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, MAGIC_BYTES, U32_BYTES, U64_BYTES, hdr,
-            skip_entry, term_meta,
+            bm25,
+            builder::{
+                DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE,
+            },
+            dict::{DictReader, make_key},
+            fst_value::FstValue,
+            positions::{decode_run, skip_run},
+            posting::{BLOCK_LEN, decode_block},
+            tokenize::{Tokenizer, tokenizer_for_name},
         },
+        lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
     },
-    fts::{
-        bm25,
-        builder::{
-            DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE,
-        },
-        dict::{DictReader, make_key},
-        fst_value::FstValue,
-        positions::{decode_run, skip_run},
-        posting::{BLOCK_LEN, decode_block},
-        tokenize::{Tokenizer, tokenizer_for_name},
-    },
-    lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
 };
 
 /// Largest gap worth overfetching when adjacent term postings share a request.
@@ -189,8 +195,22 @@ impl ClauseLists<'_> {
 /// cursors for one clause shape still to score. Owns its `ExcludeFilter`
 /// rather than borrowing it, so it can move into a `'static` closure.
 pub(crate) enum PreparedClauses {
-    /// Already final — nothing left for `run_prepared` to do.
-    Done(Vec<(u32, f32)>),
+    /// Already final — nothing left for `run_prepared` to do. Carries
+    /// the posting (and phrase-position) bytes the inline walk indexed
+    /// into, so the fast paths report work like the cursor-carrying
+    /// shapes do.
+    Done {
+        hits: Vec<(u32, f32)>,
+        postings_bytes: u64,
+        /// Byte-source ranges the inline walk requested (0 for the df=1
+        /// inline-FST and empty-resolution paths).
+        planned_ranges: u64,
+        /// On-CPU nanoseconds of the walk that produced `hits` inside
+        /// `prepare_clauses` (single-term BMW, atoms search) — the
+        /// kernel time `run_prepared` never sees for already-final
+        /// shapes. 0 for the trivial early returns.
+        kernel_cpu_ns: u64,
+    },
     /// AND-only: intersect `must_cursors`.
     Must {
         column_id: u32,
@@ -198,6 +218,9 @@ pub(crate) enum PreparedClauses {
         filter: Option<ExcludeFilter>,
         k: usize,
         floor_eff: f32,
+        /// FST-dictionary ranges the builds requested (one per
+        /// `build_term_cursors` call — must / should / negation lists).
+        dict_ranges: u64,
     },
     /// AND with should-boosted scoring.
     MustShould {
@@ -207,6 +230,8 @@ pub(crate) enum PreparedClauses {
         filter: Option<ExcludeFilter>,
         k: usize,
         floor_eff: f32,
+        /// See [`PreparedClauses::Must::dict_ranges`].
+        dict_ranges: u64,
     },
     /// Plain multi-term OR (no musts) — algorithm choice resolved in
     /// `run_prepared`.
@@ -216,7 +241,111 @@ pub(crate) enum PreparedClauses {
         filter: Option<ExcludeFilter>,
         k: usize,
         floor_eff: f32,
+        /// See [`PreparedClauses::Must::dict_ranges`].
+        dict_ranges: u64,
     },
+}
+
+/// Sum of the posting-byte ranges a cursor set indexes into (each cursor's
+/// term metadata + skip table + posting blocks). Feeds the per-query work
+/// stats ([`crate::runtime_metrics::op_stats`]).
+fn term_cursor_bytes(cursors: &[TermCursor]) -> u64 {
+    cursors.iter().map(|c| c.bytes.len() as u64).sum()
+}
+
+/// [`term_cursor_bytes`] for heterogeneous atoms: a phrase member counts
+/// its posting bytes **and** its position runs — positional verification
+/// is exactly the work that separates phrase cost from term cost.
+fn atom_cursor_bytes(atoms: &[AnyCursor]) -> u64 {
+    atoms
+        .iter()
+        .map(|a| match a {
+            AnyCursor::Term(c) => c.bytes.len() as u64,
+            AnyCursor::Phrase(p) => p
+                .members
+                .iter()
+                .map(|m| m.cursor.bytes.len() as u64 + m.positions.len() as u64)
+                .sum(),
+        })
+        .sum()
+}
+
+/// Byte-source ranges a cursor set's build requested — one per PFOR
+/// term. Inline (df=1) cursors plan no fetch (their `bytes` is empty),
+/// matching the single-term arm's "bytes 0 implies ranges 0".
+fn term_cursor_ranges(cursors: &[TermCursor]) -> u64 {
+    cursors
+        .iter()
+        .filter(|c| !c.bytes.is_empty())
+        .map(|c| 1 + u64::from(c.header_probed))
+        .sum()
+}
+
+/// Byte-source ranges the atoms' builds requested: one per PFOR term's
+/// posting range; a phrase member adds one for its postings and one for
+/// its position runs. Inline legs (empty buffers) plan no fetch.
+fn atom_planned_ranges(atoms: &[AnyCursor]) -> u64 {
+    let term_ranges = |c: &TermCursor| {
+        if c.bytes.is_empty() {
+            0
+        } else {
+            1 + u64::from(c.header_probed)
+        }
+    };
+    atoms
+        .iter()
+        .map(|a| match a {
+            AnyCursor::Term(c) => term_ranges(c),
+            AnyCursor::Phrase(p) => p
+                .members
+                .iter()
+                .map(|m| term_ranges(&m.cursor) + u64::from(!m.positions.is_empty()))
+                .sum(),
+        })
+        .sum()
+}
+
+/// Work tallies from one unranked match / dictionary walk — the posting
+/// bytes indexed and the byte-source ranges the plan requested. Returned
+/// alongside match results so the supertable flushes once per superfile;
+/// `pub` because the carrying fns are the test-helpers-widened surface
+/// (the module gate in `lib.rs` keeps it crate-private in normal builds).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MatchWork {
+    /// Posting (and phrase-position / header) bytes the walk indexed into.
+    pub postings_bytes: u64,
+    /// Byte-source ranges the walk's build requested, pre-coalesce.
+    pub planned_ranges: u64,
+    /// Bracketed on-CPU ns of the walk's synchronous scoring/merge
+    /// section (gated on `metering_active`; 0 when unmetered).
+    pub kernel_cpu_ns: u64,
+}
+
+impl MatchWork {
+    /// Tallies for a plain term-cursor set.
+    fn for_cursors(cursors: &[TermCursor]) -> Self {
+        Self {
+            postings_bytes: term_cursor_bytes(cursors),
+            planned_ranges: term_cursor_ranges(cursors),
+            kernel_cpu_ns: 0,
+        }
+    }
+
+    /// Tallies for a heterogeneous atom set (terms + phrases).
+    fn for_atoms(atoms: &[AnyCursor]) -> Self {
+        Self {
+            postings_bytes: atom_cursor_bytes(atoms),
+            planned_ranges: atom_planned_ranges(atoms),
+            kernel_cpu_ns: 0,
+        }
+    }
+
+    /// Fold another walk's tallies into this one (e.g. a negation set).
+    pub fn merge(&mut self, other: MatchWork) {
+        self.postings_bytes += other.postings_bytes;
+        self.planned_ranges += other.planned_ranges;
+        self.kernel_cpu_ns += other.kernel_cpu_ns;
+    }
 }
 
 impl PreparedClauses {
@@ -225,7 +354,7 @@ impl PreparedClauses {
     /// union for OR. `Done` has nothing left to scan, so it's zero.
     pub(crate) fn posting_mass(&self) -> u64 {
         match self {
-            PreparedClauses::Done(_) => 0,
+            PreparedClauses::Done { .. } => 0,
             PreparedClauses::Must { must_cursors, .. } => {
                 must_cursors.iter().map(|c| c.df).min().unwrap_or(0)
             }
@@ -233,6 +362,84 @@ impl PreparedClauses {
                 must_cursors.iter().map(|c| c.df).min().unwrap_or(0)
             }
             PreparedClauses::Or { cursors, .. } => cursors.iter().map(|c| c.df).sum(),
+        }
+    }
+
+    /// Posting-list bytes resident for this prepared query — what the
+    /// kernels index into across musts, shoulds, OR terms, and negation
+    /// filters (plus phrase position runs on the inline `Done` path).
+    /// Deterministic for a given query against a given superfile (cache
+    /// temperature never changes it) — the per-query work stats flush
+    /// this once per superfile.
+    pub(crate) fn postings_bytes(&self) -> u64 {
+        let filter_bytes =
+            |filter: &Option<ExcludeFilter>| filter.as_ref().map_or(0, |f| f.postings_bytes());
+        match self {
+            PreparedClauses::Done { postings_bytes, .. } => *postings_bytes,
+            PreparedClauses::Must {
+                must_cursors,
+                filter,
+                ..
+            } => term_cursor_bytes(must_cursors) + filter_bytes(filter),
+            PreparedClauses::MustShould {
+                must_cursors,
+                should_cursors,
+                filter,
+                ..
+            } => {
+                term_cursor_bytes(must_cursors)
+                    + term_cursor_bytes(should_cursors)
+                    + filter_bytes(filter)
+            }
+            PreparedClauses::Or {
+                cursors, filter, ..
+            } => term_cursor_bytes(cursors) + filter_bytes(filter),
+        }
+    }
+
+    /// On-CPU nanoseconds already spent producing an inline `Done`
+    /// result (0 for the cursor-carrying shapes, whose kernels are
+    /// bracketed at `run_prepared`).
+    pub(crate) fn inline_kernel_cpu_ns(&self) -> u64 {
+        match self {
+            PreparedClauses::Done { kernel_cpu_ns, .. } => *kernel_cpu_ns,
+            _ => 0,
+        }
+    }
+
+    /// Byte-source ranges this prepared query requested — one per term
+    /// posting range across every clause list (see
+    /// [`Self::postings_bytes`] for the byte-volume counterpart).
+    pub(crate) fn planned_ranges(&self) -> u64 {
+        let filter_ranges = |filter: &Option<ExcludeFilter>| {
+            filter.as_ref().map_or(0, ExcludeFilter::planned_ranges)
+        };
+        match self {
+            PreparedClauses::Done { planned_ranges, .. } => *planned_ranges,
+            PreparedClauses::Must {
+                must_cursors,
+                filter,
+                dict_ranges,
+                ..
+            } => term_cursor_ranges(must_cursors) + filter_ranges(filter) + dict_ranges,
+            PreparedClauses::MustShould {
+                must_cursors,
+                should_cursors,
+                filter,
+                dict_ranges,
+                ..
+            } => {
+                term_cursor_ranges(must_cursors)
+                    + term_cursor_ranges(should_cursors)
+                    + filter_ranges(filter)
+                    + dict_ranges
+            }
+            PreparedClauses::Or {
+                cursors,
+                filter,
+                dict_ranges,
+                ..
+            } => term_cursor_ranges(cursors) + filter_ranges(filter) + dict_ranges,
         }
     }
 }
@@ -1154,24 +1361,30 @@ impl FtsReader {
     ///
     /// Multi-token phrases require the column to be positional;
     /// otherwise [`FtsError::PositionsUnavailable`].
+    /// The second element counts the FST-dictionary ranges the builds
+    /// requested (one per `build_term_cursors` call plus one per inline
+    /// phrase member's position recovery) — real byte-source ranges on
+    /// every query, tallied by the caller into the planned count.
     async fn build_atom_cursors(
         &self,
         column_id: u32,
         terms: &[&str],
         phrases: &[Vec<String>],
         global_idf: Option<&GlobalTermIdf>,
-    ) -> Result<Vec<Option<AnyCursor>>, FtsError> {
+    ) -> Result<(Vec<Option<AnyCursor>>, u64), FtsError> {
         let col_meta = &self.columns[column_id as usize];
         if !phrases.is_empty() && !col_meta.positions {
             return Err(FtsError::PositionsUnavailable {
                 column: col_meta.name.clone(),
             });
         }
+        let mut dict_ranges = 0u64;
         let mut out: Vec<Option<AnyCursor>> = Vec::with_capacity(terms.len() + phrases.len());
         for term in terms {
             let mut cursors = self
                 .build_term_cursors(column_id, &[term], global_idf)
                 .await?;
+            dict_ranges += 1;
             out.push(cursors.pop().map(AnyCursor::Term));
         }
         for phrase in phrases {
@@ -1183,6 +1396,7 @@ impl FtsReader {
             let cursors = self
                 .build_term_cursors(column_id, &member_refs, global_idf)
                 .await?;
+            dict_ranges += 1;
             if cursors.len() != member_refs.len() {
                 // A member is absent — the phrase can never match.
                 out.push(None);
@@ -1203,6 +1417,7 @@ impl FtsReader {
                         positional.push((Some(term_meta), None));
                     }
                     true => {
+                        dict_ranges += 1;
                         let fst_bytes = self.dict_bytes_async().await?;
                         let dict = DictReader::open(&fst_bytes).map_err(|e| {
                             FtsError::Read(ReadError::MalformedVersion(format!(
@@ -1236,7 +1451,7 @@ impl FtsReader {
                 cursors, positions, positional,
             )?)));
         }
-        Ok(out)
+        Ok((out, dict_ranges))
     }
 
     /// Ranked search over heterogeneous atoms — the walk every
@@ -1468,27 +1683,28 @@ impl FtsReader {
         terms: &[&str],
         phrases: &[Vec<String>],
         mode: BoolMode,
-    ) -> Result<Vec<u32>, FtsError> {
+    ) -> Result<(Vec<u32>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Unranked: idf is irrelevant to the match set, so build local.
-        let built = self
+        let (built, dict_ranges) = self
             .build_atom_cursors(column_id, terms, phrases, None)
             .await?;
-        let atoms: Vec<AnyCursor> = match mode {
-            BoolMode::And => {
-                if built.iter().any(Option::is_none) {
-                    return Ok(Vec::new());
-                }
-                built.into_iter().flatten().collect()
-            }
-            BoolMode::Or => built.into_iter().flatten().collect(),
-        };
-        if atoms.is_empty() {
-            return Ok(Vec::new());
+        let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
+        let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
+        // The atoms that DID build cost their bytes even when a missing
+        // AND atom empties the result — mirrors `prepare_clauses`.
+        let mut work = MatchWork::for_atoms(&atoms);
+        work.planned_ranges += dict_ranges;
+        if missing_and_atom || atoms.is_empty() {
+            return Ok((Vec::new(), work));
         }
-        let mut out = Vec::new();
-        self.walk_atoms_match(atoms, mode, None, |d| out.push(d))?;
-        Ok(out)
+        let (walk, walk_ns) = timed_section(|| {
+            let mut out = Vec::new();
+            self.walk_atoms_match(atoms, mode, None, |d| out.push(d))
+                .map(|()| out)
+        });
+        work.kernel_cpu_ns = walk_ns;
+        Ok((walk?, work))
     }
 
     /// Phrase-aware unranked match **count** — the atoms sibling of
@@ -1499,27 +1715,26 @@ impl FtsReader {
         terms: &[&str],
         phrases: &[Vec<String>],
         mode: BoolMode,
-    ) -> Result<u64, FtsError> {
+    ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // Unranked: idf is irrelevant to the match set, so build local.
-        let built = self
+        let (built, dict_ranges) = self
             .build_atom_cursors(column_id, terms, phrases, None)
             .await?;
-        let atoms: Vec<AnyCursor> = match mode {
-            BoolMode::And => {
-                if built.iter().any(Option::is_none) {
-                    return Ok(0);
-                }
-                built.into_iter().flatten().collect()
-            }
-            BoolMode::Or => built.into_iter().flatten().collect(),
-        };
-        if atoms.is_empty() {
-            return Ok(0);
+        let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
+        let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
+        let mut work = MatchWork::for_atoms(&atoms);
+        work.planned_ranges += dict_ranges;
+        if missing_and_atom || atoms.is_empty() {
+            return Ok((0, work));
         }
-        let mut n = 0u64;
-        self.walk_atoms_match(atoms, mode, None, |_| n += 1)?;
-        Ok(n)
+        let (walk, walk_ns) = timed_section(|| {
+            let mut n = 0u64;
+            self.walk_atoms_match(atoms, mode, None, |_| n += 1)
+                .map(|()| n)
+        });
+        work.kernel_cpu_ns = walk_ns;
+        Ok((walk?, work))
     }
 
     /// Resolve a column name to its dense column_id, or
@@ -1646,7 +1861,7 @@ impl FtsReader {
                     };
                     let mut pos_at = 0usize;
 
-                    let mut cursor = TermCursor::new(term_bytes, n_docs, positional, None)?;
+                    let mut cursor = TermCursor::new(term_bytes, n_docs, positional, None, false)?;
                     while !cursor.is_exhausted() {
                         while cursor.pos < cursor.block_n {
                             let doc_id = cursor.block_doc_ids[cursor.pos];
@@ -1794,6 +2009,51 @@ impl FtsReader {
         self.run_prepared(prep)
     }
 
+    /// [`Self::search`] that also returns the walk's work — posting
+    /// bytes, planned ranges, and the bracketed kernel on-CPU ns
+    /// (`prepare_clauses`' inline walks plus the `run_prepared`
+    /// section), all carried on the one [`MatchWork`]. Prefix search
+    /// reports through this so an expansion to thousands of terms
+    /// carries its cost like any other query shape.
+    pub(crate) async fn search_with_work(
+        &self,
+        column: &str,
+        terms: &[&str],
+        k: usize,
+        mode: BoolMode,
+    ) -> Result<(Vec<(u32, f32)>, MatchWork), FtsError> {
+        let (musts, shoulds): (&[&str], &[&str]) = match mode {
+            BoolMode::And => (terms, &[]),
+            BoolMode::Or => (&[], terms),
+        };
+        let prep = self
+            .prepare_clauses(
+                column,
+                ClauseLists {
+                    musts,
+                    shoulds,
+                    ..ClauseLists::default()
+                },
+                k,
+                f32::NEG_INFINITY,
+            )
+            .await?;
+        let mut work = MatchWork {
+            postings_bytes: prep.postings_bytes(),
+            planned_ranges: prep.planned_ranges(),
+            kernel_cpu_ns: prep.inline_kernel_cpu_ns(),
+        };
+        let hits = match prep {
+            PreparedClauses::Done { hits, .. } => hits,
+            prep => {
+                let (hits, run_ns) = timed_section(|| self.run_prepared(prep));
+                work.kernel_cpu_ns += run_ns;
+                hits?
+            }
+        };
+        Ok((hits, work))
+    }
+
     /// BM25 search over explicit clause lists, with negated terms
     /// excluded.
     ///
@@ -1834,11 +2094,21 @@ impl FtsReader {
     ) -> Result<PreparedClauses, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if k == 0 {
-            return Ok(PreparedClauses::Done(Vec::new()));
+            return Ok(PreparedClauses::Done {
+                hits: Vec::new(),
+                postings_bytes: 0,
+                planned_ranges: 0,
+                kernel_cpu_ns: 0,
+            });
         }
         if lists.no_positive_atoms() {
             if lists.no_negative_atoms() {
-                return Ok(PreparedClauses::Done(Vec::new()));
+                return Ok(PreparedClauses::Done {
+                    hits: Vec::new(),
+                    postings_bytes: 0,
+                    planned_ranges: 0,
+                    kernel_cpu_ns: 0,
+                });
             }
             return Err(FtsError::NegationOnly);
         }
@@ -1846,40 +2116,62 @@ impl FtsReader {
 
         if lists.has_phrases() {
             // Phrase-bearing query: the heterogeneous atom walks.
-            let must_atoms = self
+            let (must_atoms, must_dict) = self
                 .build_atom_cursors(column_id, lists.musts, lists.must_phrases, lists.global_idf)
                 .await?;
             if must_atoms.iter().any(Option::is_none) {
-                // A must atom can never match in this superfile.
-                return Ok(PreparedClauses::Done(Vec::new()));
+                // A must atom can never match in this superfile. The
+                // atoms that DID build still cost their bytes.
+                let built: Vec<AnyCursor> = must_atoms.into_iter().flatten().collect();
+                return Ok(PreparedClauses::Done {
+                    hits: Vec::new(),
+                    postings_bytes: atom_cursor_bytes(&built),
+                    planned_ranges: atom_planned_ranges(&built) + must_dict,
+                    kernel_cpu_ns: 0,
+                });
             }
             let must_atoms: Vec<AnyCursor> = must_atoms.into_iter().flatten().collect();
-            let should_atoms: Vec<AnyCursor> = self
+            let (should_built, should_dict) = self
                 .build_atom_cursors(
                     column_id,
                     lists.shoulds,
                     lists.should_phrases,
                     lists.global_idf,
                 )
-                .await?
-                .into_iter()
-                .flatten()
-                .collect();
+                .await?;
+            let should_atoms: Vec<AnyCursor> = should_built.into_iter().flatten().collect();
             // Negatives are a hard exclusion filter, not scored, so their
             // idf is irrelevant — always build them local.
-            let negative_atoms: Vec<AnyCursor> = self
+            let (negative_built, negative_dict) = self
                 .build_atom_cursors(column_id, lists.negatives, lists.negative_phrases, None)
-                .await?
-                .into_iter()
-                .flatten()
-                .collect();
+                .await?;
+            let negative_atoms: Vec<AnyCursor> = negative_built.into_iter().flatten().collect();
+            let postings_bytes = atom_cursor_bytes(&must_atoms)
+                + atom_cursor_bytes(&should_atoms)
+                + atom_cursor_bytes(&negative_atoms);
+            let planned_ranges = atom_planned_ranges(&must_atoms)
+                + atom_planned_ranges(&should_atoms)
+                + atom_planned_ranges(&negative_atoms)
+                + must_dict
+                + should_dict
+                + negative_dict;
             let filter = match negative_atoms.is_empty() {
                 true => None,
                 false => Some(AtomExcludeFilter::new(negative_atoms)),
             };
+            // The atom walk is the whole kernel for phrase shapes —
+            // `run_prepared` sees only the finished `Done` — so bracket
+            // its on-CPU time here (sync section, no awaits inside).
+            // Gated: an unmetered process must not pay the procfs reads.
+            let kernel_start = metering_active().then(thread_cpu_ns).flatten();
             let result =
                 self.run_atoms_search(column_id, must_atoms, should_atoms, k, filter, floor_eff)?;
-            return Ok(PreparedClauses::Done(result));
+            return Ok(PreparedClauses::Done {
+                hits: result,
+                postings_bytes,
+                planned_ranges,
+                kernel_cpu_ns: thread_cpu_delta_ns(kernel_start),
+            });
         }
 
         let neg_filter = match lists.negatives {
@@ -1891,6 +2183,10 @@ impl FtsReader {
                     .await?,
             )),
         };
+        // FST-dictionary ranges the builds below request — one per
+        // `build_term_cursors` call (the dictionary fetch is a real
+        // byte-source range on every query, warm or cold).
+        let mut dict_ranges = u64::from(neg_filter.is_some());
 
         // Single-atom fast path: BlockMaxWAND-driven block skipping.
         // One term scores identically whichever clause list it sits
@@ -1907,18 +2203,36 @@ impl FtsReader {
                 .next()
                 .expect("one atom");
             let mut filter = neg_filter;
-            let result = self
+            let filter_postings_bytes = filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
+            let filter_ranges = filter.as_ref().map_or(0, ExcludeFilter::planned_ranges);
+            let (result, term_work, kernel_cpu_ns) = self
                 .search_single_term_bmw(column_id, term, k, filter.as_mut(), floor_eff)
                 .await?;
-            return Ok(PreparedClauses::Done(result));
+            // +1: the BMW walk's own dictionary fetch.
+            dict_ranges += 1;
+            return Ok(PreparedClauses::Done {
+                hits: result,
+                postings_bytes: term_work.postings_bytes + filter_postings_bytes,
+                planned_ranges: term_work.planned_ranges + filter_ranges + dict_ranges,
+                kernel_cpu_ns,
+            });
         }
 
         if lists.musts.is_empty() {
             let cursors = self
                 .build_term_cursors(column_id, lists.shoulds, lists.global_idf)
                 .await?;
+            dict_ranges += 1;
             if cursors.is_empty() {
-                return Ok(PreparedClauses::Done(Vec::new()));
+                let postings_bytes = neg_filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
+                let planned_ranges =
+                    neg_filter.as_ref().map_or(0, ExcludeFilter::planned_ranges) + dict_ranges;
+                return Ok(PreparedClauses::Done {
+                    hits: Vec::new(),
+                    postings_bytes,
+                    planned_ranges,
+                    kernel_cpu_ns: 0,
+                });
             }
             return Ok(PreparedClauses::Or {
                 column_id,
@@ -1926,6 +2240,7 @@ impl FtsReader {
                 filter: neg_filter,
                 k,
                 floor_eff,
+                dict_ranges,
             });
         }
         // Build must cursors; if any must is missing, the
@@ -1933,8 +2248,19 @@ impl FtsReader {
         let must_cursors = self
             .build_term_cursors(column_id, lists.musts, lists.global_idf)
             .await?;
+        dict_ranges += 1;
         if must_cursors.len() != lists.musts.len() {
-            return Ok(PreparedClauses::Done(Vec::new()));
+            let postings_bytes = term_cursor_bytes(&must_cursors)
+                + neg_filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
+            let planned_ranges = term_cursor_ranges(&must_cursors)
+                + neg_filter.as_ref().map_or(0, ExcludeFilter::planned_ranges)
+                + dict_ranges;
+            return Ok(PreparedClauses::Done {
+                hits: Vec::new(),
+                postings_bytes,
+                planned_ranges,
+                kernel_cpu_ns: 0,
+            });
         }
         if lists.shoulds.is_empty() {
             return Ok(PreparedClauses::Must {
@@ -1943,6 +2269,7 @@ impl FtsReader {
                 filter: neg_filter,
                 k,
                 floor_eff,
+                dict_ranges,
             });
         }
         // Shoulds absent from this superfile contribute nothing;
@@ -1950,6 +2277,7 @@ impl FtsReader {
         let should_cursors = self
             .build_term_cursors(column_id, lists.shoulds, lists.global_idf)
             .await?;
+        dict_ranges += 1;
         if should_cursors.is_empty() {
             return Ok(PreparedClauses::Must {
                 column_id,
@@ -1957,6 +2285,7 @@ impl FtsReader {
                 filter: neg_filter,
                 k,
                 floor_eff,
+                dict_ranges,
             });
         }
         Ok(PreparedClauses::MustShould {
@@ -1966,6 +2295,7 @@ impl FtsReader {
             filter: neg_filter,
             k,
             floor_eff,
+            dict_ranges,
         })
     }
 
@@ -1973,11 +2303,12 @@ impl FtsReader {
     /// cursors it fetched. No I/O, so it can run on the reader pool.
     pub(crate) fn run_prepared(&self, prep: PreparedClauses) -> Result<Vec<(u32, f32)>, FtsError> {
         match prep {
-            PreparedClauses::Done(result) => Ok(result),
+            PreparedClauses::Done { hits, .. } => Ok(hits),
             PreparedClauses::Must {
                 column_id,
                 must_cursors,
                 mut filter,
+                dict_ranges: _,
                 k,
                 floor_eff,
             } => self.run_and_intersect(column_id, must_cursors, k, filter.as_mut(), floor_eff),
@@ -1988,6 +2319,7 @@ impl FtsReader {
                 mut filter,
                 k,
                 floor_eff,
+                dict_ranges: _,
             } => self.run_must_should(
                 column_id,
                 must_cursors,
@@ -2002,6 +2334,7 @@ impl FtsReader {
                 mut filter,
                 k,
                 floor_eff,
+                dict_ranges: _,
             } => self.dispatch_or_algo(column_id, cursors, k, filter.as_mut(), floor_eff),
         }
     }
@@ -2023,24 +2356,31 @@ impl FtsReader {
         column: &str,
         tokens: &[&str],
         mode: BoolMode,
-    ) -> Result<Vec<u32>, FtsError> {
+    ) -> Result<(Vec<u32>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), MatchWork::default()));
         }
         let cursors = self.build_term_cursors(column_id, tokens, None).await?;
-        Ok(match mode {
+        // Tallied before the mode branch: the cursors that DID build cost
+        // their bytes even when a missing AND token empties the result.
+        // +1: the build's dictionary fetch.
+        let mut work = MatchWork::for_cursors(&cursors);
+        work.planned_ranges += 1;
+        let (docs, walk_ns) = timed_section(|| match mode {
             BoolMode::And => {
                 // AND needs every token present; a missing token ⇒ empty
                 // set. Otherwise intersect via the same optimized
                 // block flat-merge the ranked scorer uses.
                 if cursors.len() != tokens.len() {
-                    return Ok(Vec::new());
+                    return Vec::new();
                 }
                 self.collect_and_intersect(column_id, cursors)
             }
             BoolMode::Or => or_merge_unranked(cursors),
-        })
+        });
+        work.kernel_cpu_ns = walk_ns;
+        Ok((docs, work))
     }
 
     /// Unranked token-match **count** — the cardinality
@@ -2054,21 +2394,25 @@ impl FtsReader {
         column: &str,
         tokens: &[&str],
         mode: BoolMode,
-    ) -> Result<u64, FtsError> {
+    ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
-            return Ok(0);
+            return Ok((0, MatchWork::default()));
         }
         let cursors = self.build_term_cursors(column_id, tokens, None).await?;
-        Ok(match mode {
+        let mut work = MatchWork::for_cursors(&cursors);
+        work.planned_ranges += 1;
+        let (n, walk_ns) = timed_section(|| match mode {
             BoolMode::And => {
                 if cursors.len() != tokens.len() {
-                    return Ok(0);
+                    return 0;
                 }
                 self.count_and_intersect(column_id, cursors)
             }
             BoolMode::Or => or_count_unranked(cursors),
-        })
+        });
+        work.kernel_cpu_ns = walk_ns;
+        Ok((n, work))
     }
 
     /// Document frequency for each of `tokens` in `column` — the number
@@ -2085,10 +2429,14 @@ impl FtsReader {
     /// ranges into a minimal set of parallel GETs). This matters on the
     /// global-statistics path, where a superfile is probed for every
     /// scored term of a query at once.
-    pub async fn term_dfs(&self, column: &str, tokens: &[&str]) -> Result<Vec<u64>, FtsError> {
+    pub async fn term_dfs(
+        &self,
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<(Vec<u64>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), MatchWork::default()));
         }
         let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
@@ -2121,19 +2469,35 @@ impl FtsReader {
             }
         }
 
-        // One coalesced fetch for every PFOR header; `df` is its first 4 bytes.
+        // One coalesced fetch for every PFOR header; `df` is its first 4
+        // bytes. Each header is one planned range (pre-coalesce), and its
+        // bytes count as indexed work — the walk read them.
+        // +1: the dictionary fetch that resolved the slots.
+        let mut work = MatchWork {
+            postings_bytes: 0,
+            planned_ranges: 1,
+            kernel_cpu_ns: 0,
+        };
         if !header_ranges.is_empty() {
             let fetched = self.fetch_term_postings(&header_ranges).await?;
+            work.planned_ranges += header_ranges.len() as u64;
             for (fetched_idx, &slot) in pfor_slots.iter().enumerate() {
                 let header = fetched.get(fetched_idx).ok_or_else(|| {
                     FtsError::Read(ReadError::MalformedVersion(
                         "term_dfs: fetched fewer headers than requested".into(),
                     ))
                 })?;
-                dfs[slot] = read_u32_le(&header.as_ref()[0..4]) as u64;
+                work.postings_bytes += header.len() as u64;
+                let header_bytes = header.as_ref();
+                if header_bytes.len() < U32_BYTES {
+                    return Err(FtsError::Read(ReadError::MalformedVersion(
+                        "term_dfs: short postings header".into(),
+                    )));
+                }
+                dfs[slot] = read_u32_le(&header_bytes[0..U32_BYTES]) as u64;
             }
         }
-        Ok(dfs)
+        Ok((dfs, work))
     }
 
     /// Document frequency of a single `token` in `column`. Thin wrapper
@@ -2143,8 +2507,9 @@ impl FtsReader {
     /// `WHERE` predicate's match count *ahead of* running `token_match`,
     /// so a predicate matching a large fraction of the superfile can
     /// fall back to a plain scan instead of a (losing) index pushdown.
-    pub async fn term_df(&self, column: &str, token: &str) -> Result<u64, FtsError> {
-        Ok(self.term_dfs(column, &[token]).await?.pop().unwrap_or(0))
+    pub async fn term_df(&self, column: &str, token: &str) -> Result<(u64, MatchWork), FtsError> {
+        let (mut dfs, work) = self.term_dfs(column, &[token]).await?;
+        Ok((dfs.pop().unwrap_or(0), work))
     }
 
     /// Multi-term OR BM25 search constrained to a doc_id sub-range.
@@ -2323,6 +2688,12 @@ impl FtsReader {
     /// posting lists with high score variance — e.g. very long lists
     /// where most blocks contain mid-relevance docs and the top-k is
     /// dominated by a few outliers.
+    /// Returns `(hits, posting work, on-CPU ns of the scoring walk)` —
+    /// the walk runs inside `prepare_clauses`, so its work and kernel
+    /// time must travel with the result (single-term is the most common
+    /// query shape; leaving it unbracketed would make `kernel_cpu_ns`
+    /// incomparable across clause shapes). The work excludes the
+    /// dictionary fetch — the caller counts it once per build.
     async fn search_single_term_bmw(
         &self,
         column_id: u32,
@@ -2330,7 +2701,7 @@ impl FtsReader {
         k: usize,
         mut filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<(Vec<(u32, f32)>, MatchWork, u64), FtsError> {
         let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
             FtsError::Read(ReadError::MalformedVersion(format!(
@@ -2340,7 +2711,7 @@ impl FtsReader {
         let col_meta = &self.columns[column_id as usize];
         let key = make_key(&col_meta.name, term);
         let Some(packed) = dict.lookup(&key) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), MatchWork::default(), 0));
         };
         let (metadata_offset, postings_length) = match FstValue::unpack(packed) {
             FstValue::Inline { doc_id, tf } => {
@@ -2359,17 +2730,19 @@ impl FtsReader {
                 let idf_t = bm25::idf(self.n_docs as u64, 1);
                 let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
                 // Drop the lone match if a negated term excludes it.
+                // The inline slot read no postings-region bytes; the
+                // work-stats byte count for this path is genuinely zero.
                 if let Some(f) = filter.as_deref_mut()
                     && !f.admits(doc_id)
                 {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), MatchWork::default(), 0));
                 }
                 let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
                 let score = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
                 if score <= floor_eff {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), MatchWork::default(), 0));
                 }
-                return Ok(vec![(doc_id, score)]);
+                return Ok((vec![(doc_id, score)], MatchWork::default(), 0));
             }
             FstValue::Pfor {
                 metadata_offset,
@@ -2392,6 +2765,11 @@ impl FtsReader {
         let postings = term_bytes.as_ref();
         let metadata_offset = 0usize;
 
+        // Everything below is the synchronous scoring walk (no awaits):
+        // bracket it on this thread for the per-query kernel CPU stat.
+        // Gated: an unmetered process must not pay the procfs reads on
+        // the most common query shape.
+        let kernel_start = metering_active().then(thread_cpu_ns).flatten();
         let term_meta = TermMeta::parse(postings, metadata_offset, col_meta.positions)?;
 
         let idf_t = bm25::idf(self.n_docs as u64, term_meta.df);
@@ -2458,7 +2836,18 @@ impl FtsReader {
             }
         }
 
-        Ok(drain_top_k_desc(heap))
+        Ok((
+            drain_top_k_desc(heap),
+            MatchWork {
+                postings_bytes: term_bytes.len() as u64,
+                // A hint-less slot costs a header probe before the body
+                // fetch — two planned ranges instead of one.
+                planned_ranges: 1 + u64::from(postings_length.is_none()),
+                // The walk's ns travel in the tuple's third element.
+                kernel_cpu_ns: 0,
+            },
+            thread_cpu_delta_ns(kernel_start),
+        ))
     }
 
     /// Build one `TermCursor` per term that resolves in the FST.
@@ -2495,6 +2884,7 @@ impl FtsReader {
             },
             Pfor {
                 gidf: Option<f32>,
+                header_probed: bool,
             },
         }
         let mut resolved: Vec<Resolved> = Vec::with_capacity(terms.len());
@@ -2517,7 +2907,13 @@ impl FtsReader {
                         metadata_offset as usize,
                         postings_length_hint.map(|len| len as usize),
                     ));
-                    resolved.push(Resolved::Pfor { gidf });
+                    // A hint-less slot (21-bit length overflow) costs a
+                    // header probe BEFORE the body fetch — two planned
+                    // ranges, recorded on the cursor for the tallies.
+                    resolved.push(Resolved::Pfor {
+                        gidf,
+                        header_probed: postings_length_hint.is_none(),
+                    });
                 }
             }
         }
@@ -2548,13 +2944,17 @@ impl FtsReader {
                         gidf,
                     ));
                 }
-                Resolved::Pfor { gidf } => {
+                Resolved::Pfor {
+                    gidf,
+                    header_probed,
+                } => {
                     let term_bytes = pfor_iter.next().expect("one fetched range per PFOR term");
                     cursors.push(TermCursor::new(
                         term_bytes,
                         self.n_docs as u64,
                         col_meta.positions,
                         gidf,
+                        header_probed,
                     )?);
                 }
             }
@@ -4040,6 +4440,18 @@ impl OrCursorSet {
     pub(crate) fn len(&self) -> usize {
         self.cursors.len()
     }
+
+    /// Posting-list bytes this set's cursors index into — see
+    /// [`PreparedClauses::postings_bytes`]. Counted once per superfile
+    /// even when ranged slices share the set.
+    pub(crate) fn postings_bytes(&self) -> u64 {
+        term_cursor_bytes(&self.cursors)
+    }
+
+    /// Byte-source ranges the set's build requested (one per PFOR term).
+    pub(crate) fn planned_ranges(&self) -> u64 {
+        term_cursor_ranges(&self.cursors)
+    }
 }
 
 /// Top-k min-heap entry `(score, doc_id)`, shared by every search
@@ -4548,6 +4960,18 @@ impl ExcludeFilter {
             cursors,
             last_doc: 0,
         }
+    }
+
+    /// Posting-list bytes the negation cursors index into — see
+    /// [`PreparedClauses::postings_bytes`].
+    fn postings_bytes(&self) -> u64 {
+        term_cursor_bytes(&self.cursors)
+    }
+
+    /// Byte-source ranges the negation cursors' builds requested (one per
+    /// PFOR term) — see [`PreparedClauses::planned_ranges`].
+    fn planned_ranges(&self) -> u64 {
+        term_cursor_ranges(&self.cursors)
     }
 }
 
@@ -5192,6 +5616,10 @@ pub(crate) struct TermCursor {
     /// plain term queries never pay for them in cursor or block-meta
     /// footprint.
     bytes: Bytes,
+    /// True when this term's FST slot carried no postings-length hint,
+    /// so the build probed the 20-byte header before fetching the body
+    /// — two planned byte-source ranges instead of one.
+    header_probed: bool,
 }
 
 impl TermCursor {
@@ -5205,6 +5633,7 @@ impl TermCursor {
         n_docs: u64,
         positional: bool,
         global_idf: Option<f32>,
+        header_probed: bool,
     ) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
@@ -5264,6 +5693,7 @@ impl TermCursor {
             pos: 0,
             inspect_block: 0,
             bytes: term_bytes,
+            header_probed,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -5316,6 +5746,7 @@ impl TermCursor {
             pos: 0,
             inspect_block: 0,
             bytes: Bytes::new(),
+            header_probed: false,
         }
     }
 
@@ -5857,21 +6288,24 @@ mod tests {
         assert_eq!(
             r.token_match("body", &["rust"], BoolMode::Or)
                 .await
-                .expect("single"),
+                .expect("single")
+                .0,
             vec![0, 1]
         );
         // OR = union (rust ∪ java).
         assert_eq!(
             r.token_match("body", &["rust", "java"], BoolMode::Or)
                 .await
-                .expect("or"),
+                .expect("or")
+                .0,
             vec![0, 1, 2]
         );
         // AND = intersection (rust ∩ runtime).
         assert_eq!(
             r.token_match("body", &["rust", "runtime"], BoolMode::And)
                 .await
-                .expect("and"),
+                .expect("and")
+                .0,
             vec![0, 1]
         );
         // AND with an absent token → empty.
@@ -5879,13 +6313,15 @@ mod tests {
             r.token_match("body", &["rust", "zzz"], BoolMode::And)
                 .await
                 .expect("and absent")
+                .0
                 .is_empty()
         );
         // OR ignores an absent token.
         assert_eq!(
             r.token_match("body", &["java", "zzz"], BoolMode::Or)
                 .await
-                .expect("or absent"),
+                .expect("or absent")
+                .0,
             vec![2]
         );
         // Empty token list → empty.
@@ -5893,6 +6329,7 @@ mod tests {
             r.token_match("body", &[], BoolMode::And)
                 .await
                 .expect("empty")
+                .0
                 .is_empty()
         );
     }
@@ -5918,11 +6355,13 @@ mod tests {
                 .token_match("body", tokens, *mode)
                 .await
                 .expect("token_match")
+                .0
                 .len() as u64;
             let count = r
                 .token_match_count("body", tokens, *mode)
                 .await
-                .expect("token_match_count");
+                .expect("token_match_count")
+                .0;
             assert_eq!(count, len, "count vs len for {tokens:?} {mode:?}");
         }
     }
@@ -5968,11 +6407,13 @@ mod tests {
                 .token_match("body", terms, BoolMode::Or)
                 .await
                 .expect("token_match")
+                .0
                 .len() as u64;
             let count = r
                 .token_match_count("body", terms, BoolMode::Or)
                 .await
-                .expect("token_match_count");
+                .expect("token_match_count")
+                .0;
             assert_eq!(
                 count, merge_len,
                 "windowed count vs merge len for {terms:?}"
@@ -5984,7 +6425,8 @@ mod tests {
         assert_eq!(
             r.token_match_count("body", &["alpha"], BoolMode::Or)
                 .await
-                .expect("count"),
+                .expect("count")
+                .0,
             N_DOCS as u64
         );
     }
@@ -6005,7 +6447,8 @@ mod tests {
         let boolean = r
             .token_match("body", &["rust", "java"], BoolMode::Or)
             .await
-            .expect("boolean");
+            .expect("boolean")
+            .0;
         assert_eq!(bm25, boolean, "boolean Or doc set == bm25 doc set");
     }
 
@@ -6578,10 +7021,10 @@ mod tests {
         let r = FtsReader::open(blob, &json).expect("open");
         // common → df 3 (PFOR header read), rust → df 2 (PFOR),
         // uniqzero → df 1 (inline FST value), absent → 0.
-        assert_eq!(r.term_df("body", "common").await.expect("df"), 3);
-        assert_eq!(r.term_df("body", "rust").await.expect("df"), 2);
-        assert_eq!(r.term_df("body", "uniqzero").await.expect("df"), 1);
-        assert_eq!(r.term_df("body", "missing").await.expect("df"), 0);
+        assert_eq!(r.term_df("body", "common").await.expect("df").0, 3);
+        assert_eq!(r.term_df("body", "rust").await.expect("df").0, 2);
+        assert_eq!(r.term_df("body", "uniqzero").await.expect("df").0, 1);
+        assert_eq!(r.term_df("body", "missing").await.expect("df").0, 0);
     }
 
     #[tokio::test]
@@ -6601,11 +7044,11 @@ mod tests {
         // path (which fetches only the PFOR headers, then scatters the
         // results back) would surface as a mismatch here.
         let tokens = ["rust", "missing", "uniqzero", "common", "absent2"];
-        let batched = r.term_dfs("body", &tokens).await.expect("term_dfs");
+        let batched = r.term_dfs("body", &tokens).await.expect("term_dfs").0;
         // Element-wise identical to resolving each token on its own.
         let mut per_term = Vec::with_capacity(tokens.len());
         for t in tokens {
-            per_term.push(r.term_df("body", t).await.expect("term_df"));
+            per_term.push(r.term_df("body", t).await.expect("term_df").0);
         }
         assert_eq!(
             batched, per_term,
@@ -6615,7 +7058,7 @@ mod tests {
         // uniqzero=1 inline, absent tokens=0).
         assert_eq!(batched, vec![2, 0, 1, 3, 0], "planted document frequencies");
         // Empty input short-circuits to empty output (no dict open, no fetch).
-        assert!(r.term_dfs("body", &[]).await.expect("empty").is_empty());
+        assert!(r.term_dfs("body", &[]).await.expect("empty").0.is_empty());
     }
 
     // ---- phrase atoms ----

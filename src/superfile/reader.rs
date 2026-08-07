@@ -53,13 +53,14 @@ use crate::{
         format::{self, footer, kv},
         fts::{
             reader::{
-                self as fts_reader, BoolMode, ClauseLists, FtsReader, OrCursorSet, PreparedClauses,
+                self as fts_reader, BoolMode, ClauseLists, FtsReader, MatchWork, OrCursorSet,
+                PreparedClauses,
             },
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
         vector::{
             layout::VectorLayout,
-            reader::{self as vector_reader, ScanCandidate, ScanOutcome, VectorReader},
+            reader::{self as vector_reader, ProbeTally, ScanCandidate, ScanOutcome, VectorReader},
         },
     },
     supertable::query::provider::tombstone_access_plan,
@@ -475,12 +476,21 @@ impl SuperfileReader {
         &self.parquet_meta
     }
 
-    /// Parquet metadata with offset indexes loaded when available.
+    /// Parquet metadata with the page indexes (column + offset) loaded
+    /// when available.
     ///
-    /// Eager readers return their open-time metadata. Lazy readers fetch only
-    /// the page-index metadata range through their existing byte source; a
-    /// [`OnceCell`] coalesces concurrent first callers and keeps all later
-    /// targeted row reads local.
+    /// Eager readers return their open-time metadata. Lazy readers fetch
+    /// only the page-index metadata range through their existing byte
+    /// source; a [`OnceCell`] coalesces concurrent first callers and keeps
+    /// all later targeted row reads local.
+    ///
+    /// Both indexes load together even though the take path needs only the
+    /// offset index: the SQL scan serves this same parse to DataFusion's
+    /// parquet opener, whose page pruning short-circuits only when the
+    /// column index is present too. An index-complete parse here means the
+    /// opener never fetches index bytes through the metered DataFusion
+    /// store — which would make `sql_page_bytes` depend on how the reader
+    /// happened to be opened (see `SuperfileObjectStore`).
     pub(crate) async fn parquet_metadata_with_page_index(
         &self,
     ) -> Result<Arc<ParquetMetaData>, ReadError> {
@@ -497,7 +507,7 @@ impl SuperfileReader {
                 let mut fetch = LazyMetadataFetch { source };
                 let mut loader =
                     ParquetMetaDataReader::new_with_metadata((*self.parquet_meta).clone())
-                        .with_column_index_policy(PageIndexPolicy::Skip)
+                        .with_column_index_policy(PageIndexPolicy::Optional)
                         .with_offset_index_policy(PageIndexPolicy::Optional);
                 loader
                     .load_page_index(&mut fetch)
@@ -1019,7 +1029,7 @@ impl SuperfileReader {
         column: &str,
         tokens: &[&str],
         mode: BoolMode,
-    ) -> Result<Vec<u32>, ReadError> {
+    ) -> Result<(Vec<u32>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1035,7 +1045,7 @@ impl SuperfileReader {
         column: &str,
         tokens: &[&str],
         mode: BoolMode,
-    ) -> Result<u64, ReadError> {
+    ) -> Result<(u64, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1053,7 +1063,7 @@ impl SuperfileReader {
         terms: &[&str],
         phrases: &[Vec<String>],
         mode: BoolMode,
-    ) -> Result<Vec<u32>, ReadError> {
+    ) -> Result<(Vec<u32>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1068,7 +1078,7 @@ impl SuperfileReader {
         terms: &[&str],
         phrases: &[Vec<String>],
         mode: BoolMode,
-    ) -> Result<u64, ReadError> {
+    ) -> Result<(u64, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1079,7 +1089,7 @@ impl SuperfileReader {
     /// header-only read used to estimate a predicate's match count
     /// before running `token_match`. Delegates to
     /// [`FtsReader::term_df`].
-    pub async fn term_df(&self, column: &str, token: &str) -> Result<u64, ReadError> {
+    pub async fn term_df(&self, column: &str, token: &str) -> Result<(u64, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1090,7 +1100,11 @@ impl SuperfileReader {
     /// (0 for any absent token). Batched sibling of [`Self::term_df`]:
     /// resolves the whole set with one FST parse and one coalesced header
     /// fetch. Delegates to [`FtsReader::term_dfs`].
-    pub async fn term_dfs(&self, column: &str, tokens: &[&str]) -> Result<Vec<u64>, ReadError> {
+    pub async fn term_dfs(
+        &self,
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<(Vec<u64>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1112,7 +1126,12 @@ impl SuperfileReader {
     /// Returns the verified `local_doc_id`s in ascending order. Works
     /// for single-word and multi-word strings alike — the token count
     /// only affects pruning, never the raw-string comparison.
-    pub async fn exact_match(&self, column: &str, value: &str) -> Result<Vec<u32>, ReadError> {
+    /// Returns the verified ids plus the prune pass's posting-walk work.
+    pub async fn exact_match(
+        &self,
+        column: &str,
+        value: &str,
+    ) -> Result<(Vec<u32>, MatchWork), ReadError> {
         // Pass 1 — candidate rows via the index: the term-AND of the
         // string's tokens (a superset of the exact matches). Tokenize
         // with the column's configured tokenizer to match the index.
@@ -1122,15 +1141,15 @@ impl SuperfileReader {
             .and_then(|f| f.column_tokenizer(column).ok())
             .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer));
         let tokens: Vec<String> = tok.tokenize(value).collect();
-        let candidates: Vec<u32> = if tokens.is_empty() {
+        let (candidates, work): (Vec<u32>, MatchWork) = if tokens.is_empty() {
             // No tokens to prune with: every row is a candidate.
-            (0..self.n_docs() as u32).collect()
+            ((0..self.n_docs() as u32).collect(), MatchWork::default())
         } else {
             let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
             self.token_match(column, &refs, BoolMode::And).await?
         };
         if candidates.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), work));
         }
 
         // Pass 2 — verify raw-string equality on the decoded text.
@@ -1153,7 +1172,7 @@ impl SuperfileReader {
                 out.push(doc);
             }
         }
-        Ok(out)
+        Ok((out, work))
     }
 
     /// Pre-tokenized BM25 search over explicit clause lists — the
@@ -1214,22 +1233,25 @@ impl SuperfileReader {
     ///
     /// Returns an empty `Vec` if no indexed term begins with
     /// `prefix` or if `k == 0`.
+    /// Returns the hits plus the expansion's posting + kernel work, so
+    /// a prefix expanding to thousands of terms carries its cost like
+    /// any other query shape.
     pub async fn bm25_search_prefix(
         &self,
         column: &str,
         prefix: &str,
         k: usize,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<(Vec<(u32, f32)>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         if k == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), MatchWork::default()));
         }
         let lowered = prefix.to_ascii_lowercase();
         let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes())?;
         if term_bytes.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), MatchWork::default()));
         }
         // FST keys are valid UTF-8 by construction (AsciiLower
         // tokenizer only emits ASCII bytes); the from_utf8 below
@@ -1238,7 +1260,9 @@ impl SuperfileReader {
             .iter()
             .filter_map(|b| str::from_utf8(b).ok())
             .collect();
-        Ok(fts.search(column, &term_strings, k, BoolMode::Or).await?)
+        Ok(fts
+            .search_with_work(column, &term_strings, k, BoolMode::Or)
+            .await?)
     }
 
     /// Multi-term OR BM25 search restricted to a doc_id sub-range.
@@ -1423,8 +1447,10 @@ impl SuperfileReader {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        self.vector_hits_filtered_async(column, query, k, options, None, None, None, None)
-            .await
+        Ok(self
+            .vector_hits_filtered_async(column, query, k, options, None, None, None, None)
+            .await?
+            .0)
     }
 
     /// As [`Self::vector_hits_async`], but restricts the kNN ranking to
@@ -1433,6 +1459,8 @@ impl SuperfileReader {
     /// shortlist, so the returned top-k is the true k-nearest among
     /// matching rows — pushdown, not post-filter, with no underflow.
     /// `allow == None` is identical to [`Self::vector_hits_async`].
+    /// Returns the hits plus the probe's work tallies for the per-query
+    /// work stats.
     pub async fn vector_hits_filtered_async(
         &self,
         column: &str,
@@ -1443,7 +1471,7 @@ impl SuperfileReader {
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
         budget: Option<Arc<ConnectionMemoryBudget>>,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<(Vec<(u32, f32)>, ProbeTally), ReadError> {
         let filtered = allow.is_some();
         let (nprobe, rerank_mult) = options.resolve(filtered);
         let v = self
@@ -1477,16 +1505,20 @@ impl SuperfileReader {
         clusters: &[u32],
         options: VectorSearchOptions,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        self.vector_search_clusters_filtered(
-            column, query, k, clusters, options, None, None, None, None,
-        )
-        .await
+        Ok(self
+            .vector_search_clusters_filtered(
+                column, query, k, clusters, options, None, None, None, None,
+            )
+            .await?
+            .0)
     }
 
     /// As [`Self::vector_search_clusters`], but restricts the kNN
     /// ranking to the `local_doc_id`s in `allow` (a per-superfile
     /// predicate allow-set), applied inside the coarse shortlist.
     /// `allow == None` is identical to [`Self::vector_search_clusters`].
+    /// Returns the hits plus the probe's work tallies for the per-query
+    /// work stats.
     pub async fn vector_search_clusters_filtered(
         &self,
         column: &str,
@@ -1498,7 +1530,7 @@ impl SuperfileReader {
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
         budget: Option<Arc<ConnectionMemoryBudget>>,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<(Vec<(u32, f32)>, ProbeTally), ReadError> {
         let filtered = allow.is_some();
         let (_, rerank_mult) = options.resolve(filtered);
         let v = self
@@ -1560,7 +1592,8 @@ impl SuperfileReader {
     }
 
     /// Rerank this superfile's share of the globally selected shortlist —
-    /// phase C of the deferred-rerank width sweep.
+    /// phase C of the deferred-rerank width sweep. Returns the hits plus
+    /// the rerank kernel's bracketed on-CPU ns.
     pub(crate) async fn vector_rerank_selected(
         &self,
         column: &str,
@@ -1568,7 +1601,7 @@ impl SuperfileReader {
         k: usize,
         selected: Vec<ScanCandidate>,
         pool: Option<Arc<ThreadPool>>,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<(Vec<(u32, f32)>, u64), ReadError> {
         let v = self
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
@@ -2285,12 +2318,14 @@ mod tests {
         let and = r
             .token_match("title", &["rust", "runtime"], BoolMode::And)
             .await
-            .expect("and");
+            .expect("and")
+            .0;
         assert_eq!(and, vec![0]);
         let or = r
             .token_match("title", &["rust", "runtime"], BoolMode::Or)
             .await
-            .expect("or");
+            .expect("or")
+            .0;
         assert_eq!(or, vec![0, 2]);
     }
 
@@ -2298,8 +2333,8 @@ mod tests {
     async fn term_df_counts_documents() {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open");
-        assert_eq!(r.term_df("title", "rust").await.expect("df"), 2);
-        assert_eq!(r.term_df("title", "absent").await.expect("df"), 0);
+        assert_eq!(r.term_df("title", "rust").await.expect("df").0, 2);
+        assert_eq!(r.term_df("title", "absent").await.expect("df").0, 0);
     }
 
     #[tokio::test]
@@ -2311,10 +2346,11 @@ mod tests {
         let hits = r
             .exact_match("title", "rust async runtime")
             .await
-            .expect("exact_match");
+            .expect("exact_match")
+            .0;
         assert_eq!(hits, vec![0]);
         // No row stores just "rust", so the exact comparison yields none.
-        let none = r.exact_match("title", "rust").await.expect("exact_match");
+        let none = r.exact_match("title", "rust").await.expect("exact_match").0;
         assert!(none.is_empty());
     }
 
@@ -2323,10 +2359,14 @@ mod tests {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open");
         // "rust" is a prefix of "rust" (docs 0,2); "ru" expands to it too.
-        let hits = r
+        let (hits, work) = r
             .bm25_search_prefix("title", "ru", 5)
             .await
             .expect("prefix search");
+        assert!(
+            work.postings_bytes > 0 && work.planned_ranges > 0,
+            "a matching prefix expansion reports its posting work"
+        );
         let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert!(ids.contains(&0));
         assert!(ids.contains(&2));
@@ -2335,6 +2375,7 @@ mod tests {
             r.bm25_search_prefix("title", "zz", 5)
                 .await
                 .expect("prefix")
+                .0
                 .is_empty()
         );
         // k == 0 short-circuits.
@@ -2342,6 +2383,7 @@ mod tests {
             r.bm25_search_prefix("title", "ru", 0)
                 .await
                 .expect("zero k")
+                .0
                 .is_empty()
         );
     }
@@ -2650,7 +2692,8 @@ mod tests {
         let hits = r
             .exact_match("title", "rust javascript")
             .await
-            .expect("exact_match");
+            .expect("exact_match")
+            .0;
         assert!(hits.is_empty());
     }
 

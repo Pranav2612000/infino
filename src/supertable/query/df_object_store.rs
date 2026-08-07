@@ -41,7 +41,10 @@ use object_store::{
     PutPayload, PutResult, Result as OsResult, path::Path as ObjPath,
 };
 
-use crate::superfile::{LazyByteSource, lazy_source::Source};
+use crate::{
+    runtime_metrics::op_stats::{self, OpStatsCollector},
+    superfile::{LazyByteSource, lazy_source::Source},
+};
 
 /// Fixed `last_modified` reported for every registered superfile.
 /// Superfiles are immutable once committed, so a wall-clock timestamp
@@ -56,6 +59,18 @@ const SUPERFILE_LAST_MODIFIED: DateTime<Utc> = DateTime::UNIX_EPOCH;
 /// [`Self::insert_source`] as immutable files are first opened, and reuses it
 /// for every DataFusion scan of that manifest.
 pub(crate) struct SuperfileObjectStore {
+    /// Per-query work collector, captured at construction. On the catalog
+    /// path (`Connection::query_sql`) the provider — and therefore this
+    /// store — is built fresh per query on the caller's thread, so the
+    /// capture is per-query by construction and can never leak across
+    /// queries. The reader-level cached `SessionContext`
+    /// (`sql_session_context`) instead builds its provider under
+    /// `op_stats::suppressed`, so this is `None` there by design — a
+    /// collector riding a cached context would bill later queries into
+    /// an old scope. That cached path serves mutation id-capture
+    /// (`scan_ids_matching`) and the test-only reader `query_sql`,
+    /// neither of which is part of the metered read surface.
+    op_stats: Option<Arc<OpStatsCollector>>,
     /// One byte source per surviving superfile, keyed by the same path
     /// used to build the superfile's `PartitionedFile`.
     sources: Arc<DashMap<ObjPath, Arc<dyn LazyByteSource>>>,
@@ -79,8 +94,16 @@ impl SuperfileObjectStore {
     /// Empty registry filled lazily as a pinned provider prepares files.
     pub(crate) fn new() -> Self {
         Self {
+            op_stats: op_stats::current(),
             sources: Arc::new(DashMap::new()),
         }
+    }
+
+    /// The per-query collector this store captured at construction — the
+    /// provider flushes its predicate-walk work through the same channel
+    /// that meters this scan's page bytes.
+    pub(crate) fn op_stats(&self) -> Option<Arc<OpStatsCollector>> {
+        self.op_stats.clone()
     }
 
     /// Build the store from the superfile byte sources gathered during a
@@ -155,6 +178,14 @@ impl ObjectStore for SuperfileObjectStore {
 
         let range = resolve_range(options.range, size);
         let len = range.end.saturating_sub(range.start);
+        if let Some(stats) = &self.op_stats
+            && len > 0
+        {
+            // Parquet-driven plan reads: page/footer ranges the scan needs,
+            // counted before the byte source decides resident vs fetch.
+            stats.add_sql_page_bytes(len);
+            stats.add_planned_read_ranges(1);
+        }
         let bytes = if len == 0 {
             Bytes::new()
         } else {
