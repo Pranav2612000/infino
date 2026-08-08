@@ -19,7 +19,7 @@ use crate::superfile::{
     builder::VectorConfig,
     format::vec::{METRIC_ID_COSINE, METRIC_ID_L2SQ, METRIC_ID_NEGDOT},
     vector::{
-        builder::derive_sq8_quantizer_from_min_max,
+        builder::derive_quantizer_from_min_max,
         distance::{Metric, Sq8ResidualKernel},
         rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
     },
@@ -576,9 +576,12 @@ fn encode_rows(
                     max[d] = max[d].max(src[d]);
                 }
             }
-            derive_sq8_quantizer_from_min_max(&min, &max)
+            derive_quantizer_from_min_max(&min, &max, SQ8_CODE_MAX)
         }
-        RerankCodec::Fp32 | RerankCodec::Sq16 | RerankCodec::RabitqOnly => {
+        RerankCodec::Fp32
+        | RerankCodec::Sq16
+        | RerankCodec::Sq16Adaptive
+        | RerankCodec::RabitqOnly => {
             return Err(format!(
                 "cell posting encode requires an Sq8 residual-family codec, got {}",
                 codec.name()
@@ -727,6 +730,15 @@ static TRANSCODE_CLAMPED_COMPONENTS: AtomicU64 = AtomicU64::new(0);
 /// Snapshot of [`TRANSCODE_CLAMPED_COMPONENTS`]; callers report deltas.
 pub(crate) fn transcode_clamped_components() -> u64 {
     TRANSCODE_CLAMPED_COMPONENTS.load(AtomicOrdering::Relaxed)
+}
+
+/// Add to the transcode-clamp tally. Used by single-plane codecs whose merge
+/// re-encode lives outside this module (the Sq8 residual transcode above bumps
+/// the counter inline); a no-op for the common zero-clamp row.
+pub(crate) fn note_transcode_clamped_components(n: u64) {
+    if n > 0 {
+        TRANSCODE_CLAMPED_COMPONENTS.fetch_add(n, AtomicOrdering::Relaxed);
+    }
 }
 
 /// True when two per-cluster Sq8 quantizers are bitwise identical.
@@ -926,9 +938,15 @@ pub fn load_encoded_rows_from_blob(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, PoisonError};
 
     use super::*;
+
+    /// Serializes the tests that assert an exact delta on the process-wide
+    /// [`TRANSCODE_CLAMPED_COMPONENTS`] counter. cargo runs tests in parallel,
+    /// so without this each would observe the other's increments in its
+    /// before/after window and see the wrong count.
+    static TRANSCODE_COUNTER_TEST_LOCK: Mutex<()> = Mutex::new(());
     use crate::superfile::{
         builder::VectorConfig,
         vector::{
@@ -1256,6 +1274,9 @@ mod tests {
     /// whose destination covers the source adds nothing.
     #[test]
     fn transcode_counts_components_that_saturate_the_destination_grid() {
+        let _serialize = TRANSCODE_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let dim = 4;
         // Source: a raw-ingest-class data-derived grid decoding [-2.5, 2.5].
         let raw_scale: Arc<[f32]> = vec![5.0 / f32::from(u8::MAX); dim].into();
@@ -1317,6 +1338,48 @@ mod tests {
             transcode_clamped_components() - before,
             0,
             "a covering destination grid never clamps"
+        );
+    }
+
+    /// Parity with the Sq8 tripwire for the new default codec: a Sq16Adaptive
+    /// merge transcode whose destination ruler is narrower than the source
+    /// saturates the out-of-range components and bumps the same process tally,
+    /// so the compaction `BUG` line fires instead of the clamp being silent.
+    /// (The clamp itself goes away once the merge union-sizes the destination
+    /// ruler; until then it must at least be observable, never silent.)
+    #[test]
+    fn sq16_adaptive_transcode_counts_saturated_components() {
+        let _serialize = TRANSCODE_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let dim = 4;
+        // Source ruler decodes [-2.5, 2.5] across the full u16 range.
+        let src_scale: Arc<[f32]> = vec![5.0 / f32::from(u16::MAX); dim].into();
+        let src_offset: Arc<[f32]> = vec![-2.5; dim].into();
+        // Codes decode to [2.5, -2.5, 2.5, ~0.0]: three outside [-1, 1], one fits.
+        let code_vals: [u16; 4] = [u16::MAX, 0, u16::MAX, u16::MAX / 2];
+        let codes: Vec<u8> = code_vals.iter().flat_map(|c| c.to_le_bytes()).collect();
+        let row = EncodedCellRow {
+            stable_id: 0,
+            rerank_codec: RerankCodec::Sq16Adaptive,
+            scale: src_scale,
+            offset: src_offset,
+            codes,
+            residuals: Vec::new(),
+            norm_sq: None,
+        };
+        // Destination ruler covers only [-1, 1] (single u16 plane, no residual).
+        let dst_scale = vec![2.0 / f32::from(u16::MAX); dim];
+        let dst_offset = vec![-1.0f32; dim];
+        let mut out = vec![0u8; dim * 2];
+        let ops = RerankCodec::Sq16Adaptive.ops().expect("Sq16Adaptive ops");
+        let before = transcode_clamped_components();
+        ops.materialize_row_into_cluster_quant(&row, &dst_scale, &dst_offset, dim, &mut out, false)
+            .expect("transcode");
+        assert_eq!(
+            transcode_clamped_components() - before,
+            3,
+            "the three components outside the destination ruler must be counted, not silently clamped"
         );
     }
 }
