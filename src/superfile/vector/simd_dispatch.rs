@@ -145,7 +145,14 @@ pub fn avx2_enabled() -> bool {
         }
         #[cfg(target_arch = "x86_64")]
         {
+            // FMA is detected alongside AVX2: several kernels behind this
+            // gate compile with `target_feature(enable = "avx2,fma")`
+            // (`sq16_cross_avx2`, `sq8_encode_row_avx2`), and calling one
+            // on silicon without FMA is UB. Every known AVX2 part ships
+            // FMA, but detection is one CPUID read — cheap to be correct
+            // about, same doctrine as the AVX-512 gate above.
             std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma")
         }
         #[cfg(not(target_arch = "x86_64"))]
         {

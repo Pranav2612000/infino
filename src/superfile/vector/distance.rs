@@ -1156,29 +1156,8 @@ impl Sq16Kernel {
     #[inline]
     pub fn distance_with_norm(&self, code_bytes: &[u8], norm: Option<f32>) -> f32 {
         debug_assert_eq!(code_bytes.len(), self.dim * 2);
-        let mut acc = f32x8::ZERO;
-        let mut i = 0;
-        while i + F32X8_LANES <= self.dim {
-            let qp: [f32; F32X8_LANES] = self.q_prime[i..i + F32X8_LANES]
-                .try_into()
-                .expect("q_prime[i..i+8] len 8");
-            let mut code = [0f32; F32X8_LANES];
-            for (j, lane) in code.iter_mut().enumerate() {
-                let b = 2 * (i + j);
-                *lane = u16::from_le_bytes([code_bytes[b], code_bytes[b + 1]]) as f32;
-            }
-            acc += f32x8::from(qp) * f32x8::from(code);
-            i += F32X8_LANES;
-        }
-        let mut cross = acc.reduce_add();
-        while i < self.dim {
-            let b = 2 * i;
-            let code = u16::from_le_bytes([code_bytes[b], code_bytes[b + 1]]) as f32;
-            cross += self.q_prime[i] * code;
-            i += 1;
-        }
         // dot(query, x_decoded) = Σ q_prime[d]·code[d] + q_dot_offset.
-        let dot = cross + self.q_dot_offset;
+        let dot = sq16_cross(&self.q_prime, code_bytes) + self.q_dot_offset;
         match self.metric {
             Metric::Cosine => {
                 let x_norm = norm
@@ -1196,6 +1175,131 @@ impl Sq16Kernel {
                 self.q_norm_sq - L2_CROSS_TERM_COEFF * dot + x_norm_sq
             }
         }
+    }
+}
+
+/// `Σ_d q_prime[d] · code_u16[d]` over `dim` little-endian `u16` codes —
+/// the [`Sq16Kernel`] cross term and the whole of its per-candidate
+/// arithmetic. Tier-dispatched: AVX-512F (16 codes/iteration), AVX2+FMA
+/// (8), and a safe `wide` fallback. The rerank phase at 1M measured this
+/// conversion as 92% of warm query wall when it ran through per-byte
+/// slice indexing; the intrinsic tiers convert with `cvtepu16` directly
+/// from the unaligned code bytes. Tiers may differ in the final f32 by
+/// add-order/FMA rounding only (same contract as
+/// [`BitQuantizer::estimate_dot_rotated_with_total`]).
+#[inline]
+fn sq16_cross(q_prime: &[f32], code_bytes: &[u8]) -> f32 {
+    // Release-enforced: the intrinsic tiers below read `2 * dim` code
+    // bytes through unaligned pointer loads, so a short slice would be
+    // an out-of-bounds read, not a panic. One predictable branch per
+    // candidate is free next to the ~dim FMAs that follow.
+    assert_eq!(code_bytes.len(), q_prime.len() * 2);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx512_enabled() {
+            // SAFETY: gated on `avx512_enabled()` (avx512f+bw+dq+vl);
+            // the kernel uses AVX-512F conversions/FMA plus AVX2 loads,
+            // all implied by that gate. Bounds: the loop reads
+            // `16 * 2` code bytes and 16 `q_prime` floats per iteration
+            // strictly below `dim - dim % 16`, and the scalar tail
+            // covers the remainder — no out-of-bounds access.
+            return unsafe { sq16_cross_avx512(q_prime, code_bytes) };
+        }
+        if avx2_enabled() {
+            // SAFETY: gated on `avx2_enabled()`, which detects both
+            // `avx2` and `fma` — the two features the function enables.
+            // Bounds as above with an 8-code stride.
+            return unsafe { sq16_cross_avx2(q_prime, code_bytes) };
+        }
+    }
+    sq16_cross_wide(q_prime, code_bytes)
+}
+
+/// Safe `wide` tier of [`sq16_cross`]: fixed-size 16-byte chunks so the
+/// u16 conversions compile without per-byte bounds checks.
+fn sq16_cross_wide(q_prime: &[f32], code_bytes: &[u8]) -> f32 {
+    let mut acc = f32x8::ZERO;
+    let mut q_chunks = q_prime.chunks_exact(F32X8_LANES);
+    let mut c_chunks = code_bytes.chunks_exact(F32X8_LANES * 2);
+    for (qp, cb) in (&mut q_chunks).zip(&mut c_chunks) {
+        let qp: [f32; F32X8_LANES] = qp.try_into().expect("len-8 q_prime chunk");
+        let cb: [u8; F32X8_LANES * 2] = cb.try_into().expect("len-16 code chunk");
+        let mut lanes = [0f32; F32X8_LANES];
+        for (j, lane) in lanes.iter_mut().enumerate() {
+            *lane = f32::from(u16::from_le_bytes([cb[2 * j], cb[2 * j + 1]]));
+        }
+        acc = f32x8::from(qp).mul_add(f32x8::from(lanes), acc);
+    }
+    let mut cross = acc.reduce_add();
+    for (qp, cb) in q_chunks
+        .remainder()
+        .iter()
+        .zip(c_chunks.remainder().chunks_exact(2))
+    {
+        cross += qp * f32::from(u16::from_le_bytes([cb[0], cb[1]]));
+    }
+    cross
+}
+
+/// AVX2+FMA tier of [`sq16_cross`]: 8 u16 codes load as one 128-bit
+/// vector, widen (`cvtepu16_epi32`), convert (`cvtepi32_ps`), and fold
+/// into a single FMA accumulator; scalar tail for `dim % 8`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sq16_cross_avx2(q_prime: &[f32], code_bytes: &[u8]) -> f32 {
+    let dim = q_prime.len();
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+    // SAFETY (callee): unaligned loads only, within `i + 8 <= dim`
+    // (16 code bytes, 8 floats per iteration).
+    unsafe {
+        while i + 8 <= dim {
+            let raw = _mm_loadu_si128(code_bytes.as_ptr().add(2 * i) as *const __m128i);
+            let vals = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(raw));
+            let q = _mm256_loadu_ps(q_prime.as_ptr().add(i));
+            acc = _mm256_fmadd_ps(q, vals, acc);
+            i += 8;
+        }
+        let hi = _mm256_extractf128_ps(acc, 1);
+        let lo = _mm256_castps256_ps128(acc);
+        let sum4 = _mm_add_ps(lo, hi);
+        let sum2 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+        let sum1 = _mm_add_ss(sum2, _mm_shuffle_ps(sum2, sum2, 1));
+        let mut cross = _mm_cvtss_f32(sum1);
+        while i < dim {
+            let b = 2 * i;
+            cross += q_prime[i] * f32::from(u16::from_le_bytes([code_bytes[b], code_bytes[b + 1]]));
+            i += 1;
+        }
+        cross
+    }
+}
+
+/// AVX-512F tier of [`sq16_cross`]: 16 u16 codes per iteration
+/// (256-bit load → 512-bit widen/convert → one FMA accumulator).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn sq16_cross_avx512(q_prime: &[f32], code_bytes: &[u8]) -> f32 {
+    let dim = q_prime.len();
+    let mut acc = _mm512_setzero_ps();
+    let mut i = 0;
+    // SAFETY (callee): unaligned loads only, within `i + 16 <= dim`
+    // (32 code bytes, 16 floats per iteration).
+    unsafe {
+        while i + 16 <= dim {
+            let raw = _mm256_loadu_si256(code_bytes.as_ptr().add(2 * i) as *const __m256i);
+            let vals = _mm512_cvtepi32_ps(_mm512_cvtepu16_epi32(raw));
+            let q = _mm512_loadu_ps(q_prime.as_ptr().add(i));
+            acc = _mm512_fmadd_ps(q, vals, acc);
+            i += 16;
+        }
+        let mut cross = _mm512_reduce_add_ps(acc);
+        while i < dim {
+            let b = 2 * i;
+            cross += q_prime[i] * f32::from(u16::from_le_bytes([code_bytes[b], code_bytes[b + 1]]));
+            i += 1;
+        }
+        cross
     }
 }
 
@@ -2796,6 +2900,61 @@ mod tests {
     /// same raw-dot cosine (`1 − q·x`) the [`distance`] dispatch uses,
     /// so this is an apples-to-apples quantization-error bound. Sweeps a
     /// SIMD-aligned dim, a tail dim, and a production-shaped dim.
+    /// Every [`sq16_cross`] tier this host supports agrees with the safe
+    /// `wide` tier and with an f64 scalar reference, to f32
+    /// add-order/FMA tolerance — the cross-tier contract the 1-bit
+    /// estimator documents. Sweeps SIMD-aligned dims, tail dims, and the
+    /// production 768.
+    #[test]
+    fn sq16_cross_tiers_agree() {
+        for &dim in &[8usize, 13, 100, 384, 768, 771] {
+            let q_prime: Vec<f32> = (0..dim)
+                .map(|i| ((i as f32) * 0.013 - 0.2).sin() * 0.001)
+                .collect();
+            let codes: Vec<u8> = (0..dim)
+                .flat_map(|i| (((i * 2_654_435_761) % 65_536) as u16).to_le_bytes())
+                .collect();
+            let exact: f64 = (0..dim)
+                .map(|i| {
+                    f64::from(q_prime[i])
+                        * f64::from(u16::from_le_bytes([codes[2 * i], codes[2 * i + 1]]))
+                })
+                .sum();
+            let abs_sum: f64 = (0..dim)
+                .map(|i| {
+                    (f64::from(q_prime[i])
+                        * f64::from(u16::from_le_bytes([codes[2 * i], codes[2 * i + 1]])))
+                    .abs()
+                })
+                .sum();
+            let tol = (abs_sum * 1e-5 + 1e-3) as f32;
+            let reference = sq16_cross_wide(&q_prime, &codes);
+            assert!(
+                ((f64::from(reference) - exact).abs() as f32) <= tol,
+                "dim {dim}: wide {reference} vs exact {exact}"
+            );
+            #[cfg(target_arch = "x86_64")]
+            {
+                if avx2_enabled() {
+                    // SAFETY: gated on runtime AVX2 detection.
+                    let got = unsafe { sq16_cross_avx2(&q_prime, &codes) };
+                    assert!(
+                        (got - reference).abs() <= tol,
+                        "dim {dim}: avx2 {got} vs wide {reference}"
+                    );
+                }
+                if avx512_enabled() {
+                    // SAFETY: gated on runtime AVX-512 detection.
+                    let got = unsafe { sq16_cross_avx512(&q_prime, &codes) };
+                    assert!(
+                        (got - reference).abs() <= tol,
+                        "dim {dim}: avx512 {got} vs wide {reference}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn sq16_round_trip_within_16bit_tolerance_of_fp32() {
         fn normalize(v: &mut [f32]) {
