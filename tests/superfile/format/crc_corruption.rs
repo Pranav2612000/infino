@@ -48,8 +48,8 @@ const CRC_TEST_SECONDARY_AXIS_OFFSET: usize = 3;
 const CORRUPTION_FLIP_MASK: u8 = 0xFF;
 
 /// Positional variant of the corruptable superfile: same corpus, the
-/// FTS column records token positions, so the blob is v2 and carries a
-/// CRC-protected positions region.
+/// FTS column records token positions, so the blob is v3 and carries a
+/// CRC-protected positions region (plus the position sub-index).
 fn build_corruptable_positional_superfile() -> Vec<u8> {
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -308,7 +308,7 @@ fn corruption_at_random_interior_positions_rejected() {
 
 #[test]
 fn corrupt_fts_positions_region_rejected() {
-    // v2 blob: the positions-region offset lives at header bytes
+    // v3 blob: the positions-region offset lives at header bytes
     // [48..56] (relative to the blob). Flip a byte inside the region
     // body — the multi-doc terms guarantee it is non-empty.
     let bytes = build_corruptable_positional_superfile();
@@ -318,7 +318,10 @@ fn corrupt_fts_positions_region_rejected() {
             .try_into()
             .expect("version bytes"),
     );
-    assert_eq!(version, 2, "positional superfile must embed a v2 FTS blob");
+    assert_eq!(
+        version, 3,
+        "positional superfile must embed a v3 FTS blob (positions sub-index)"
+    );
     let positions_off_rel = u64::from_le_bytes(
         bytes[fts_off + 48..fts_off + 56]
             .try_into()
@@ -339,10 +342,47 @@ fn corrupt_fts_positions_region_rejected() {
 
 #[test]
 fn uncorrupted_positional_superfile_opens() {
-    // Sanity twin of the corruption test: the same v2 bytes open
+    // Sanity twin of the corruption test: the same v3 bytes open
     // cleanly when untouched.
     let bytes = build_corruptable_positional_superfile();
-    SuperfileReader::open(Bytes::from(bytes)).expect("clean v2 superfile opens");
+    SuperfileReader::open(Bytes::from(bytes)).expect("clean v3 superfile opens");
+}
+
+#[test]
+fn corrupt_fts_position_subindex_rejected() {
+    // The v3 position run-offset sub-index is not a new CRC region — it
+    // rides inside each term's postings region, which is already
+    // CRC-protected. This pins that the new bytes are covered: land a flip
+    // squarely inside the first term's sub-index and confirm the reader
+    // rejects it at open.
+    //
+    // A v3 positional term's region is `[meta][skip table][sub-index]
+    // [blocks]`. The postings region holds only non-inline terms (inline
+    // df=1 terms live in the FST value), and the fixture's FTS column is
+    // positional, so its first postings term is a positional term whose
+    // sub-index begins right after its skip table.
+    let bytes = build_corruptable_positional_superfile();
+    let (fts_off, _) = locate_fts_blob_only(&bytes);
+    // postings_offset (relative to the blob) at FTS header bytes [+32..+40].
+    let postings_offset_rel = u64::from_le_bytes(
+        bytes[fts_off + 32..fts_off + 40]
+            .try_into()
+            .expect("postings offset"),
+    ) as usize;
+    let term0 = fts_off + postings_offset_rel;
+    // Positional term header is 32 bytes; `num_blocks` is the u32 at its
+    // offset 16; each skip entry is 16 bytes. The sub-index starts right
+    // after the skip table.
+    const POSITIONAL_META: usize = 32;
+    const SKIP_ENTRY: usize = 16;
+    let num_blocks = u32::from_le_bytes(
+        bytes[term0 + 16..term0 + 20]
+            .try_into()
+            .expect("num_blocks"),
+    ) as usize;
+    assert!(num_blocks >= 1, "first postings term must have ≥1 block");
+    let subindex_start = term0 + POSITIONAL_META + num_blocks * SKIP_ENTRY;
+    assert_corruption_rejected(bytes, subindex_start + 1, "fts/position sub-index");
 }
 
 /// FTS blob range only (the positional fixture has no vector blob, so
