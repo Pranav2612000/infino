@@ -288,6 +288,25 @@ pub(super) const OR_WINDOW: u32 = 4096;
 /// Number of 64-bit words in the window presence bitset.
 pub(super) const OR_WINDOW_WORDS: usize = (OR_WINDOW as usize).div_ceil(64);
 
+/// Dominance threshold for the df-anchored union count. When one term's
+/// document frequency is at least this multiple of *all the other terms'
+/// dfs combined*, a disjunction count is cheaper computed as
+/// `df(dominant) + |others \ dominant|` — the dominant term's df is read
+/// from its header (no decode) and its skip table is traversed once to
+/// membership-test the rarer docs — than by walking every posting of
+/// every term.
+///
+/// The anchored path does one skip-probe per doc in the *others* union,
+/// and a skip-probe costs several times what the windowed walk's linear
+/// `next()` does. So it only pays when the dominant list — the postings
+/// the anchor avoids decoding — is larger than the others' combined df by
+/// more than that per-probe penalty. Measurement puts the crossover
+/// between ~6× (where the probe cost still loses) and ~130× (a clear
+/// win); this threshold sits above the loss region so only a decisively
+/// dominant term takes the anchored path. Balanced unions keep the
+/// windowed bitset, which is already faster when no term dominates.
+pub(super) const OR_COUNT_ANCHOR_DOMINANCE: u64 = 8;
+
 /// Multi-term OR dispatch floor. A 2-term OR is already sub-millisecond
 /// on MaxScore, so the window's per-window bookkeeping isn't worth it
 /// below this many terms. `pub(crate)`: the supertable fan-out reuses
@@ -1505,6 +1524,12 @@ pub(super) fn or_merge_unranked(cursors: Vec<TermCursor>) -> Vec<u32> {
 /// drops scoring and the top-k heap, since a count needs neither order
 /// nor scores. No doc-id list is materialized.
 pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
+    // Fast path: when one term's list dwarfs the rest, count it as
+    // `df(dominant) + |others \ dominant|` instead of walking the
+    // dominant term's whole posting list. See `or_count_anchored`.
+    if let Some(anchor) = dominant_anchor_index(&cursors) {
+        return or_count_anchored(cursors, anchor);
+    }
     let mut present = [0u64; OR_WINDOW_WORDS];
     let mut n = 0u64;
     loop {
@@ -1541,6 +1566,79 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
         for word in present.iter_mut() {
             n += word.count_ones() as u64;
             *word = 0;
+        }
+    }
+    n
+}
+
+/// Pick the cursor whose df dominates the union, or `None` if no term is
+/// dominant enough for the anchored count to pay off. Dominant means the
+/// largest df is at least [`OR_COUNT_ANCHOR_DOMINANCE`]× the sum of all
+/// the other dfs — so the dominant list is longer than everything else
+/// combined by a wide margin, exactly when replacing its full walk with a
+/// df read + skip-probe wins. Requires ≥ 2 cursors (a single cursor's
+/// count is just its df, and the windowed walk handles it trivially).
+fn dominant_anchor_index(cursors: &[TermCursor]) -> Option<usize> {
+    dominant_anchor_of_dfs(cursors.iter().map(|c| c.df))
+}
+
+/// The routing decision behind [`dominant_anchor_index`], over raw dfs so
+/// the boundary behaviour is unit-testable without building cursors.
+/// Returns the index of the term whose df is at least
+/// [`OR_COUNT_ANCHOR_DOMINANCE`]× the sum of all the others' (a `>=`
+/// boundary — exactly `N×` still routes to the anchor), or `None` when no
+/// term dominates or there are fewer than two terms.
+fn dominant_anchor_of_dfs(dfs: impl IntoIterator<Item = u64>) -> Option<usize> {
+    let dfs: Vec<u64> = dfs.into_iter().collect();
+    if dfs.len() < 2 {
+        return None;
+    }
+    let (max_idx, &max_df) = dfs.iter().enumerate().max_by_key(|&(_, df)| *df)?;
+    let others_df: u64 = dfs
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != max_idx)
+        .map(|(_, df)| *df)
+        .sum();
+    // `others_df == 0` (every other term inline/df-1-summing-to-0 is
+    // impossible, but guard anyway) trivially dominates.
+    match max_df >= others_df.saturating_mul(OR_COUNT_ANCHOR_DOMINANCE) {
+        true => Some(max_idx),
+        false => None,
+    }
+}
+
+/// Disjunction cardinality anchored on a dominant term. The union size is
+/// `df(anchor) + |(the other cursors' union) \ anchor|`: every doc in the
+/// anchor is counted once by its df (no decode), and each doc in the
+/// rarer cursors' union is added once iff the anchor does not already
+/// contain it. The anchor is advanced monotonically by `skip_to` as the
+/// others' merge frontier ascends, so its skip table is traversed once
+/// rather than its whole posting list decoded.
+fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
+    let mut anchor = cursors.swap_remove(anchor_idx);
+    let mut n = anchor.df;
+    // Frontier merge over the remaining (rarer) cursors: smallest current
+    // doc, membership-test the anchor, then advance every other cursor
+    // sitting on that doc so each distinct doc is visited once.
+    loop {
+        let mut min_doc = u32::MAX;
+        for c in &cursors {
+            if !c.is_exhausted() {
+                min_doc = min_doc.min(c.current_doc_id());
+            }
+        }
+        if min_doc == u32::MAX {
+            break;
+        }
+        anchor.skip_to(min_doc);
+        if anchor.is_exhausted() || anchor.current_doc_id() != min_doc {
+            n += 1;
+        }
+        for c in cursors.iter_mut() {
+            if !c.is_exhausted() && c.current_doc_id() == min_doc {
+                c.next();
+            }
         }
     }
     n
@@ -2025,6 +2123,31 @@ mod tests {
         assert_eq!(read_u32_le(&b32), 0x1234_5678);
         let b64 = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         assert_eq!(read_u64_le(&b64), 1);
+    }
+
+    #[test]
+    fn dominant_anchor_routes_at_the_dominance_boundary() {
+        // The union count anchors on a term only when its df is at least
+        // OR_COUNT_ANCHOR_DOMINANCE× the others' combined df. Pin the
+        // routing at the boundary (values chosen against the 8× default).
+        let k = OR_COUNT_ANCHOR_DOMINANCE;
+        // Exactly N× the rest → dominates (the boundary is inclusive).
+        assert_eq!(dominant_anchor_of_dfs([100 * k, 100]), Some(0));
+        // One below the boundary → no anchor, fall back to windowed.
+        assert_eq!(dominant_anchor_of_dfs([100 * k - 1, 100]), None);
+        // The anchor is the max-df term wherever it sits.
+        assert_eq!(dominant_anchor_of_dfs([100, 100 * k]), Some(1));
+        // Single term → no anchor (its count is just its df).
+        assert_eq!(dominant_anchor_of_dfs([100 * k]), None);
+        // Two-way tie → neither dominates.
+        assert_eq!(dominant_anchor_of_dfs([500, 500]), None);
+        // Dominance is measured against the *sum* of the others, not the
+        // largest single other: 8×(100+100)=1600 > 1500, so no anchor.
+        assert_eq!(dominant_anchor_of_dfs([1500, 100, 100]), None);
+        // …and just clears when the sum is small enough.
+        assert_eq!(dominant_anchor_of_dfs([100 * k, 60, 40]), Some(0));
+        // Empty → no anchor.
+        assert_eq!(dominant_anchor_of_dfs([0u64; 0]), None);
     }
 
     #[test]
