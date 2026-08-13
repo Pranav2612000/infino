@@ -58,7 +58,7 @@ use super::{
 };
 use crate::{
     config::{Config, DrainConsolidate, StorageBackend, StorageColdFetchMode, ThreadCount},
-    memory::{ConnectionMemoryBudget, Reservation},
+    memory::ConnectionMemoryBudget,
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
         StorageProvider,
@@ -87,20 +87,11 @@ use crate::{
 pub(crate) struct GappedPlacementIndex {
     ids: Vec<i128>,
     locals: Vec<u32>,
-    /// Held only for its `Drop`: releases the reserved bytes back to the
-    /// connection budget when this index is evicted. `None` under a
-    /// measure-only budget or when the reservation was declined.
-    #[allow(dead_code)]
-    reservation: Option<Reservation>,
 }
 
 impl GappedPlacementIndex {
-    pub(crate) fn new(ids: Vec<i128>, locals: Vec<u32>, reservation: Option<Reservation>) -> Self {
-        Self {
-            ids,
-            locals,
-            reservation,
-        }
+    pub(crate) fn new(ids: Vec<i128>, locals: Vec<u32>) -> Self {
+        Self { ids, locals }
     }
 
     /// The local row for `id` via binary search, or `None` if this superfile
