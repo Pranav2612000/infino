@@ -47,6 +47,7 @@ use crate::superfile::{
         dict::{DictReader, make_key},
         fst_value::FstValue,
         positions::decode_run,
+        posting::{self, BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
         tokenize::{Tokenizer, tokenizer_for_name},
     },
     lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
@@ -307,6 +308,17 @@ pub(super) const OR_WINDOW_WORDS: usize = (OR_WINDOW as usize).div_ceil(64);
 /// windowed bitset, which is already faster when no term dominates.
 pub(super) const OR_COUNT_ANCHOR_DOMINANCE: u64 = 8;
 
+/// Density gate for the full-bitset union count. When the terms' combined
+/// postings reach `1/N` of the doc-id space, OR them all into one
+/// doc-space bitset and popcount, instead of the per-window walk — a dense
+/// union (several common terms, e.g. a 3-4 word title) touches most of the
+/// corpus, so the bitset streams the doc ids into memory with no per-doc
+/// window bookkeeping. Below the gate the union is sparse and the windowed
+/// bitset — whose state stays L1-resident and needs no full-corpus alloc +
+/// popcount — is cheaper. Expressed as the divisor `N`: bitset when
+/// `total_df >= max_doc / N`.
+pub(super) const OR_COUNT_BITSET_DENSITY_DIVISOR: u64 = 16;
+
 /// Multi-term OR dispatch floor. A 2-term OR is already sub-millisecond
 /// on MaxScore, so the window's per-window bookkeeping isn't worth it
 /// below this many terms. `pub(crate)`: the supertable fan-out reuses
@@ -491,6 +503,10 @@ pub struct FtsReader {
     /// `< POSITION_SUBINDEX_STRIDE` runs. `V1`/`V2` blobs lack it and take
     /// the block-start skip-walk fallback.
     pub(super) has_position_subindex: bool,
+    /// True iff the blob is `VERSION_V4` — some posting blocks may be
+    /// bitset-encoded, so the unranked count kernels prefer membership
+    /// bit-tests (no decode) over decoding a common term's blocks.
+    pub(super) has_bitset_blocks: bool,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
 }
@@ -546,18 +562,22 @@ impl FtsReader {
         if version != format::fts::VERSION_V1_LEGACY
             && version != format::fts::VERSION_V2
             && version != format::fts::VERSION_V3
+            && version != format::fts::VERSION_V4
         {
             return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                 "fts section version {version}"
             ))));
         }
         // The FST directory starts right after whichever header
-        // applies; a v2/v3 header's extension bytes are already in the
+        // applies; a v2/v3/v4 header's extension bytes are already in the
         // fetched span (and in the overlay below), so
-        // `open_with_source` re-reads them without another GET. (v3 shares
+        // `open_with_source` re-reads them without another GET. (v3/v4 share
         // v2's header size.)
         let header_size = match version {
-            v if v == format::fts::VERSION_V2 || v == format::fts::VERSION_V3 => {
+            v if v == format::fts::VERSION_V2
+                || v == format::fts::VERSION_V3
+                || v == format::fts::VERSION_V4 =>
+            {
                 format::fts::HEADER_SIZE_V2
             }
             _ => FTS_HEADER_SIZE,
@@ -637,19 +657,24 @@ impl FtsReader {
         // the positions-region offset at [48..56] and a positions
         // region between the postings and the doc-lengths directory.
         let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
-        // v3 shares v2's header and region layout; it additionally carries
-        // a per-term position sub-index (handled in the phrase decode).
+        // v3/v4 share v2's header and region layout; v3+ additionally
+        // carries a per-term position sub-index (handled in the phrase
+        // decode), and v4 may store dense blocks in the bitset encoding
+        // (self-describing per block, handled in the codec).
         let positional_blob = match version {
             v if v == format::fts::VERSION_V1_LEGACY => false,
             v if v == format::fts::VERSION_V2 => true,
             v if v == format::fts::VERSION_V3 => true,
+            v if v == format::fts::VERSION_V4 => true,
             _ => {
                 return Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
                     "fts section version {version}"
                 ))));
             }
         };
-        let has_position_subindex = version == format::fts::VERSION_V3;
+        let has_position_subindex =
+            version == format::fts::VERSION_V3 || version == format::fts::VERSION_V4;
+        let has_bitset_blocks = version == format::fts::VERSION_V4;
         let header_size = match positional_blob {
             true => format::fts::HEADER_SIZE_V2,
             false => FTS_HEADER_SIZE,
@@ -909,6 +934,7 @@ impl FtsReader {
             postings_range,
             positions_range,
             has_position_subindex,
+            has_bitset_blocks,
             columns,
             column_id_by_name,
         })
@@ -1124,7 +1150,7 @@ impl FtsReader {
         let mut out: Vec<Option<AnyCursor>> = Vec::with_capacity(terms.len() + phrases.len());
         for term in terms {
             let mut cursors = self
-                .build_term_cursors(column_id, &[term], global_idf)
+                .build_term_cursors(column_id, &[term], global_idf, false)
                 .await?;
             dict_ranges += 1;
             out.push(cursors.pop().map(AnyCursor::Term));
@@ -1136,7 +1162,7 @@ impl FtsReader {
             // per-member rescale ratio cancels out of the phrase's tf/length
             // bound. Build members with the same `global_idf` as bare terms.
             let cursors = self
-                .build_term_cursors(column_id, &member_refs, global_idf)
+                .build_term_cursors(column_id, &member_refs, global_idf, false)
                 .await?;
             dict_ranges += 1;
             if cursors.len() != member_refs.len() {
@@ -1318,7 +1344,8 @@ impl FtsReader {
                     };
                     let mut pos_at = 0usize;
 
-                    let mut cursor = TermCursor::new(term_bytes, n_docs, positional, None, false)?;
+                    let mut cursor =
+                        TermCursor::new(term_bytes, n_docs, positional, None, false, false)?;
                     while !cursor.is_exhausted() {
                         while cursor.pos < cursor.block_n {
                             let doc_id = cursor.block_doc_ids[cursor.pos];
@@ -1555,6 +1582,20 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
     if let Some(anchor) = dominant_anchor_index(&cursors) {
         return or_count_anchored(cursors, anchor);
     }
+    // Dense union (no dominant term, but the terms together cover a large
+    // fraction of the corpus — e.g. a 3-4 common-word title): OR all doc
+    // ids into one doc-space bitset and popcount. Avoids the per-window
+    // bookkeeping the walk below pays per doc.
+    let total_df: u64 = cursors.iter().map(|c| c.df).sum();
+    let max_doc = cursors
+        .iter()
+        .filter_map(|c| c.blocks.last())
+        .map(|b| b.last_doc_id)
+        .max()
+        .unwrap_or(0);
+    if total_df.saturating_mul(OR_COUNT_BITSET_DENSITY_DIVISOR) >= u64::from(max_doc) {
+        return or_count_bitset(cursors, max_doc);
+    }
     let mut present = [0u64; OR_WINDOW_WORDS];
     let mut n = 0u64;
     loop {
@@ -1594,6 +1635,67 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
         }
     }
     n
+}
+
+/// Disjunction cardinality via a full doc-space bitset: OR every term's
+/// doc ids into one bitset, then popcount. Iterates blocks at the byte
+/// level so a **bitset-encoded block** (`ENCODING_BITSET`, dense — a common
+/// term) is merged by a word-aligned `union[w] |= block[w]` with **no
+/// decode**; a PACKED block is decoded doc-ids-only (no tf) and scattered.
+/// Overlap between terms is deduplicated for free by the OR. Called only
+/// for dense unions (see the gate in [`or_count_unranked`]); the
+/// full-corpus alloc + popcount would dominate on a sparse one.
+fn or_count_bitset(cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
+    let words = max_doc as usize / 64 + 1;
+    let mut union = vec![0u64; words];
+    let mut scratch = [0u32; BLOCK_LEN];
+    for c in &cursors {
+        or_cursor_into_bitset(&mut union, c, &mut scratch);
+    }
+    union.iter().map(|w| w.count_ones() as u64).sum()
+}
+
+/// OR one cursor's doc presence into `dest` (a doc-space bitset spanning at
+/// least the cursor's largest doc id), reading blocks at the byte level: a
+/// **BITSET** block is word-copied at its aligned base word — no expansion to
+/// doc ids; a **PACKED** block is decoded doc-ids-only (no tf) and scattered; an
+/// inline (df=1) cursor scatters its single pre-decoded doc. `scratch` is a
+/// reused `BLOCK_LEN` decode buffer. Shared by the union count
+/// ([`or_count_bitset`]) and the intersection count (`count_and_intersect_bitset`)
+/// so a common term's dense blocks are merged at memory bandwidth either way.
+pub(super) fn or_cursor_into_bitset(
+    dest: &mut [u64],
+    c: &TermCursor,
+    scratch: &mut [u32; BLOCK_LEN],
+) {
+    // Inline (df=1) cursors carry their single doc pre-decoded and have no
+    // postings bytes to slice.
+    if c.bytes.is_empty() {
+        for &d in &c.block_doc_ids[..c.block_n] {
+            dest[(d >> 6) as usize] |= 1u64 << (d & 63);
+        }
+        return;
+    }
+    for block in c.blocks.iter() {
+        let bytes = c.bytes.slice(block.block_byte_offset..block.block_byte_end);
+        let bytes = bytes.as_ref();
+        if bytes[posting::ENCODING_OFF] == ENCODING_BITSET {
+            // Word-OR the presence bitset in at its aligned base word.
+            // Tfs trail; the bitset is everything between them.
+            let base_word = read_u32_le(&bytes[4..8]) as usize / 64;
+            let tf_bits = bytes[2] as usize;
+            let tfs_size = BLOCK_LEN * tf_bits / 8;
+            let presence = &bytes[posting::HEADER_SIZE..bytes.len() - tfs_size];
+            for (i, chunk) in presence.chunks_exact(8).enumerate() {
+                dest[base_word + i] |= u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+            }
+        } else {
+            let n = decode_block_doc_ids(bytes, scratch);
+            for &d in &scratch[..n] {
+                dest[(d >> 6) as usize] |= 1u64 << (d & 63);
+            }
+        }
+    }
 }
 
 /// Pick the cursor whose df dominates the union, or `None` if no term is
@@ -1656,8 +1758,11 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
         if min_doc == u32::MAX {
             break;
         }
-        anchor.skip_to(min_doc);
-        if anchor.is_exhausted() || anchor.current_doc_id() != min_doc {
+        // Membership by bit-test, not `skip_to`: the anchor is the dominant
+        // (common ⇒ dense) term, so its blocks are bitsets. `contains` answers
+        // in one word-load; `skip_to` would decode each block — expanding its
+        // ~128 doc ids — as the frontier drags the anchor across its whole list.
+        if !anchor.contains(min_doc) {
             n += 1;
         }
         for c in cursors.iter_mut() {

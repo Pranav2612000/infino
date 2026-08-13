@@ -69,15 +69,21 @@ impl FtsReader {
             BoolMode::And => {
                 let mut target = 0u32;
                 'docs: loop {
+                    // Phase 1 — align every atom by its cheap *approximation*: a
+                    // term atom is exact; a phrase atom advances only to a doc
+                    // holding all its members, without decoding positions. So a
+                    // rare co-clause (e.g. a term AND'd with a common-word
+                    // phrase) prunes the candidate set here, before any phrase
+                    // pays for adjacency.
                     let mut aligned = target;
                     let mut i = 0usize;
                     while i < atoms.len() {
                         let a = &mut atoms[i];
-                        a.skip_to(aligned)?;
+                        a.approx_skip_to(aligned);
                         if a.is_exhausted() {
                             break 'docs;
                         }
-                        let here = a.current_doc_id();
+                        let here = a.approx_current_doc();
                         if here > aligned {
                             aligned = here;
                             i = 0;
@@ -85,12 +91,25 @@ impl FtsReader {
                         }
                         i += 1;
                     }
-                    let admitted = match filter.as_mut() {
-                        Some(f) => f.admits(aligned)?,
-                        None => true,
-                    };
-                    if admitted {
-                        on_doc(aligned);
+                    // Phase 2 — every approximation agrees on `aligned`. Verify
+                    // the phrase atoms' positions here only: the intersection is
+                    // already down to the co-occurring docs, so position decode
+                    // runs on that handful, not on a phrase's whole match set.
+                    let mut matched = true;
+                    for a in atoms.iter_mut() {
+                        if !a.verify_at(aligned)? {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if matched {
+                        let admitted = match filter.as_mut() {
+                            Some(f) => f.admits(aligned)?,
+                            None => true,
+                        };
+                        if admitted {
+                            on_doc(aligned);
+                        }
                     }
                     let Some(next) = aligned.checked_add(1) else {
                         break;
@@ -223,7 +242,9 @@ impl FtsReader {
         if tokens.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
         }
-        let cursors = self.build_term_cursors(column_id, tokens, None).await?;
+        let cursors = self
+            .build_term_cursors(column_id, tokens, None, true)
+            .await?;
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.
         // +1: the build's dictionary fetch.
@@ -261,7 +282,9 @@ impl FtsReader {
         if tokens.is_empty() {
             return Ok((0, MatchWork::default()));
         }
-        let cursors = self.build_term_cursors(column_id, tokens, None).await?;
+        let cursors = self
+            .build_term_cursors(column_id, tokens, None, true)
+            .await?;
         let mut work = MatchWork::for_cursors(&cursors);
         work.planned_ranges += 1;
         let (n, walk_ns) = timed_section(|| match mode {
@@ -382,7 +405,11 @@ mod tests {
     use bytes::Bytes;
 
     use super::{super::test_util::*, *};
-    use crate::superfile::fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer};
+    use crate::superfile::fts::{
+        builder::FtsBuilder,
+        posting::{self, ENCODING_BITSET, ENCODING_PACKED},
+        tokenize::AsciiLowerTokenizer,
+    };
 
     #[tokio::test]
     async fn token_match_or_unions_and_intersects_unranked() {
@@ -488,7 +515,7 @@ mod tests {
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("alpha "); // every doc
-            if i % 2 == 0 {
+            if i.is_multiple_of(2) {
                 text.push_str("beta ");
             }
             if i % 3 == 0 {
@@ -535,6 +562,275 @@ mod tests {
                 .expect("count")
                 .0,
             N_DOCS as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn and_count_matches_merge_on_dense_bitset_corpus() {
+        // A dense corpus stores common terms as bitset blocks (v4). The
+        // intersection count must agree with `token_match`'s flat-merge AND
+        // length across both v4 intersection kernels: the bitset-AND
+        // (word-parallel presence AND, when every term is dense enough to
+        // trip the density gate) and the rarest-driven membership walk (when
+        // a sparse term keeps the intersection below the gate). `token_match`
+        // AND collects via the decode-based flat-merge, an independent
+        // reference from either count kernel.
+        const N_DOCS: u32 = OR_WINDOW * 2 + 500;
+        const RARE_STRIDE: u32 = 371; // sparse ⇒ below the density gate
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("alpha "); // every doc → dense
+            if i % 2 == 0 {
+                text.push_str("beta ");
+            }
+            if i % 3 == 0 {
+                text.push_str("gamma ");
+            }
+            if i % 5 == 0 {
+                text.push_str("delta ");
+            }
+            if i.is_multiple_of(RARE_STRIDE) {
+                text.push_str("rare ");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let shapes: &[&[&str]] = &[
+            &["alpha", "beta"],                   // dense ∩ dense → bitset-AND
+            &["alpha", "beta", "gamma"],          // 3 dense → bitset-AND
+            &["alpha", "beta", "gamma", "delta"], // 4 dense → bitset-AND
+            &["beta", "gamma"],                   // dense ∩ dense, neither anchor
+            &["alpha", "rare"],                   // dense ∩ sparse → membership
+            &["gamma", "zzz_absent"],             // absent term ⇒ empty
+        ];
+        for terms in shapes {
+            let merge_len = r
+                .token_match("body", terms, BoolMode::And)
+                .await
+                .expect("token_match")
+                .0
+                .len() as u64;
+            let count = r
+                .token_match_count("body", terms, BoolMode::And)
+                .await
+                .expect("token_match_count")
+                .0;
+            assert_eq!(count, merge_len, "AND count vs merge len for {terms:?}");
+        }
+        // Absolute pin: `alpha` is in every doc, so `alpha ∩ beta` is exactly
+        // the docs where `beta` is present (i % 2 == 0) = ⌈N_DOCS / 2⌉.
+        assert_eq!(
+            r.token_match_count("body", &["alpha", "beta"], BoolMode::And)
+                .await
+                .expect("count")
+                .0,
+            u64::from(N_DOCS.div_ceil(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn count_kernels_handle_a_mixed_encoding_term() {
+        // A term that is dense early (near-consecutive doc ids ⇒ BITSET blocks)
+        // and sparse later (strided ⇒ PACKED blocks) has *both* block encodings
+        // in one posting list. The per-block encoding dispatch in the union
+        // (`or_cursor_into_bitset`), the membership probe (`TermCursor::contains`
+        // advancing across a bitset→packed boundary), and the doc-id decode must
+        // each pick the right branch block by block. Uniform-stride corpora
+        // never produce this, so drive it explicitly and cross-check every count
+        // kernel against `token_match`'s independent flat-merge length.
+        const DENSE_END: u32 = 256; // docs 0..256 hold `mix` every doc → BITSET
+        const SPARSE_STRIDE: u32 = 30; // docs after that every 30th → PACKED
+        const N_DOCS: u32 = 4200;
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("common "); // every doc → dense partner
+            if i % 2 == 0 {
+                text.push_str("even "); // every other doc → dense, non-dominant
+            }
+            let mix = i < DENSE_END || (i - DENSE_END).is_multiple_of(SPARSE_STRIDE);
+            if mix {
+                text.push_str("mix ");
+            }
+            if i.is_multiple_of(37) {
+                text.push_str("rareb "); // sparse ⇒ AND stays below the density gate
+            }
+            text.push_str(&format!("f{}", i % 50));
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        // Prove `mix` really has both encodings — else the test silently checks
+        // nothing about the transition.
+        let cursors = r
+            .build_term_cursors(0, &["mix"], None, true)
+            .await
+            .expect("build cursors");
+        let mix = &cursors[0];
+        let (mut saw_bitset, mut saw_packed) = (false, false);
+        for blk in mix.blocks.iter() {
+            match mix.bytes.as_ref()[blk.block_byte_offset + posting::ENCODING_OFF] {
+                ENCODING_BITSET => saw_bitset = true,
+                ENCODING_PACKED => saw_packed = true,
+                other => panic!("unexpected encoding byte {other}"),
+            }
+        }
+        assert!(
+            saw_bitset && saw_packed,
+            "`mix` must carry both BITSET and PACKED blocks (bitset={saw_bitset}, packed={saw_packed})"
+        );
+
+        // Every count kernel over the mixed term must agree with the flat-merge.
+        // - `mix` alone: doc-id decode across mixed blocks.
+        // - `mix ∪ even`: dense union, neither dominant ⇒ `or_count_bitset` →
+        //   `or_cursor_into_bitset` takes both the word-copy and scatter branches.
+        // - `mix ∩ common`: `common` dominates → membership walk probes `mix`
+        //   (`contains`) across the bitset→packed boundary.
+        // - `mix ∩ rareb`: rarest is sparse ⇒ membership drives by `rareb` and
+        //   probes `mix`, again crossing the encoding boundary.
+        let cases: &[(&[&str], BoolMode)] = &[
+            (&["mix"], BoolMode::Or),
+            (&["mix", "even"], BoolMode::Or),
+            (&["mix", "common"], BoolMode::And),
+            (&["mix", "rareb"], BoolMode::And),
+            (&["mix", "even", "common"], BoolMode::And),
+        ];
+        for (tokens, mode) in cases {
+            let merge_len = r
+                .token_match("body", tokens, *mode)
+                .await
+                .expect("token_match")
+                .0
+                .len() as u64;
+            let count = r
+                .token_match_count("body", tokens, *mode)
+                .await
+                .expect("token_match_count")
+                .0;
+            assert_eq!(
+                count, merge_len,
+                "mixed-encoding count for {tokens:?} {mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn intersection_count_edges_across_the_density_gate() {
+        // Dispatch edges in `count_and_intersect`: the density-gate boundary
+        // (bitset-AND just above, membership just below `min_df*DIVISOR >=
+        // max_doc`), a single-cursor AND, and inline (df=1) cursors in both an
+        // intersection (`contains` inline branch, true and false) and a dense
+        // union (`or_cursor_into_bitset` inline branch). All cross-checked
+        // against `token_match`'s independent flat-merge length.
+        const N_DOCS: u32 = 4096; // max doc id 4095
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::from("common"); // every doc
+            text.push_str(if i.is_multiple_of(2) { " even" } else { " odd" });
+            // `gatehi` in 256 docs (df*16 = 4096 ≥ 4095 ⇒ bitset-AND);
+            // `gatelo` in 255 docs (df*16 = 4080 < 4095 ⇒ membership).
+            if i.is_multiple_of(16) {
+                text.push_str(" gatehi");
+            }
+            if i.is_multiple_of(16) && i != 0 {
+                text.push_str(" gatelo");
+            }
+            if i == 100 {
+                text.push_str(" inlinea inlineb"); // two df=1 terms on one doc
+            }
+            if i == 200 {
+                text.push_str(" inlinec"); // a df=1 term on a different doc
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        // Pin the gate arithmetic: `gatehi` lands on/above the switch, `gatelo`
+        // just below, so the two intersections below take different kernels.
+        let max_doc = u64::from(N_DOCS - 1);
+        let hi = r.term_df("body", "gatehi").await.expect("df").0;
+        let lo = r.term_df("body", "gatelo").await.expect("df").0;
+        assert!(
+            hi.saturating_mul(OR_COUNT_BITSET_DENSITY_DIVISOR) >= max_doc,
+            "gatehi df={hi} must sit on/above the density gate"
+        );
+        assert!(
+            lo.saturating_mul(OR_COUNT_BITSET_DENSITY_DIVISOR) < max_doc,
+            "gatelo df={lo} must sit below the density gate"
+        );
+        for token in ["inlinea", "inlineb", "inlinec"] {
+            assert_eq!(
+                r.term_df("body", token).await.expect("df").0,
+                1,
+                "{token} df"
+            );
+        }
+
+        let and_cases: &[&[&str]] = &[
+            &["common", "gatehi"],   // bitset-AND — just above the gate
+            &["common", "gatelo"],   // membership — just below the gate
+            &["common"],             // single-cursor AND
+            &["inlinea", "inlineb"], // two df=1 on the same doc ⇒ contains inline true
+            &["inlinea", "inlinec"], // df=1 on different docs ⇒ contains inline false
+            &["inlinea", "common"],  // inline drives, bitset term probed
+        ];
+        for tokens in and_cases {
+            let merge_len = r
+                .token_match("body", tokens, BoolMode::And)
+                .await
+                .expect("token_match")
+                .0
+                .len() as u64;
+            let count = r
+                .token_match_count("body", tokens, BoolMode::And)
+                .await
+                .expect("token_match_count")
+                .0;
+            assert_eq!(count, merge_len, "AND edge count for {tokens:?}");
+        }
+
+        // Dense union containing an inline term ⇒ `or_count_bitset` →
+        // the inline branch of `or_cursor_into_bitset`.
+        let or_tokens: &[&str] = &["inlinea", "even", "odd"];
+        let merge_len = r
+            .token_match("body", or_tokens, BoolMode::Or)
+            .await
+            .expect("token_match")
+            .0
+            .len() as u64;
+        let count = r
+            .token_match_count("body", or_tokens, BoolMode::Or)
+            .await
+            .expect("token_match_count")
+            .0;
+        assert_eq!(count, merge_len, "OR-with-inline count");
+
+        // Absolute pins on the inline intersections: same doc ⇒ 1, disjoint ⇒ 0.
+        assert_eq!(
+            r.token_match_count("body", &["inlinea", "inlineb"], BoolMode::And)
+                .await
+                .expect("count")
+                .0,
+            1
+        );
+        assert_eq!(
+            r.token_match_count("body", &["inlinea", "inlinec"], BoolMode::And)
+                .await
+                .expect("count")
+                .0,
+            0
         );
     }
 

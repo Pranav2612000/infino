@@ -17,7 +17,67 @@ use super::{
         AndSink, CollectSink, CountSink, MustShouldSink, ScoreSink, TopKEntry, drain_top_k_desc,
     },
 };
-use crate::superfile::{error::FtsError, fts::bm25};
+use crate::superfile::{
+    error::FtsError,
+    fts::{bm25, posting::BLOCK_LEN},
+};
+
+/// Intersection cardinality by a rarest-driven membership walk: iterate the
+/// term with the fewest blocks and count docs the others all contain. Each
+/// membership probe is `TermCursor::contains`, which bit-tests a bitset
+/// block with no decode — so a common (bitset) term's blocks are never
+/// expanded. Used for `v4` blobs; the flat-merge stays for `v1`–`v3`, where
+/// every block is PFOR and the sorted merge over decoded blocks is faster.
+fn count_and_intersect_membership(mut cursors: Vec<TermCursor>) -> u64 {
+    // Drive by the rarest term (fewest blocks) to minimise membership
+    // probes. Ties don't matter; any driver yields the same count.
+    let driver_idx = cursors
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, c)| c.block_count())
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let mut driver = cursors.swap_remove(driver_idx);
+    let mut others = cursors;
+    let mut n = 0u64;
+    while !driver.is_exhausted() {
+        let doc = driver.current_doc_id();
+        if others.iter_mut().all(|o| o.contains(doc)) {
+            n += 1;
+        }
+        driver.next();
+    }
+    n
+}
+
+/// Intersection cardinality via bitset AND: build each term's doc presence into
+/// a doc-space bitset (byte-level — a dense term's bitset blocks are word-copied,
+/// never expanded to doc ids), AND them together, and popcount. Word-parallel, so
+/// its cost is `n_terms × max_doc/64` regardless of how many docs the rarest term
+/// holds — the opposite of the rarest-driven membership walk, which iterates the
+/// rarest term doc by doc. Wins when *every* term is common (dense), where the
+/// membership driver is itself a long list. `max_doc` is the largest doc id
+/// across the terms, so `acc`/`scratch` span every term's presence.
+fn count_and_intersect_bitset(cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
+    let words = max_doc as usize / 64 + 1;
+    let mut acc = vec![0u64; words];
+    let mut scratch = vec![0u64; words];
+    let mut decode = [0u32; BLOCK_LEN];
+    let mut cursors = cursors.iter();
+    // The first term seeds the accumulator; the rest AND their presence in.
+    let Some(first) = cursors.next() else {
+        return 0;
+    };
+    or_cursor_into_bitset(&mut acc, first, &mut decode);
+    for c in cursors {
+        scratch.iter_mut().for_each(|w| *w = 0);
+        or_cursor_into_bitset(&mut scratch, c, &mut decode);
+        for (a, s) in acc.iter_mut().zip(scratch.iter()) {
+            *a &= *s;
+        }
+    }
+    acc.iter().map(|w| w.count_ones() as u64).sum()
+}
 
 impl FtsReader {
     /// Multi-term OR via WAND + BlockMaxWAND.
@@ -403,6 +463,33 @@ impl FtsReader {
     pub(super) fn count_and_intersect(&self, column_id: u32, mut cursors: Vec<TermCursor>) -> u64 {
         if cursors.is_empty() {
             return 0;
+        }
+        // On a v4 blob a common term's blocks may be bitset-encoded, where
+        // decoding (set-bit expansion) is slower than the PFOR path the
+        // flat-merge assumes.
+        if self.has_bitset_blocks {
+            // When even the *rarest* term is dense (covers ≥ 1/DIVISOR of the
+            // corpus), the rarest-driven membership walk still iterates a long
+            // list. AND the terms' presence bitsets word-at-a-time instead —
+            // cost is independent of the terms' lengths. The two full-width
+            // bitsets it allocates only pay off at this density, so a sparser
+            // intersection keeps the membership probe.
+            if cursors.len() >= 2 {
+                let max_doc = cursors
+                    .iter()
+                    .filter_map(|c| c.blocks.last())
+                    .map(|b| b.last_doc_id)
+                    .max()
+                    .unwrap_or(0);
+                let min_df = cursors.iter().map(|c| c.df).min().unwrap_or(0);
+                if min_df.saturating_mul(OR_COUNT_BITSET_DENSITY_DIVISOR) >= u64::from(max_doc) {
+                    return count_and_intersect_bitset(cursors, max_doc);
+                }
+            }
+            // Rarest term is sparse: drive by it and probe the rest by
+            // membership — a bitset block answers with an O(1) bit-test, no
+            // decode. See `count_and_intersect_membership`.
+            return count_and_intersect_membership(cursors);
         }
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = &col_meta.dl_norm_k1;
@@ -1481,7 +1568,9 @@ impl FtsReader {
         if terms.is_empty() || k == 0 {
             return Ok(Vec::new());
         }
-        let cursors = self.build_term_cursors(column_id, terms, None).await?;
+        let cursors = self
+            .build_term_cursors(column_id, terms, None, false)
+            .await?;
         if cursors.is_empty() {
             return Ok(Vec::new());
         }
@@ -1727,7 +1816,7 @@ mod tests {
         let col = r.resolve_column_id("body").expect("col");
         let uniform_terms: &[&str] = &["zeta", "eta", "theta"];
         let uniform_cursors = r
-            .build_term_cursors(col, uniform_terms, None)
+            .build_term_cursors(col, uniform_terms, None, false)
             .await
             .expect("uniform cursors");
         assert!(
@@ -1795,11 +1884,11 @@ mod tests {
         for terms in shapes {
             for k in [1usize, 5, 50, 128] {
                 let cw = r
-                    .build_term_cursors(col, terms, None)
+                    .build_term_cursors(col, terms, None, false)
                     .await
                     .expect("cursors");
                 let cb = r
-                    .build_term_cursors(col, terms, None)
+                    .build_term_cursors(col, terms, None, false)
                     .await
                     .expect("cursors");
                 let wand = r.run_wand_bmw(col, cw, k).expect("wand");
@@ -1844,7 +1933,7 @@ mod tests {
 
         // common (df≈N) + rare (df≈N/200): ratio 200 ≥ 16 → anchor.
         let anchored = r
-            .build_term_cursors(col, &["common", "rare"], None)
+            .build_term_cursors(col, &["common", "rare"], None, false)
             .await
             .expect("cursors");
         assert!(
@@ -1853,7 +1942,7 @@ mod tests {
         );
         // common (df≈N) + frequent (df≈N/2): ratio 2 < 16 → no anchor.
         let uniform = r
-            .build_term_cursors(col, &["common", "frequent"], None)
+            .build_term_cursors(col, &["common", "frequent"], None, false)
             .await
             .expect("cursors");
         assert!(
@@ -1962,14 +2051,14 @@ mod tests {
         for (pos, neg) in cases {
             for k in [1usize, 5, 50] {
                 let mut wf = ExcludeFilter::new(
-                    r.build_term_cursors(col, neg, None)
+                    r.build_term_cursors(col, neg, None, false)
                         .await
                         .expect("neg cursors"),
                 );
                 let win = r
                     .run_windowed_union(
                         col,
-                        r.build_term_cursors(col, pos, None)
+                        r.build_term_cursors(col, pos, None, false)
                             .await
                             .expect("pos cursors"),
                         k,
@@ -1980,14 +2069,14 @@ mod tests {
                     )
                     .expect("windowed");
                 let mut bf = ExcludeFilter::new(
-                    r.build_term_cursors(col, neg, None)
+                    r.build_term_cursors(col, neg, None, false)
                         .await
                         .expect("neg cursors"),
                 );
                 let bmm = r
                     .run_max_score_bmm(
                         col,
-                        r.build_term_cursors(col, pos, None)
+                        r.build_term_cursors(col, pos, None, false)
                             .await
                             .expect("pos cursors"),
                         k,
@@ -2017,7 +2106,9 @@ mod tests {
         let unfiltered = r
             .run_windowed_union(
                 col,
-                r.build_term_cursors(col, pos, None).await.expect("pos"),
+                r.build_term_cursors(col, pos, None, false)
+                    .await
+                    .expect("pos"),
                 N_DOCS as usize,
                 None,
                 f32::NEG_INFINITY,
@@ -2025,11 +2116,17 @@ mod tests {
                 u32::MAX,
             )
             .expect("unfiltered");
-        let mut f = ExcludeFilter::new(r.build_term_cursors(col, neg, None).await.expect("neg"));
+        let mut f = ExcludeFilter::new(
+            r.build_term_cursors(col, neg, None, false)
+                .await
+                .expect("neg"),
+        );
         let filtered = r
             .run_windowed_union(
                 col,
-                r.build_term_cursors(col, pos, None).await.expect("pos"),
+                r.build_term_cursors(col, pos, None, false)
+                    .await
+                    .expect("pos"),
                 N_DOCS as usize,
                 Some(&mut f),
                 f32::NEG_INFINITY,
