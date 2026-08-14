@@ -1363,24 +1363,29 @@ impl SupertableWriter {
         })
     }
 
-    /// Drive one pending update entry through its full WAL
-    /// pipeline. Returns the per-op outcome on success.
-    fn drive_one_update(&self, entry: &PendingUpdateEntry) -> Result<MutationStats, MutationError> {
-        let storage = self
-            .inner
-            .options
-            .storage
-            .as_ref()
-            .ok_or(MutationError::NoStorageAttached)?
-            .clone();
-
-        let wal_doc = WalStateDoc {
+    /// Build the `Intent` state doc for one buffered update.
+    ///
+    /// Leased at create for the same reason as [`Self::delete_wal_doc`], and
+    /// the window it closes is wider here: an unowned `Intent` UPDATE is
+    /// drivable by a sweep from its very first step, so a peer would run the
+    /// append phase — building and publishing the replacement superfile —
+    /// against the same preallocated id while this writer was doing it too.
+    ///
+    /// One `now` stamps `created_at` and both lease timestamps.
+    fn update_wal_doc(&self, entry: &PendingUpdateEntry, now: DateTime<Utc>) -> WalStateDoc {
+        let lease_span = ChronoDuration::from_std(DEFAULT_LEASE_DURATION)
+            .expect("default lease duration should be a valid chronoduration");
+        WalStateDoc {
             wal_id: entry.wal_id,
             schema_version: SCHEMA_VERSION,
             op_kind: OpKind::Update,
             state: WalState::Intent,
-            created_at: Utc::now(),
-            lease: None,
+            created_at: now,
+            lease: Some(Lease {
+                owner: self.inner.handle_id,
+                acquired_at: now,
+                expires_at: now + lease_span,
+            }),
             predicate_repr: "writer.update()".into(),
             target_ids: entry.target_ids.iter().map(|&v| RowId(v)).collect(),
             new_row_count: Some(entry.new_row_count),
@@ -1396,12 +1401,27 @@ impl SupertableWriter {
                     tombstoned_in_superfile: None,
                 })
                 .collect(),
-        };
+        }
+    }
+
+    /// Drive one pending update entry through its full WAL
+    /// pipeline. Returns the per-op outcome on success.
+    fn drive_one_update(&self, entry: &PendingUpdateEntry) -> Result<MutationStats, MutationError> {
+        let storage = self
+            .inner
+            .options
+            .storage
+            .as_ref()
+            .ok_or(MutationError::NoStorageAttached)?
+            .clone();
+
+        let wal_doc = self.update_wal_doc(entry, Utc::now());
 
         let wal_store = WalStore::new(Arc::clone(&storage));
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
         let wal_id = entry.wal_id;
         let ipc_bytes = entry.ipc_bytes.clone();
+        let owner = self.inner.handle_id;
         let drive = async move {
             wal_store
                 .put_arrow(wal_id, ipc_bytes)
@@ -1411,15 +1431,28 @@ impl SupertableWriter {
                 .create(&wal_doc)
                 .await
                 .map_err(MutationError::WalStore)?;
-            let (_outcome, doc_after_append, etag_after_append) =
-                pipeline::run_append_phase(&supertable, &wal_store, &wal_doc, &etag).await?;
-            let (outcome, _post, _post_etag) = pipeline::run_tombstone_phase(
+            let append = pipeline::run_append_phase(&supertable, &wal_store, &wal_doc, &etag).await;
+            let (_outcome, doc_after_append, etag_after_append) = match append {
+                Ok(appended) => appended,
+                Err(cause) => {
+                    release_mutation_lease(&wal_store, wal_id, owner).await;
+                    return Err(cause.into());
+                }
+            };
+            let tombstone = pipeline::run_tombstone_phase(
                 &supertable,
                 &wal_store,
                 &doc_after_append,
                 &etag_after_append,
             )
-            .await?;
+            .await;
+            let (outcome, _post, _post_etag) = match tombstone {
+                Ok(applied) => applied,
+                Err(cause) => {
+                    release_mutation_lease(&wal_store, wal_id, owner).await;
+                    return Err(cause.into());
+                }
+            };
             let (n_t, n_nf) = match outcome {
                 TombstonePhaseOutcome::Applied {
                     n_tombstoned,
@@ -10600,6 +10633,214 @@ supertable:
         assert!(
             doc.lease.is_none(),
             "a failed delete must release its lease so the next sweep can take \
+             the WAL immediately, still held by {:?}",
+            doc.lease
+        );
+    }
+
+    // ---- update-WAL lease ownership ----------------------------------
+
+    /// Owner id of the peer running the recovery sweep in the update-lease
+    /// tests. Distinct from the writer handle's own id, since `try_acquire`
+    /// treats a same-owner lease as a renewal rather than a conflict.
+    const UPDATE_LEASE_PEER_OWNER: i128 = 0x0BAD_CAFE;
+
+    /// A writer holding one buffered update against a committed row, so the
+    /// tests can inspect the exact entry — and therefore the exact state
+    /// doc — that `commit` would drive.
+    fn writer_with_buffered_update(table: &Supertable) -> SupertableWriter {
+        let mut writer = table.writer().expect("writer");
+        writer
+            .append(&build_title_batch(&["alpha", "beta"]))
+            .expect("append");
+        writer.commit().expect("commit appends");
+        writer
+            .update(col("title").eq(lit("alpha")), build_title_batch(&["gamma"]))
+            .expect("buffer update");
+        writer
+    }
+
+    /// An update's WAL state doc is born holding a live lease owned by the
+    /// handle about to drive it, from a single clock reading — and it still
+    /// carries the append-phase fields that make the WAL drivable.
+    #[test]
+    fn update_wal_doc_is_born_leased_by_this_handle() {
+        let directory = TempDir::new().expect("tempdir");
+        let table = delete_lease_test_table(&directory);
+        let writer = writer_with_buffered_update(&table);
+        let entry = writer
+            .pending_updates
+            .first()
+            .expect("update() must buffer an entry");
+
+        let now = Utc::now();
+        let doc = writer.update_wal_doc(entry, now);
+
+        assert_eq!(doc.op_kind, OpKind::Update);
+        assert_eq!(doc.state, WalState::Intent);
+        assert_eq!(
+            doc.created_at, now,
+            "created_at must come from the passed clock reading, not a second sample"
+        );
+        let lease = doc
+            .lease
+            .expect("an update WAL must be born leased, not left unowned until a later acquire");
+        assert_eq!(
+            lease.owner,
+            table.handle_id(),
+            "the lease must name the handle that will drive the pipeline"
+        );
+        assert_eq!(
+            lease.acquired_at, now,
+            "acquired_at must share created_at's clock reading"
+        );
+        assert_eq!(
+            lease.expires_at,
+            now + ChronoDuration::from_std(DEFAULT_LEASE_DURATION)
+                .expect("default lease duration converts"),
+            "the lease must run a full default duration from the same reading"
+        );
+
+        // The append phase reads these off the doc; a lease that arrived by
+        // clobbering them would be no fix at all.
+        assert_eq!(doc.new_row_count, Some(1));
+        assert!(doc.preallocated_superfile_id.is_some());
+        assert_eq!(doc.tombstone_progress.len(), 1);
+    }
+
+    /// Regression: a peer's recovery sweep must not take an update WAL away
+    /// from the writer that just created it. The window is wider than the
+    /// delete case — an unowned `Intent` UPDATE is drivable from its first
+    /// step, so a sweep would run the append phase and publish the
+    /// replacement superfile while this writer was doing the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peer_sweep_skips_a_freshly_created_update_wal() {
+        let directory = TempDir::new().expect("tempdir");
+        let table = delete_lease_test_table(&directory);
+        let storage = table
+            .inner()
+            .options
+            .storage
+            .as_ref()
+            .expect("storage attached")
+            .clone();
+        let writer = writer_with_buffered_update(&table);
+        let entry = writer
+            .pending_updates
+            .first()
+            .expect("update() must buffer an entry");
+        let wal_id = entry.wal_id;
+
+        // The WAL exactly as `drive_one_update` leaves it after its create:
+        // payload sidecar uploaded, `Intent` doc leased to this handle. The
+        // sidecar matters — without it the sweep could not run the append
+        // phase even if the lease were missing, and the test would pass for
+        // the wrong reason.
+        let wal_store = WalStore::new(storage);
+        wal_store
+            .put_arrow(wal_id, entry.ipc_bytes.clone())
+            .await
+            .expect("put arrow payload");
+        let doc = writer.update_wal_doc(entry, Utc::now());
+        let etag_before = wal_store.create(&doc).await.expect("create wal state doc");
+
+        let report = scan_and_recover(
+            &table,
+            SupertableHandleId(UPDATE_LEASE_PEER_OWNER),
+            DEFAULT_LEASE_DURATION,
+        )
+        .await
+        .expect("sweep");
+
+        assert_eq!(report.n_scanned, 1, "the sweep must see the seeded WAL");
+        assert_eq!(
+            report.n_held_by_peer, 1,
+            "the writer's live lease must fence the sweep off this WAL"
+        );
+        assert_eq!(
+            report.n_full_pipeline_completed, 0,
+            "the sweep must not run the append phase for an update the writer holds"
+        );
+
+        let (after, etag_after) = wal_store.read(wal_id).await.expect("read back");
+        assert_eq!(
+            etag_after, etag_before,
+            "etag unchanged → the sweep never wrote the state doc"
+        );
+        assert_eq!(
+            after.state,
+            WalState::Intent,
+            "the WAL must still be waiting for its owner's append phase"
+        );
+        assert_eq!(
+            after.lease.expect("lease survives the sweep").owner,
+            table.handle_id(),
+            "ownership must still sit with the creating handle"
+        );
+    }
+
+    /// An update that fails in its *tombstone* phase — after the append
+    /// phase has landed — hands its lease back too, so recovery can finish
+    /// the WAL from `Appended` on its next pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_update_hands_back_its_wal_lease() {
+        let directory = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let table =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+
+        let mut writer = table.writer().expect("writer");
+        writer
+            .append(&build_title_batch(&["alpha", "beta"]))
+            .expect("append");
+        writer.commit().expect("commit appends");
+
+        // Buffer while storage is healthy, then break every sidecar CAS.
+        // The append phase writes superfile + manifest and is untouched, so
+        // the failure lands in the tombstone phase that follows it.
+        writer
+            .update(col("title").eq(lit("alpha")), build_title_batch(&["gamma"]))
+            .expect("buffer update");
+        faults.fail_with(
+            FaultKind::Precondition,
+            FaultOp::PutIfMatch,
+            DELETE_LEASE_TOMBSTONES_SUFFIX,
+            DELETE_LEASE_SIDECAR_FAULTS,
+        );
+        let err = writer
+            .commit()
+            .expect_err("a sidecar CAS that never lands must fail the update");
+        assert!(
+            matches!(err, CommitError::PartialCommit { .. }),
+            "the failed update must surface as a partial commit, got {err:?}"
+        );
+        assert!(
+            faults.fired() > 1,
+            "the failure must come from the injected sidecar faults, fired {}",
+            faults.fired()
+        );
+
+        faults.clear();
+        let wal_store = WalStore::new(storage);
+        let wal_ids = wal_store.list_wal_ids().await.expect("list wal ids");
+        assert_eq!(
+            wal_ids.len(),
+            1,
+            "the failed update must leave its WAL for recovery, found {wal_ids:?}"
+        );
+        let (doc, _etag) = wal_store.read(wal_ids[0]).await.expect("read wal doc");
+        assert_eq!(
+            doc.state,
+            WalState::Appended,
+            "the append phase landed; only the tombstone phase is left"
+        );
+        assert!(
+            doc.lease.is_none(),
+            "a failed update must release its lease so the next sweep can take \
              the WAL immediately, still held by {:?}",
             doc.lease
         );
