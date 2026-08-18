@@ -28,9 +28,12 @@ mod infino_vector_engine;
 pub mod sql_driver;
 pub mod vector_driver;
 
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 pub use driver::{
     BuildStat, EngineFtsResult, FtsQuery, PhaseStats, QueryStats, run_fts, run_fts_with_index,
 };
+use infino::superfile::vector::distance::Metric;
 pub use infino_engine::{
     InfinoFtsEngine, InfinoFtsIndex, build_positionless, parallel_build_positionless,
 };
@@ -41,7 +44,7 @@ pub use infino_sql_engine::{
 pub use infino_vector_engine::{InfinoVectorEngine, InfinoVectorIndex};
 pub use sql_driver::{
     EngineSqlResult, SqlBuildStat, SqlQuery, SqlQueryStats, SqlRunConfig, run_sql,
-    run_sql_with_index,
+    run_sql_batches_with_index, run_sql_with_index,
 };
 pub use vector_driver::{
     EngineVectorResult, VectorBuildStat, VectorMetric, VectorQuery, VectorQueryStats,
@@ -196,6 +199,38 @@ pub struct SqlRow<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SqlOutput {
     pub rows: usize,
+}
+
+/// The embedding column of a schema-driven corpus, when it has one.
+#[derive(Clone, Debug)]
+pub struct SqlVectorSpec {
+    pub column: String,
+    pub dim: usize,
+    pub metric: Metric,
+}
+
+/// What a schema-driven corpus tells an engine about its own shape.
+///
+/// `fts_columns` is empty for every corpus this ships with: choosing which
+/// of a dataset's text columns deserve a BM25 index needs a per-dataset
+/// declaration, and indexing all of them would dominate build time for
+/// queries that never use them.
+#[derive(Clone, Debug)]
+pub struct SqlCorpusSpec {
+    pub schema: SchemaRef,
+    pub fts_columns: Vec<String>,
+    pub vector: Option<SqlVectorSpec>,
+}
+
+/// A SQL engine that can ingest a dataset's own schema, rather than the
+/// fixed [`SqlRow`] fixture. Opt-in: an engine that does not implement
+/// this is unaffected by its existence.
+pub trait SchemaDrivenSqlEngine: SqlEngine {
+    fn create_with_spec(spec: &SqlCorpusSpec) -> Self::Index;
+
+    fn write_batches(index: &mut Self::Index, batches: &[RecordBatch]);
+
+    fn parallel_write_batches(spec: &SqlCorpusSpec, batches: &[RecordBatch], writers: usize);
 }
 
 /// A SQL engine under comparison.

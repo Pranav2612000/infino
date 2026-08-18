@@ -7,8 +7,8 @@ use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::corpus::{
-    DIM, TEXT_CORPUS_CHUNK_DOCS, TOKENS_PER_DOC, VECTOR_CORPUS_CHUNK_DOCS, VOCAB_SIZE,
-    ZipfDistribution, chunk_seed, normalize,
+    TEXT_CORPUS_CHUNK_DOCS, TOKENS_PER_DOC, VECTOR_CORPUS_CHUNK_DOCS, VOCAB_SIZE, ZipfDistribution,
+    chunk_seed, dim, normalize,
 };
 
 /// Gaussian scale of a planted cluster center (matches `corpus.rs`).
@@ -52,7 +52,7 @@ impl SequentialSyntheticCorpus {
         let dist = StandardNormal;
         let centers: Vec<Vec<f32>> = (0..n_cent)
             .map(|_| {
-                (0..DIM)
+                (0..dim())
                     .map(|_| {
                         let s: f64 = dist.sample(&mut center_rng);
                         (s as f32) * CENTER_GAUSSIAN_SCALE
@@ -72,14 +72,14 @@ impl SequentialSyntheticCorpus {
         }
     }
 
-    /// Fill `titles` and `flat` (`len * DIM` elements) for the next `len` docs.
+    /// Fill `titles` and `flat` (`len * dim()` elements) for the next `len` docs.
     pub fn fill_chunk(&mut self, len: usize, titles: &mut Vec<String>, flat: &mut Vec<f32>) {
         self.fill_chunk_modality(len, titles, flat, true, true);
     }
 
     /// Modality-aware fill: generate only the columns the build actually
     /// ingests. A vector-only build does not need the (~2 KB/doc) title
-    /// strings, and an FTS-only build does not need the (DIM·4 B/doc) vector
+    /// strings, and an FTS-only build does not need the (dim()·4 B/doc) vector
     /// payload. Generating an unused column would (a) burn CPU and (b) sit
     /// resident in the bench process so the whole-process RSS sampler counts
     /// it — neither of which a production server ingesting over the API pays.
@@ -101,10 +101,10 @@ impl SequentialSyntheticCorpus {
             titles.reserve(len);
         }
         if gen_vec {
-            flat.reserve(len.saturating_mul(DIM));
+            flat.reserve(len.saturating_mul(dim()));
         }
         let dist = StandardNormal;
-        let mut row = vec![0.0f32; DIM];
+        let mut row = vec![0.0f32; dim()];
         for _ in 0..len {
             let doc_id = self.doc_id;
             if gen_text {

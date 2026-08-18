@@ -28,7 +28,7 @@ use infino::{
 };
 use rayon::prelude::*;
 
-use super::{Capabilities, SqlEngine, SqlOutput, SqlRow};
+use super::{Capabilities, SchemaDrivenSqlEngine, SqlCorpusSpec, SqlEngine, SqlOutput, SqlRow};
 use crate::corpus;
 
 const TITLE_COLUMN: &str = "title";
@@ -51,7 +51,10 @@ const WRITE_CHUNK: usize = 65_536;
 /// Vector dimension for the SQL/hybrid arms. Matches the suite-wide corpus
 /// dimension so `vector_search` / `hybrid_search` exercise the same
 /// dimensionality the vector cell tests, not a toy size.
-pub const SQL_DIM: usize = crate::corpus::DIM;
+// The SQL tier's embedding column is a fixed-width fixture, not the vector
+// corpus: real corpora are vector-only, so this stays pinned to the
+// synthetic width regardless of INFINO_BENCH_CORPUS.
+pub const SQL_DIM: usize = crate::corpus::SYNTHETIC_DIM;
 const ROT_SEED: u64 = 7;
 
 fn fixed_list_f32(dim: usize) -> DataType {
@@ -285,6 +288,83 @@ impl SqlEngine for InfinoSqlEngine {
     }
 }
 
+/// Supertable options for a schema-driven corpus: the dataset's own schema,
+/// its declared FTS columns, and its embedding column when it has one.
+fn spec_options(spec: &SqlCorpusSpec) -> SupertableOptions {
+    let fts = spec
+        .fts_columns
+        .iter()
+        .map(|column| FtsConfig {
+            column: column.clone(),
+            positions: false,
+        })
+        .collect();
+    let vectors = spec
+        .vector
+        .iter()
+        .map(|v| VectorConfig {
+            provided_centroids: None,
+            column: v.column.clone(),
+            dim: v.dim,
+            rot_seed: ROT_SEED,
+            metric: v.metric,
+            rerank_codec: corpus::bench_rerank_codec(v.metric),
+        })
+        .collect();
+    SupertableOptions::new(
+        Arc::clone(&spec.schema),
+        fts,
+        vectors,
+        Some(default_tokenizer()),
+    )
+    .expect("invariant: schema-driven supertable options are well-formed")
+}
+
+/// Appends every batch to `table` and commits once — the write-side tail
+/// shared by a freshly created table and one already handed to the engine.
+fn append_batches_and_commit(table: &Supertable, batches: &[RecordBatch]) {
+    let mut writer = table.writer().expect("writer");
+    for batch in batches {
+        writer.append(batch).expect("append batch");
+    }
+    writer.commit().expect("commit");
+    drop(writer);
+}
+
+/// Builds one in-memory supertable from `batches` via the public writer
+/// API, mirroring [`build_supertable`] for the schema-driven ingest path.
+fn build_supertable_from_batches(spec: &SqlCorpusSpec, batches: &[RecordBatch]) -> Supertable {
+    let table = Supertable::create(spec_options(spec)).expect("create supertable");
+    append_batches_and_commit(&table, batches);
+    table
+}
+
+impl SchemaDrivenSqlEngine for InfinoSqlEngine {
+    fn create_with_spec(spec: &SqlCorpusSpec) -> Self::Index {
+        InfinoSqlIndex {
+            table: Some(Supertable::create(spec_options(spec)).expect("create supertable")),
+        }
+    }
+
+    fn write_batches(index: &mut Self::Index, batches: &[RecordBatch]) {
+        let table = index
+            .table
+            .as_ref()
+            .expect("invariant: created with a spec");
+        append_batches_and_commit(table, batches);
+    }
+
+    fn parallel_write_batches(spec: &SqlCorpusSpec, batches: &[RecordBatch], writers: usize) {
+        let writers = writers.max(1);
+        let per_writer = batches.len().div_ceil(writers);
+        let built: Vec<Supertable> = batches
+            .par_chunks(per_writer.max(1))
+            .map(|chunk| build_supertable_from_batches(spec, chunk))
+            .collect();
+        std::hint::black_box(built);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +439,42 @@ mod tests {
             "hybrid should fuse hits; got {}",
             hybrid.rows
         );
+    }
+
+    fn two_column_batch(rows: i64) -> (SqlCorpusSpec, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::LargeUtf8, false),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let names =
+            LargeStringArray::from((0..rows).map(|i| format!("row{i}")).collect::<Vec<_>>());
+        let ns = Int64Array::from((0..rows).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(names) as ArrayRef, Arc::new(ns) as ArrayRef],
+        )
+        .expect("batch");
+        let spec = SqlCorpusSpec {
+            schema,
+            fts_columns: Vec::new(),
+            vector: None,
+        };
+        (spec, batch)
+    }
+
+    /// A dataset's own schema round-trips through ingest: every row lands
+    /// and the columns stay queryable by their source names.
+    #[test]
+    fn ingests_a_dataset_schema_and_queries_it_back() {
+        const ROWS: i64 = 64;
+        let (spec, batch) = two_column_batch(ROWS);
+        let mut index = InfinoSqlEngine::create_with_spec(&spec);
+        InfinoSqlEngine::write_batches(&mut index, &[batch]);
+
+        let all = InfinoSqlEngine::read(&index, "SELECT n FROM supertable");
+        assert_eq!(all.rows, ROWS as usize);
+
+        let filtered = InfinoSqlEngine::read(&index, "SELECT n FROM supertable WHERE n < 10");
+        assert_eq!(filtered.rows, 10, "source column names must be queryable");
     }
 }

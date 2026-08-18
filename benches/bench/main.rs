@@ -45,7 +45,7 @@
 //! plain integers) and object-store backend (`INFINO_BENCH_STORE`) are env
 //! knobs.
 
-use infino_bench_utils::supertable::Phases;
+use infino_bench_utils::{corpus, supertable::Phases};
 use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -317,12 +317,28 @@ fn print_usage_and_exit(code: i32) -> ! {
          Diagnostic: scale | tombstone | update | sql-diag | fts-diag | object-store | concurrent | disk-warm | recall_while_ingest,\n\
          \x20           or `diagnostic` for the grouped set / `diagnostic <names>` for a subset\n\
          \n\
+         corpus=<spec>     : corpus source (default synthetic). Vector cells\n\
+         \x20                   always consume it; supertable fts/sql consume its\n\
+         \x20                   text (the dataset must carry a text column); the\n\
+         \x20                   superfile sql cell ingests its schema; superfile\n\
+         \x20                   fts is synthetic-only and refuses it.\n\
+         \x20   synthetic          seeded planted-cluster generator\n\
+         \x20   annb:<slug>        published ann-benchmarks dataset; ships official\n\
+         \x20                      queries + top-k neighbours (glove-100-angular,\n\
+         \x20                      sift-128-euclidean, deep-image-96-angular, ...)\n\
+         \x20   hf:<owner/repo>    Hugging Face parquet dataset; real embeddings at\n\
+         \x20                      scale, ground truth computed from the ingested rows\n\
+         \x20   parquet:<dir>      local directory of *.parquet shards, read in\n\
+         \x20                      name order (no download)\n\
+         corpus-dir=<path> : where downloadable corpora are staged\n\
+         \n\
          Examples:\n\
          \x20 cargo bench\n\
          \x20 cargo bench -- supertable\n\
          \x20 cargo bench -- superfile fts\n\
          \x20 cargo bench -- supertable sql warm\n\
-         \x20 cargo bench -- tombstone\n"
+         \x20 cargo bench -- tombstone\n\
+         \x20 cargo bench -- supertable vector corpus=annb:glove-100-angular corpus-dir=/data/annb\n"
     );
     std::process::exit(code);
 }
@@ -361,6 +377,11 @@ fn parse_args() -> Selection {
     let mut want_all = false;
     let mut want_diagnostics = false;
     let mut unknown: Vec<String> = Vec::new();
+    // Corpus selection is an ARGUMENT, not an env var: the bench tier's
+    // only env-tunable knobs are the two doc counts, and a corpus that can
+    // change from the environment silently makes two runs incomparable.
+    let mut corpus_spec: Option<String> = None;
+    let mut corpus_dir: Option<String> = None;
 
     let push_tier = |t: Tier, tiers: &mut Vec<Tier>| {
         if !tiers.contains(&t) {
@@ -405,12 +426,28 @@ fn parse_args() -> Selection {
             "disk-warm" | "disk_warm" => diagnostics.push(Diagnostic::DiskWarm),
             "recall_while_ingest" => diagnostics.push(Diagnostic::RecallWhileIngest),
             "diagnostic" | "diagnostics" => want_diagnostics = true,
-            other => unknown.push(other.to_string()),
+            other => match other.split_once('=') {
+                Some(("corpus", spec)) => corpus_spec = Some(spec.to_string()),
+                Some(("corpus-dir", dir)) => corpus_dir = Some(dir.to_string()),
+                _ => unknown.push(other.to_string()),
+            },
         }
     }
 
     if !unknown.is_empty() {
         eprintln!("[bench] unknown selector(s): {}", unknown.join(", "));
+        print_usage_and_exit(2);
+    }
+
+    // Install before any tier runs: the source resolves once per process
+    // and every corpus read goes through it.
+    if let Some(spec) = corpus_spec.as_deref()
+        && let Err(err) = corpus::set_source(spec, corpus_dir.as_deref())
+    {
+        eprintln!("[bench] {err}");
+        print_usage_and_exit(2);
+    } else if corpus_dir.is_some() && corpus_spec.is_none() {
+        eprintln!("[bench] corpus-dir= given without corpus=; nothing would read it");
         print_usage_and_exit(2);
     }
 

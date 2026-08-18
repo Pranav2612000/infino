@@ -1389,6 +1389,64 @@ pub mod vector {
     /// Default `(nprobe, rerank)` config gate — lower bar so large-scale
     /// pre-drain staging runs can complete while routing is tuned.
     pub const DEFAULT_CONFIG_RECALL_FLOOR: f32 = 0.80;
+
+    /// Per-tier recall tripwires. These are regression floors, never the
+    /// acceptance bar (0.99 on the standard supertable bench) — they exist
+    /// so a run that has broken badly fails loudly instead of reporting a
+    /// number.
+    ///
+    /// The two tiers legitimately sit at different recall levels, so one
+    /// constant cannot serve both. The supertable tier runs the calibrated
+    /// path — drain-stamped width, fine depth and rerank budget — and is
+    /// where the bar is enforced. The superfile tier is a single-superfile
+    /// micro-bench with NO drain and NO stamped laws: its `default` config
+    /// is a fixed probe width tuned against the synthetic corpus's planted
+    /// clusters, so on a real dataset it under-serves by construction
+    /// (measured at 100K: glove-25-angular 0.740, Cohere 0.660, both ~0.99
+    /// on synthetic). A floor tight enough for the calibrated tier
+    /// therefore fails the uncalibrated one on real data without anything
+    /// being wrong.
+    #[derive(Debug, Clone, Copy)]
+    pub struct RecallFloors {
+        /// Wide-probe sanity gate (`CORRECTNESS_NPROBE` / rerank).
+        pub correctness: f32,
+        /// Shipped-defaults gate.
+        pub default_config: f32,
+    }
+
+    impl RecallFloors {
+        /// Calibrated tier: the drain stamps the serving laws, so the
+        /// tripwires stay where they are.
+        pub const SUPERTABLE: Self = Self {
+            correctness: CORRECTNESS_RECALL_FLOOR,
+            default_config: DEFAULT_CONFIG_RECALL_FLOOR,
+        };
+        /// Uncalibrated single-superfile tier on a REAL corpus: loose
+        /// enough that the legitimately lower default-config recall is
+        /// reported rather than aborting the run, still tight enough that
+        /// a broken index (which collapses toward chance) trips it.
+        const SUPERFILE_REAL: Self = Self {
+            correctness: 0.60,
+            default_config: 0.60,
+        };
+        /// Uncalibrated single-superfile tier on the synthetic corpus: the
+        /// fixed probe width is tuned against the planted clusters, so
+        /// synthetic runs sit ~0.99 and the supertable tripwires keep
+        /// their full sensitivity here — only real corpora need the loose
+        /// floor above.
+        const SUPERFILE_SYNTHETIC: Self = Self {
+            correctness: CORRECTNESS_RECALL_FLOOR,
+            default_config: DEFAULT_CONFIG_RECALL_FLOOR,
+        };
+
+        /// The superfile tier's floors for the active corpus source.
+        pub fn superfile() -> Self {
+            match corpus::corpus_source() {
+                corpus::CorpusSource::Synthetic => Self::SUPERFILE_SYNTHETIC,
+                _ => Self::SUPERFILE_REAL,
+            }
+        }
+    }
     pub const CORRECTNESS_NPROBE: usize = 64;
     pub const CORRECTNESS_RERANK_MULT: usize = 256;
     pub const N_CORRECTNESS_QUERIES: usize = 20;
@@ -2178,6 +2236,7 @@ pub mod vector {
         gt_correct: &[Vec<u32>],
         q_cal: &[Vec<f32>],
         gt_cal: &[Vec<u32>],
+        floors: RecallFloors,
         include_warm: bool,
         include_cold: bool,
         cold_iters: usize,
@@ -2226,15 +2285,17 @@ pub mod vector {
                     default_rerank,
                 );
                 eprintln!(
-                    "[{log_prefix}] default-config: recall@{k} = {default:.3} (floor {DEFAULT_CONFIG_RECALL_FLOOR:.2})",
+                    "[{log_prefix}] default-config: recall@{k} = {default:.3} (floor {:.2})",
+                    floors.default_config,
                 );
                 // The printed floor is a real gate, not decoration — this
                 // was previously print-only, so a recall collapse in skip
                 // mode sailed through green.
                 assert!(
-                    default >= DEFAULT_CONFIG_RECALL_FLOOR,
+                    default >= floors.default_config,
                     "{log_prefix} default-config vector recall@{k} {default:.3} < floor \
-                     {DEFAULT_CONFIG_RECALL_FLOOR:.2}"
+                     {:.2}",
+                    floors.default_config
                 );
                 default_recall = Some(default);
             }
@@ -2254,8 +2315,9 @@ pub mod vector {
                 CORRECTNESS_RERANK_MULT,
             );
             assert!(
-                recall >= CORRECTNESS_RECALL_FLOOR,
-                "{log_prefix} vector recall@{k} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+                recall >= floors.correctness,
+                "{log_prefix} vector recall@{k} {recall:.3} < floor {:.2}",
+                floors.correctness
             );
             eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
 
@@ -2273,8 +2335,9 @@ pub mod vector {
                 default_rerank,
             );
             assert!(
-                default >= DEFAULT_CONFIG_RECALL_FLOOR,
-                "{log_prefix} default-config vector recall@{k} {default:.3} < floor {DEFAULT_CONFIG_RECALL_FLOOR:.2}"
+                default >= floors.default_config,
+                "{log_prefix} default-config vector recall@{k} {default:.3} < floor {:.2}",
+                floors.default_config
             );
             eprintln!("[{log_prefix}] default-config OK: recall@{k} = {default:.3}");
             default_recall = Some(default);

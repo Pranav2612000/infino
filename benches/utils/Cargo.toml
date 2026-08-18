@@ -53,3 +53,12 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+# Static build (vendored HDF5 C sources) so this stays a pure cargo dep:
+# no system libhdf5, no runner/VM provisioning coupling (the A/B bench VM
+# is provisioned by MAIN's workflow via pull_request_target, so a PR can
+# never install system packages for itself). Pinned to 0.11: the newest
+# hdf5-metno whose static build vendors an HDF5 tree with a cmake floor
+# of 3.18 (hdf5-metno-src 0.9.x, HDF5 1.14.6) — 0.12+ pulls src 0.10.x,
+# which demands cmake 3.26 and fails on Ubuntu 22.04's apt cmake 3.22.
+hdf5 = { version = "0.11.0", package = "hdf5-metno", features = ["static"] }
+ndarray = "0.17.2"

@@ -21,7 +21,7 @@ use infino::{
 };
 
 use crate::{
-    corpus::{self, DIM, MmapTextCorpus, MmapVectorCorpus},
+    corpus::{self, MmapTextCorpus, MmapVectorCorpus, dim},
     harness::{emb_for, scatter_key, sql_options, sql_schema},
     markdown::fmt_count,
     rss::fmt_bytes,
@@ -258,7 +258,7 @@ pub(crate) fn schema_for(modality: Modality) -> Arc<Schema> {
             VEC_COLUMN,
             DataType::FixedSizeList(
                 Arc::new(Field::new("item", DataType::Float32, true)),
-                DIM as i32,
+                dim() as i32,
             ),
             false,
         ));
@@ -324,7 +324,7 @@ pub fn options_for(
         vec![VectorConfig {
             provided_centroids: None,
             column: VEC_COLUMN.into(),
-            dim: DIM,
+            dim: dim(),
             rot_seed: ROT_SEED,
             metric: bench_metric(),
             rerank_codec: corpus::bench_rerank_codec(bench_metric()),
@@ -353,8 +353,9 @@ pub fn combined_options(storage: Option<Arc<dyn StorageProvider>>) -> Supertable
 /// The corpus + index knobs this bench config builds with.
 pub fn current_knobs(modality: Modality) -> crate::dataset::Knobs {
     crate::dataset::Knobs {
+        corpus: corpus::corpus_label().to_string(),
         doc_count: n_docs(),
-        dim: DIM,
+        dim: dim(),
         n_cent_total: corpus::n_cent(n_docs()),
         vec_seed: CORPUS_VEC_SEED,
         text_seed: CORPUS_TEXT_SEED,
@@ -402,7 +403,7 @@ impl PreparedCorpus {
         let vec = self
             .vectors
             .as_ref()
-            .map(|_| (n_docs() * DIM * size_of::<f32>()) as u64)
+            .map(|_| (n_docs() * dim() * size_of::<f32>()) as u64)
             .unwrap_or(0);
         text + vec + self.sql_embed_bytes
     }
@@ -418,7 +419,28 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     // post-drain → delta → compact). Generate base + that tail once so
     // the delta batch does not regenerate.
     let corpus_docs = n_docs + docs_per_commit();
+    if !corpus::corpus_has_text() && (modality.has_text() || modality.has_sql()) {
+        panic!(
+            "corpus {} carries no text column, so the {} modality cannot run on it — \
+             use a text-bearing dataset (e.g. hf:KShivendu/dbpedia-entities-openai-1M) \
+             or the synthetic corpus",
+            corpus::corpus_label(),
+            modality_label(modality)
+        );
+    }
     let text = modality.has_text().then(|| {
+        if !matches!(corpus::corpus_source(), corpus::CorpusSource::Synthetic) {
+            let source = corpus::corpus_source();
+            eprintln!(
+                "[supertable_ingest] loading {} {} text docs...",
+                fmt_count(corpus_docs),
+                corpus::corpus_label()
+            );
+            let shards = corpus::parquet_shards_for(source);
+            return MmapTextCorpus::from_parquet_shards(&shards, corpus_docs)
+                .or_else(|_| MmapTextCorpus::from_parquet_shards(&shards, n_docs))
+                .unwrap_or_else(|e| panic!("failed to load the dataset's text column: {e}"));
+        }
         eprintln!(
             "[supertable_ingest] generating {} -doc text corpus (mmap-backed)...",
             fmt_count(corpus_docs)
@@ -432,7 +454,8 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
             // shape `generate` writes). Accept both; `vector_delta_batch`
             // regenerates the tail when only the base rows are present.
             eprintln!(
-                "[supertable_ingest] opening persisted {} ×{DIM} vector corpus from {}...",
+                "[supertable_ingest] opening persisted {} ×{} vector corpus from {}...",
+                dim(),
                 fmt_count(n_docs),
                 path.display()
             );
@@ -445,10 +468,49 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
                         path.display()
                     )
                 })
+        } else if !matches!(corpus::corpus_source(), corpus::CorpusSource::Synthetic)
+            && !matches!(
+                corpus::corpus_source(),
+                corpus::CorpusSource::AnnBenchmarks { .. }
+            )
+        {
+            // Parquet dataset (downloaded or local): the tail past `n_docs`
+            // stays uningested so it can serve as held-out queries.
+            let source = corpus::corpus_source();
+            eprintln!(
+                "[supertable_ingest] loading {} ×{} {} vectors...",
+                fmt_count(n_docs),
+                dim(),
+                corpus::corpus_label()
+            );
+            let shards = corpus::parquet_shards_for(source);
+            MmapVectorCorpus::from_parquet_shards(&shards, corpus_docs, dim(), true)
+                .or_else(|_| MmapVectorCorpus::from_parquet_shards(&shards, n_docs, dim(), true))
+                .unwrap_or_else(|error| panic!("failed to load the parquet dataset: {error}"))
+        } else if let corpus::CorpusSource::AnnBenchmarks { dir, slug } = corpus::corpus_source() {
+            // Real dataset: base + delta rows when it is deep enough, else
+            // base-only (the delta tail regenerates, the same contract as a
+            // base-only persisted corpus above).
+            eprintln!(
+                "[supertable_ingest] loading {} ×{} {slug} vectors from {}...",
+                fmt_count(n_docs),
+                dim(),
+                dir.display()
+            );
+            MmapVectorCorpus::from_hdf5(dir, slug, corpus_docs, dim(), true)
+                .or_else(|_| MmapVectorCorpus::from_hdf5(dir, slug, n_docs, dim(), true))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to load {slug} from {} with either {corpus_docs} \
+                         (base + delta) or {n_docs} (base-only) rows: {error}",
+                        dir.display()
+                    )
+                })
         } else {
             eprintln!(
-                "[supertable_ingest] generating {} ×{DIM} vector corpus (mmap-backed)...",
-                fmt_count(corpus_docs)
+                "[supertable_ingest] generating {} ×{} vector corpus (mmap-backed)...",
+                fmt_count(corpus_docs),
+                dim()
             );
             MmapVectorCorpus::generate(corpus_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true)
         }
@@ -458,7 +520,7 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     // vector index, so `has_vector()` is false) — sized here so
     // `byte_size()` still counts it.
     let sql_embed_bytes = if modality.has_sql() {
-        (n_docs * DIM * size_of::<f32>()) as u64
+        (n_docs * dim() * size_of::<f32>()) as u64
     } else {
         0
     };
@@ -865,7 +927,7 @@ fn chunk_batch(
             .as_ref()
             .expect("vector modality has a vector corpus")
             .as_slice();
-        let flat = &all[start * DIM..end * DIM];
+        let flat = &all[start * dim()..end * dim()];
         columns.push(vector_array(flat));
     }
     RecordBatch::try_new(schema.clone(), columns).expect("batch")
@@ -875,7 +937,7 @@ pub(crate) fn vector_array(flat: &[f32]) -> Arc<dyn Array> {
     Arc::new(
         FixedSizeListArray::try_new(
             Arc::new(Field::new("item", DataType::Float32, true)),
-            DIM as i32,
+            dim() as i32,
             Arc::new(Float32Array::from(flat.to_vec())) as Arc<dyn Array>,
             None,
         )

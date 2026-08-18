@@ -6589,15 +6589,33 @@ mod tests {
             .expect("raw search");
         // Stable ids are per-table snowflakes; compare table-relative
         // positions (ids are minted sequentially over the same ingest
-        // order, so offsets from the smallest returned id identify docs).
-        let positions = |hits: &[SuperfileHit]| -> Vec<i128> {
+        // Identify hits by the RANK of their stable id among the ids this
+        // query returned, never by arithmetic on the ids themselves. Both
+        // tables ingest the same batch in the same order, so id order
+        // tracks row order — snowflake ids stay monotonic in mint order
+        // even when the millisecond ticks mid-batch. Their DIFFERENCES do
+        // not: a tick bumps the timestamp field and resets the sequence, so
+        // `id - min(ids)` jumps by 2^64-scale amounts and makes two
+        // identical rankings compare unequal. That is a real CI failure
+        // this test produced under parallel load (the sibling filtered-path
+        // test below documents the same timing hazard), and it was never a
+        // ranking difference: the same eight rows came back in the same
+        // order on both sides.
+        let rank_signature = |hits: &[SuperfileHit]| -> Vec<usize> {
             let ids: Vec<i128> = hits.iter().map(|h| h.stable_id.expect("id")).collect();
-            let base = *ids.iter().min().expect("hits");
-            ids.iter().map(|id| id - base).collect()
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            ids.iter()
+                .map(|id| {
+                    sorted
+                        .binary_search(id)
+                        .expect("returned id is in its own sorted set")
+                })
+                .collect()
         };
         assert_eq!(
-            positions(&unit_hits),
-            positions(&raw_hits),
+            rank_signature(&unit_hits),
+            rank_signature(&raw_hits),
             "raw corpus + scaled query must rank exactly like the unit twin"
         );
         for (u, r) in unit_hits.iter().zip(raw_hits.iter()) {

@@ -72,6 +72,8 @@ jobs:
       bench: ${{ matrix.bench }}
       docs: ${{ matrix.docs }}
       metric: ${{ matrix.metric }}
+      corpus: ${{ matrix.corpus }}
+      corpus_dir: ${{ matrix.corpus_dir }}
       ref: ${{ github.event.pull_request.head.sha }}
       name_suffix: -${{ matrix.suffix }}
       pr_number: ${{ github.event.pull_request.number }}

@@ -32,6 +32,38 @@ KEY_PARTS = 4
 # report ("Time", "warm p90") never silently drops a metric from gating.
 HIGHER_BETTER = ("throughput", "bandwidth")
 TEXT_ONLY = ("corpus", "superfiles")
+
+# Byte-valued headers: memory footprints, on-disk sizes, and object-store
+# transfer volumes. These must be classified explicitly rather than inferred,
+# because the merge gate treats every metric it believes is time-valued as
+# nanoseconds: a byte metric reaching it is both formatted as a duration and
+# compared against the millisecond threshold, so a 494 MiB -> 788 MiB
+# file-backed RSS move blocked a merge as "294 ms over a 5 ms gate".
+BYTE_HEADERS = (
+    "rss",
+    "stored",
+    "peak anon",
+    "peak file",
+    "payload",
+    "bytes",
+    "downloaded",
+    "uploaded",
+)
+
+# Count-valued headers: request and row counts, thread counts, and ratios
+# (recall, share). Also not nanoseconds. Substring match on the lowercased
+# header, so "Cold open GET/bytes" and "Warm GET/query" are both covered.
+COUNT_HEADERS = (
+    "get",
+    "put",
+    "head",
+    "requests",
+    "rows",
+    "hits",
+    "threads",
+    "recall",
+    "share of node",
+)
 # Cost cells are USD/queries-per-$ figures, not nanoseconds, and their keys
 # embed volatile text - they do not diff cleanly.
 COST_TOKENS = ("$", "cost", "measured", "per-unit")
@@ -120,10 +152,26 @@ def primary_latency_header_from_gate_metric(metric):
     return "warm p90"
 
 
+def is_bytes(header):
+    return any(t in header.lower() for t in BYTE_HEADERS)
+
+
+def is_count(header):
+    return any(t in header.lower() for t in COUNT_HEADERS)
+
+
 def is_latency(header):
-    """Lower-is-better and measured in nanoseconds (Time, p50, cold, count())."""
-    h = header.lower()
-    return not higher_is_better(header) and "rss" not in h and "stored" not in h
+    """Lower-is-better AND measured in nanoseconds (Time, p50, cold, wall).
+
+    Only these are eligible for the merge gate, which compares raw deltas
+    against a nanosecond threshold. Byte- and count-valued headers are
+    excluded by name: judging them by the absence of a couple of substrings
+    silently swept every new non-time column into the latency gate.
+    `throughput` / `bandwidth` are excluded as higher-is-better.
+    """
+    if higher_is_better(header) or is_bytes(header) or is_count(header):
+        return False
+    return True
 
 
 def human(header, value):
@@ -133,10 +181,16 @@ def human(header, value):
         return f"{value:,.0f} docs/s"
     if "bandwidth" in h:
         return f"{value / 1048576:,.1f} MiB/s"
-    if "rss" in h or "stored" in h:
+    if is_bytes(header):
         if value >= 1073741824:
             return f"{value / 1073741824:.2f} GiB"
-        return f"{value / 1048576:.1f} MiB"
+        if value >= 1048576:
+            return f"{value / 1048576:.1f} MiB"
+        if value >= 1024:
+            return f"{value / 1024:.1f} KiB"
+        return f"{value:,.0f} B"
+    if is_count(header):
+        return f"{value:,.0f}"
     if value >= 1e9:
         return f"{value / 1e9:.2f} s"
     return f"{value / 1e6:.2f} ms"
