@@ -1759,6 +1759,33 @@ fn stream_fp32_rows_to_buckets(
     });
     let chunk_rows = materialized_chunk_rows_for_dim(dim);
     let mut chunk_rotated = vec![0.0f32; chunk_rows * dim];
+    // Cosine rows must be unit before ANY consumer below sees them: the
+    // fixed cosine grid spans [-1, 1], so a non-unit component saturates at
+    // encode — silently, with no error and no clamp counter (the drain's
+    // transcode tripwire only observes RE-encodes). Issue #512 measured
+    // about -10 points of recall@10 from exactly this.
+    //
+    // #520 normalized at `VectorBuilder::add`, described there as "the
+    // single seam every downstream consumer reads through". That holds for
+    // that builder and not for the engine: the supertable buffers the
+    // caller's Arrow vector buffers zero-copy (`BufferedBatch`) and the
+    // commit-time hidden-index pack views them directly
+    // (`VectorColumnView` -> `PackRow::Fp32` -> `build_merged_subsection_
+    // from_fp32`), never passing through that seam. So the user table
+    // stored unit rows while the hidden index — what actually serves vector
+    // search — stored clamped ones.
+    //
+    // Normalizing here covers every fp32 cell build regardless of caller,
+    // and the scratch is chunk-bounded (same sizing as `chunk_rotated`),
+    // not corpus-bounded: normalizing at `append` instead would reintroduce
+    // the commit-wide vector copy `VectorColumnView` exists to avoid
+    // (12.8 GiB at a 3.125M-row x dim-1024 commit).
+    let cosine = cfg.metric == Metric::Cosine;
+    let mut chunk_unit = if cosine {
+        vec![0.0f32; chunk_rows * dim]
+    } else {
+        Vec::new()
+    };
     let mut chunk_codes = vec![0u8; chunk_rows * code_bytes];
     let mut chunk_payload = if fixed {
         vec![0u8; chunk_rows * dim * 2]
@@ -1768,7 +1795,19 @@ fn stream_fp32_rows_to_buckets(
     let mut row_base = 0usize;
     while row_base < n_docs {
         let take = (n_docs - row_base).min(chunk_rows);
-        let chunk = &vectors[row_base * dim..(row_base + take) * dim];
+        let raw = &vectors[row_base * dim..(row_base + take) * dim];
+        let chunk: &[f32] = if cosine {
+            chunk_unit[..take * dim]
+                .par_chunks_mut(dim)
+                .zip(raw.par_chunks(dim))
+                .for_each(|(dst, src)| {
+                    dst.copy_from_slice(src);
+                    normalize(dst);
+                });
+            &chunk_unit[..take * dim]
+        } else {
+            raw
+        };
         let mut assignments = vec![0u32; take];
         assign_to_centroids(chunk, centroids, dim, n_cent, &mut assignments);
         chunk_rotated[..take * dim]
