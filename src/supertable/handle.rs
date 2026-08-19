@@ -1932,9 +1932,10 @@ impl SupertableReader {
     /// The shared `Arc<SupertableInner>` backing this reader. Used to
     /// build a [`WeakReader`] that retains the snapshot without an
     /// owning cycle through a cached `SessionContext`. Module-private:
-    /// `SupertableInner` is module-private, and the only caller is
-    /// [`WeakReader::from_reader`] in this file.
-    fn inner_arc(&self) -> &Arc<SupertableInner> {
+    /// `SupertableInner` is module-private; callers are
+    /// [`WeakReader::from_reader`] in this file and the query module's
+    /// resident-index cache lookup.
+    pub(super) fn inner_arc(&self) -> &Arc<SupertableInner> {
         &self.inner
     }
 
@@ -5940,6 +5941,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let no_removals = Vec::new();
         // The hidden table's own scoped provider — its pointer file, not the
@@ -6142,6 +6144,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let no_removals = Vec::new();
         let hidden_storage = hidden
@@ -6217,6 +6220,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let zero_manifest = hidden
             .block_on_query(persist_commit_async(
@@ -6378,6 +6382,7 @@ mod tests {
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let no_removals = Vec::new();
         let hidden_storage = hidden

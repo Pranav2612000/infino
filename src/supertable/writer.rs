@@ -92,8 +92,8 @@ use super::{
     error::BuildError,
     handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner},
     manifest::{
-        CellVectorSummary, FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SubsectionOffsets,
-        SuperfileEntry, SuperfileUri, VectorSummary, bloom::BloomBuilder,
+        CellVectorSummary, FtsSummaryAgg, ManifestSnapshot, RoutingRef, ScalarStatsAgg,
+        SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary, bloom::BloomBuilder,
     },
     mutations::{
         CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -272,10 +272,19 @@ struct DrainRemoteState {
 }
 
 #[cfg(test)]
+// The shared `After` prefix is the point — each variant names the drain phase
+// the injected failure fires AFTER.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainTestFailurePhase {
     AfterBatch,
     AfterShard,
+    /// Between building the resident graph and the single membership commit
+    /// that stamps cells + `drained_ranges` + the graph together — simulates a
+    /// crash in that gap. Because the commit is atomic, nothing durable
+    /// advanced, so a just-drained row stays visible (served from its user
+    /// superfile) rather than falling into a drained-but-not-yet-in-graph hole.
+    AfterMembershipCommit,
 }
 
 #[cfg(test)]
@@ -1717,6 +1726,7 @@ impl SupertableWriter {
             global_vector_index: pending_gvi.clone(),
             drained_ranges: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
 
         // Vector commit: same row-shard fanout as the legacy path. Each writer
@@ -3221,6 +3231,20 @@ async fn materialized_user_rows_for_drain(
     materialized_ivf_rows_in_doc_order(vec_reader, column, stable_ids, tombstones).await
 }
 
+/// Drain user superfiles into the hidden cell index.
+///
+/// A drain lands in TWO manifest commits:
+///   - **A (membership)** — activates the new cells, advances `drained_ranges`,
+///     and stamps ANY state that gates whether a row is VISIBLE (the resident
+///     `hnsw` graph included, built here against the prospective membership).
+///   - **B (settle)** — recall-quality slow serving state ONLY (routing / probe
+///     law / centroid section); a query is already correct without it.
+///
+/// The split is the invariant, not an accident: visibility-gating state MUST be
+/// atomic with `drained_ranges` (commit A), or a just-drained row falls into a
+/// window where it is drained out of the user arm but not yet in the graph —
+/// invisible to both. Recall-quality overlays belong in B, where lagging only
+/// costs a temporarily wider serving law, never a missing row. Origin: OPANN #422.
 pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     user_inner: Arc<SupertableInner>,
     hidden_inner: Arc<SupertableInner>,
@@ -4151,7 +4175,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .iter()
             .map(|entry| (entry.uri, Arc::clone(entry)))
             .collect();
-        let pending_cache_inserts = publish.pending_cache_inserts;
+        let mut pending_cache_inserts = publish.pending_cache_inserts;
         let pending_store_inserts = publish.pending_store_inserts;
         let multipart_threshold = hidden_inner.options.put_multipart_threshold_bytes;
         let put_futures = publish
@@ -4306,7 +4330,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 routing.rerank_for_k
             );
         }
-        let list_metadata = CommitListMetadata {
+        let mut list_metadata = CommitListMetadata {
             partition_strategy: Some(PartitionStrategy::VectorCell {
                 column: column.clone(),
                 clusters: running_clusters.clone(),
@@ -4315,8 +4339,62 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             drained_ranges: Some(new_drained),
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
+        // Build the resident `hnsw` graph NOW, against a PROSPECTIVE manifest
+        // that already carries this drain's new cells + advanced watermark, and
+        // stamp its ref INTO this membership commit (Commit A) — never in the
+        // later settle. The graph gates query visibility (the hidden arm serves
+        // it), so it MUST land atomically with `drained_ranges`; a lag between
+        // the watermark and the graph is a window where a just-drained row is
+        // invisible to both arms. The cells are already durable objects
+        // (uploaded above), so the prospective's readers can score them; the
+        // graph blob is PUT here and orphaned harmlessly if the commit loses
+        // the CAS. The settle then reuses it (population key matches) → no-op.
+        let old_hidden = hidden_inner.manifest.load_full();
+        let (prospective, _parts) = list_metadata
+            .apply(&old_hidden)
+            .update(&new_entries, &no_removals)
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        // Opt-in gate: only build the resident data graph when queries will
+        // walk it (`search_mode = hnsw_ivf`). Under the default `ivf` (or
+        // `global_fine_centroid`) the drain skips the build — no build tax, no
+        // RAM-pinned graph — and queries serve ivf. Gating here (not inside
+        // `build_hnsw_graph_ref`) keeps that function a pure, directly-testable
+        // build step.
+        let building_graph =
+            crate::config::global().vector.search_mode == crate::config::VectorSearchMode::HnswIvf;
+        // Warm the DISK CACHE with the just-drained cell bytes — already
+        // resident in `pending_cache_inserts` — BEFORE the build, so the graph's
+        // full re-read of these same cells is served from the local cache
+        // instead of a cold GET of data we wrote seconds ago (the dominant
+        // drain-time cost on object-store deployments). This pre-build warm
+        // exists ONLY to serve that re-read, so it is gated on the graph path:
+        // under `ivf`/`gfc` there is no re-read, and warming here would just
+        // overlap the warmed bytes with the commit's own buffers (higher peak
+        // file memory) for no benefit — those modes warm AFTER the commit
+        // below, matching the non-graph baseline. The disk cache is URI-keyed
+        // and LRU-bounded, so if the membership CAS below loses, these entries
+        // are unreferenced and evicted under budget pressure. The in-memory
+        // store tier is NOT warmed here: it has no eviction, so pre-committing
+        // to it would pin bytes on a failed drain.
+        if building_graph
+            && !pending_cache_inserts.is_empty()
+            && let Some(cache) = hidden_inner.options.disk_cache.as_ref()
+        {
+            warm_cache_after_commit(&hidden_inner, cache, mem::take(&mut pending_cache_inserts));
+        }
+        let graph_ref = if building_graph {
+            build_hnsw_graph_ref(storage.as_ref(), &prospective).await
+        } else {
+            None
+        };
+        list_metadata.graph_ref = Some(graph_ref);
+        // Commit A (membership). Visibility-gating state MUST land here,
+        // atomically with `drained_ranges`: cells, watermark, and the resident
+        // graph in one CAS. Do not defer any of it to the settle below.
         let new_manifest = persist_commit_async(
             &hidden_inner,
             Arc::clone(&storage),
@@ -4329,7 +4407,25 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         .await
         .map_err(BuildError::from)?;
         hidden_inner.manifest.store(Arc::new(new_manifest));
+        // Simulate a crash AFTER the membership commit landed but BEFORE settle.
+        // With the atomic fix the commit already carries the graph, so the
+        // just-drained rows stay visible without the settle; a test asserts
+        // that here. Pre-fix, the graph lagged in settle and the rows were
+        // invisible in exactly this gap.
+        #[cfg(test)]
+        maybe_fail_drain_for_test(
+            &remote_state.checkpoint.epoch_id,
+            DrainTestFailurePhase::AfterMembershipCommit,
+            0,
+        )?;
+        // In-memory store tier (cache-less deployments only): warmed after the
+        // commit succeeds, so a lost CAS never pins bytes in the non-evicting
+        // store.
         apply_pending_store_inserts(&hidden_inner, pending_store_inserts);
+        // Disk-cache warm for the non-graph path (`ivf`/`gfc`): after the
+        // commit, matching the baseline ordering (lower peak file memory than
+        // warming before the commit). A no-op when the graph path already
+        // consumed the inserts in the pre-build warm above.
         if !pending_cache_inserts.is_empty()
             && let Some(cache) = hidden_inner.options.disk_cache.as_ref()
         {
@@ -6375,6 +6471,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         drained_ranges: None,
         global_vector_index: None,
         superseded_cells_additions: Some(superseded_additions),
+        graph_ref: None,
     };
     let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
     let new_manifest = match persist_commit_async(
@@ -6855,6 +6952,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         drained_ranges: None,
         global_vector_index: None,
         superseded_cells_additions: Some(superseded_additions),
+        graph_ref: None,
     };
     let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
     let new_manifest = match persist_commit_async(
@@ -7522,6 +7620,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             drained_ranges: None,
             global_vector_index: None,
             superseded_cells_additions: None,
+            graph_ref: None,
         };
         let base = Arc::new(list_metadata.apply(&manifest));
         let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
@@ -7683,6 +7782,207 @@ async fn previous_centroid_section(
     }
 }
 
+/// One-`u64` population key for the persisted `hnsw` graph — a
+/// digest of *which rows exist*, independent of how they are packed into
+/// superfiles. Built from repack-invariant aggregates (row count, min and
+/// max stable id) plus the consolidated delete generation (the manifest's
+/// deleted-id bytes), so:
+///   - a compaction that only repacks the same rows keeps the key stable →
+///     the settle reuses the existing graph (no rebuild);
+///   - any add or delete moves the key → rebuild.
+/// It stays one value (not per-node) and does not assume monotonic ids:
+/// min, max, and count together move under non-monotonic inserts and
+/// deletes. A hash collision only ever costs a spurious reuse/rebuild, not
+/// correctness — the copy-flip and query-time doc-id dedup are the
+/// correctness guards.
+fn graph_population_key(manifest: &ManifestSnapshot) -> u64 {
+    let entries = manifest.get_all_superfiles();
+    let count: u64 = entries.iter().map(|e| e.n_docs).sum();
+    let min_id = entries.iter().map(|e| e.id_min).min().unwrap_or(0);
+    let max_id = entries.iter().map(|e| e.id_max).max().unwrap_or(0);
+    // FNV-1a: deterministic across processes (unlike the std hasher), so a
+    // key recomputed at open matches one persisted at drain.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    mix(&count.to_le_bytes());
+    mix(&min_id.to_le_bytes());
+    mix(&max_id.to_le_bytes());
+    if let Some(deleted) = manifest.deleted_user_ids_inline() {
+        mix(deleted);
+    }
+    h
+}
+
+/// Encode + PUT a data bundle as a graph section, logging the outcome.
+async fn publish_hnsw_blob(
+    storage: &dyn StorageProvider,
+    population_key: u64,
+    high_water: i128,
+    data_bundle: &[u8],
+) -> Option<crate::supertable::manifest::list::RoutingRef> {
+    let blob = crate::superfile::vector::hnsw::encode_graph_bundle(
+        population_key,
+        high_water,
+        &[],
+        Some(data_bundle),
+    );
+    let blob_mib = blob.len() / (1024 * 1024);
+    match slow_vector_state::write_graph_section(storage, blob).await {
+        Ok(reference) => {
+            tracing::debug!(uri = %reference.uri, blob_mib, "hnsw: published graph section");
+            Some(reference)
+        }
+        Err(error) => {
+            tracing::warn!("hnsw: publish failed: {error}");
+            None
+        }
+    }
+}
+
+/// Build and publish the persisted `hnsw` graph blob for a settled
+/// generation, returning its manifest ref (`None` when nothing is
+/// persisted). Best-effort: any read/build/publish problem logs and
+/// returns `None` so the drain stamp is never blocked and the query falls
+/// back to the lazy build or scan path.
+///
+/// When the prior generation already persisted a graph and this settle only
+/// **appended** rows, the delta is inserted into a copy of that graph
+/// ([`assemble_hnsw_incremental`]). The graph insert is ∝ new rows, and the
+/// post-insert recall recheck is bounded to a strided probe subsample once
+/// the grown corpus exceeds `hnsw_probe_max_docs` — so neither scales with
+/// the whole population (only the scan that locates the append delta does).
+/// Otherwise (no prior graph, or a non-append change) it does a full
+/// rebuild. PUT-before-CAS: the blob is durable before the caller stamps the
+/// manifest ref, so a crash before the manifest CAS just orphans the blob
+/// (GC-reclaimed) and keeps serving the prior generation.
+///
+/// Scope: the per-row **data** graph for the first vector column, gated here
+/// by `vector.hnsw_max_docs` (RAM ceiling). The opt-in `vector.search_mode =
+/// hnsw_ivf` gate lives at the sole caller (the drain), so this stays a pure
+/// build step — directly callable in tests without touching global config. The
+/// scale-free **centroid** graph is not yet built here — the bundle carries an
+/// empty centroid section.
+async fn build_hnsw_graph_ref(
+    storage: &dyn StorageProvider,
+    manifest: &ManifestSnapshot,
+) -> Option<crate::supertable::manifest::list::RoutingRef> {
+    let Some(column) = manifest
+        .options
+        .vector_columns
+        .first()
+        .map(|vc| vc.column.clone())
+    else {
+        tracing::debug!("hnsw: build skipped — no vector columns on this manifest");
+        return None;
+    };
+    let total_docs: u64 = manifest.get_all_superfiles().iter().map(|e| e.n_docs).sum();
+    let max_docs = crate::config::global().vector.hnsw_max_docs;
+    tracing::debug!(
+        column,
+        total_docs,
+        max_docs,
+        superfiles = manifest.get_all_superfiles().len(),
+        "hnsw: build hook"
+    );
+    if total_docs > max_docs {
+        tracing::info!(
+            total_docs,
+            max_docs,
+            "hnsw: build skipped — docs exceed hnsw_max_docs (data graph would exceed RAM)"
+        );
+        return None;
+    }
+    let population_key = graph_population_key(manifest);
+    let high_water_now = manifest
+        .get_all_superfiles()
+        .iter()
+        .map(|e| e.id_max)
+        .max()
+        .unwrap_or(0);
+    let t0 = std::time::Instant::now();
+
+    // Incremental append: extend the prior persisted graph with only the new
+    // rows, cloning it (fetch + decode) rather than mutating a serving graph.
+    if let Some(prior_ref) = manifest.slow_vector_state_graphs_blob()
+        && let Ok(sections) = slow_vector_state::fetch_graph_sections(storage, prior_ref).await
+        && let Some(prior_data) = sections.data
+    {
+        let prior_count = prior_data.doc_ids.len();
+        match crate::supertable::query::vector::assemble_hnsw_incremental(
+            manifest,
+            &column,
+            &None,
+            prior_data,
+            sections.high_water_id,
+        )
+        .await
+        {
+            Ok(Some((data_bundle, new_high_water, inserted))) => {
+                tracing::debug!(
+                    inserted,
+                    nodes = prior_count + inserted,
+                    data_bundle_mib = data_bundle.len() / (1024 * 1024),
+                    wall_s = t0.elapsed().as_secs_f64(),
+                    "hnsw: incremental insert into prior graph"
+                );
+                return publish_hnsw_blob(storage, population_key, new_high_water, &data_bundle)
+                    .await;
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    "hnsw: incremental not applicable (not a pure append); full rebuild"
+                );
+            }
+            Err(error) => {
+                tracing::debug!("hnsw: incremental error ({error}); full rebuild");
+            }
+        }
+    }
+
+    // Full rebuild.
+    let data_bundle = match crate::supertable::query::vector::assemble_hnsw_sections(
+        manifest, &column, &None,
+    )
+    .await
+    {
+        Ok(Some(bundle)) => bundle,
+        Ok(None) => {
+            tracing::debug!(
+                column,
+                "hnsw: build skipped — no Sq16 rows assembled (column absent, not sq16, or empty)"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!("hnsw: build skipped — assemble error: {error}");
+            return None;
+        }
+    };
+    tracing::debug!(
+        total_docs,
+        data_bundle_mib = data_bundle.len() / (1024 * 1024),
+        wall_s = t0.elapsed().as_secs_f64(),
+        "hnsw: built graph (full)"
+    );
+    publish_hnsw_blob(storage, population_key, high_water_now, &data_bundle).await
+}
+
+/// Publish/refresh the slow-CAS serving state (Commit B, "settle").
+///
+/// ONLY recall-quality overlay state belongs here — the routing blob, probe
+/// law, and centroid section. Between the membership commit (A) and this
+/// settle, a just-drained row is still VISIBLE (served from its cells under the
+/// default routing); B only UPGRADES the serving law. NEVER stamp anything here
+/// that gates visibility — it opens a window where the row is invisible to both
+/// arms across the A→B gap and durably so across a crash between them. The
+/// resident `hnsw` graph is visibility-critical, so it is stamped in Commit A
+/// (against the prospective membership), not here; this pass finds it already
+/// present with a matching population key and reuses it (a no-op).
 pub(in crate::supertable) async fn stamp_slow_vector_state(
     inner: &SupertableInner,
     pending_drain: Option<slow_vector_state::PendingDrainState>,
@@ -7703,8 +8003,9 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
         };
         let entries = old.get_all_superfiles();
         if entries.is_empty() && pending_drain.is_none() {
-            // Nothing to describe (pre-drain / empty table); the ref is
-            // already absent because `update` never carries it forward.
+            // Nothing to describe (pre-drain / empty table): no routing blob
+            // or centroid section to stamp, and a never-drained table has no
+            // graph ref either.
             return Ok(());
         }
         // Carried-forward entries are stripped (routing-shaped hydration);
@@ -7731,16 +8032,36 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             }
         }
         .map_err(|e| BuildError::Store(e.to_string()))?;
+        // The `hnsw` graph is built and stamped ONLY in the membership commit
+        // (Commit A), atomically with `drained_ranges`. This settle carries the
+        // prior ref forward untouched and NEVER builds. The graph is
+        // packing-invariant (keyed by `stable_id`), so the prior ref is correct
+        // in every case that reaches here: a drain already rebuilt it in
+        // Commit A; a compaction / merge / split repacks the same id population,
+        // so the same graph still covers it; a legacy generation carries no ref
+        // and stays on ivf until its next drain rebuilds one.
+        //
+        // Building here would let the graph be stamped outside the membership
+        // commit — a lag between the watermark and the graph is a window where a
+        // just-drained row is invisible to both arms, the exact visibility gap
+        // the atomic-drain stamp closes.
+        let graphs_ref = old.slow_vector_state_graphs_blob().cloned();
+        // No-op only when NOTHING changed — routing blob, centroid section,
+        // and the resolved graph ref all already stamped.
         if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()
             && cur_uri == published.uri
             && cur_hash == published.content_hash
             && old.slow_vector_state_centroids_blob() == Some(&published.centroids)
+            && old.slow_vector_state_graphs_blob() == graphs_ref.as_ref()
         {
-            // Same membership already stamped — republish is a no-op.
             return Ok(());
         }
-        let new_manifest =
-            old.with_slow_vector_state(published.uri, published.content_hash, published.centroids);
+        let new_manifest = old.with_slow_vector_state(
+            published.uri,
+            published.content_hash,
+            published.centroids,
+            graphs_ref,
+        );
         let attempted_id = new_manifest.get_manifest_id();
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await
@@ -7870,6 +8191,15 @@ pub(crate) struct CommitListMetadata {
     /// superfiles here so their now-dead blocks are excluded from reads,
     /// counts, and merges without rewriting the parents.
     pub(crate) superseded_cells_additions: Option<BTreeMap<Uuid, BTreeSet<u32>>>,
+    /// The resident `hnsw` graph ref to stamp in THIS commit (`Some(inner)`
+    /// where `inner` is the built ref, or `None` if the graph declined). The
+    /// graph gates query visibility, so a drain builds it against the
+    /// prospective post-drain membership and stamps it HERE, atomically with
+    /// `drained_ranges` — never in a later settle, which would open a window
+    /// where a just-drained row is invisible to both serving arms. `None`
+    /// (the outer option) leaves the graph ref as `update` carried it forward
+    /// — the only correct value for every non-drain commit.
+    pub(crate) graph_ref: Option<Option<RoutingRef>>,
 }
 
 impl CommitListMetadata {
@@ -7882,6 +8212,7 @@ impl CommitListMetadata {
             && self.global_vector_index.is_none()
             && self.drained_ranges.is_none()
             && self.superseded_cells_additions.is_none()
+            && self.graph_ref.is_none()
     }
 
     /// Overlay stamped fields onto `base`. `ManifestSnapshot` is not
@@ -7900,6 +8231,13 @@ impl CommitListMetadata {
         }
         if let Some(additions) = &self.superseded_cells_additions {
             out = out.with_superseded_cells_added(additions);
+        }
+        if let Some(graphs) = &self.graph_ref {
+            // Stamp the graph ref so it lands atomically with membership +
+            // `drained_ranges`. `update` (in `try_commit_attempt`) carries this
+            // field forward and `with_slow_vector_state_ref` preserves it, so
+            // the graph ref survives to the durable list/pointer CAS.
+            out = out.with_slow_vector_state_graphs(graphs.clone());
         }
         out
     }
@@ -8306,6 +8644,10 @@ pub(crate) async fn try_commit_attempt(
                     ManifestLoadError::SlowStateHydration(e.to_string()),
                 ))
             })?;
+            // Membership-commit path: the graph ref is left as `update`
+            // carried it forward (the settle's `stamp_slow_vector_state` pass
+            // keys on the doc-id population to reuse or rebuild it); the
+            // membership commit itself never touches it.
             new_manifest = new_manifest.with_slow_vector_state_ref(
                 published.uri,
                 published.content_hash,
@@ -8772,6 +9114,73 @@ mod tests {
     /// Boundary test target that permits one extra posting per input row.
     const BOUNDARY_STUB_TARGET_FACTOR: f32 = 2.0;
 
+    /// End-to-end coverage of the opt-in `hnsw_ivf` drain-build path, which the
+    /// default `ivf` mode no longer exercises (the caller now gates the build).
+    /// Drives the caller-gated build step directly on the drained cells
+    /// (`build_hnsw_graph_ref` → the full `assemble_hnsw_sections` build +
+    /// `publish_hnsw_blob` internally), fetches the published graph back, and
+    /// asserts it actually SERVES — a query on the batch's axis finds its exact
+    /// row through the fetched graph. Behavioral coverage, not a
+    /// build-and-forget stub: it would catch a wrong node→id map or a build
+    /// whose rows are unreachable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hnsw_drain_full_build_serves_its_rows() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let dim = 32usize;
+        let rows = 256usize;
+        let half = dim / 2;
+        let table = Supertable::create(
+            options_title_emb_sq16(dim)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_batch_superfiles(1),
+        )
+        .expect("create");
+
+        let nearest = |data: &crate::superfile::vector::hnsw::HnswIndex, axis: usize| -> f32 {
+            let mut q = vec![0.0f32; dim];
+            q[axis] = 1.0;
+            data.graph
+                .search(&data.scorer, &q, 5, 128)
+                .into_iter()
+                .map(|(_, d)| d)
+                .fold(f32::INFINITY, f32::min)
+        };
+
+        // Batch 1 on axes [0, half): append + drain (cells only — the default
+        // ivf caller-gate skips the graph build).
+        {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch_range(rows, dim, 0, half))
+                .expect("append batch 1");
+            writer.commit().expect("commit batch 1");
+        }
+        let (hidden, _epoch) = current_drain_epoch(&table).await;
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("first drain");
+
+        // Full build directly off the drained cells (the now caller-gated step).
+        let reader1 = hidden.reader().expect("hidden reader");
+        let ref1 = build_hnsw_graph_ref(storage.as_ref(), reader1.manifest())
+            .await
+            .expect("full build registers a graph");
+        let prior = slow_vector_state::fetch_graph_sections(storage.as_ref(), &ref1)
+            .await
+            .expect("fetch built graph")
+            .data
+            .expect("data graph present after full build");
+        assert!(
+            nearest(&prior, 1) < 0.05,
+            "full-build graph must serve a batch-1 row"
+        );
+    }
+
     /// Default shard target for the fanout unit tests, in bytes — mirrors the shipped
     /// `superfile_buffer_split_mb` default (64 MiB).
     const TEST_SPLIT_BYTES: usize = 64 * MIB;
@@ -9080,6 +9489,121 @@ mod tests {
                 .is_none(),
             "settled slow-CAS state must not retain a drain checkpoint"
         );
+    }
+
+    /// A crash in the drain WINDOW — after the membership commit (cells +
+    /// `drained_ranges` + graph) but before the settle — must NOT hide the
+    /// just-drained rows. With the graph stamped atomically in the membership
+    /// commit, a batch-2 row (its `_id` past batch 1's) is served by the hidden
+    /// graph even though the settle never ran. Pre-fix (graph stamped only at
+    /// settle) the second drain advanced `drained_ranges` past batch 2 while the
+    /// graph still covered batch 1 only, so batch-2 rows were invisible to both
+    /// arms in exactly this gap — this test FAILS on that behavior.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_window_keeps_just_drained_rows_visible() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let dim = 32usize;
+        let rows = 256usize;
+        let options = options_title_emb_sq16(dim)
+            .with_storage(storage)
+            .with_drain_batch_superfiles(1);
+        let table = Supertable::create(options).expect("create");
+        // Batch 1 occupies axes [0, dim/2); batch 2 the DISJOINT [dim/2, dim).
+        // A query on a batch-2 axis has an EXACT match (distance ~0) only if the
+        // batch-2 rows are visible; if only batch-1 is served, the nearest row
+        // is orthogonal (cosine distance ~1).
+        let half = dim / 2;
+        let batch2_axis = half + 3;
+
+        // Batch 1: append + commit, then drain FULLY so the graph (G1, batch-1
+        // rows only) is built and settled.
+        {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch_range(rows, dim, 0, half))
+                .expect("append batch 1");
+            writer.commit().expect("commit batch 1");
+        }
+        {
+            let (hidden, _epoch) = current_drain_epoch(&table).await;
+            drain_user_superfiles_to_hidden_cells(
+                Arc::clone(table.inner()),
+                Arc::clone(hidden.inner()),
+            )
+            .await
+            .expect("first drain settles G1");
+        }
+
+        // Batch 2: append + commit — DISJOINT axes [dim/2, dim).
+        {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch_range(rows, dim, half, dim))
+                .expect("append batch 2");
+            writer.commit().expect("commit batch 2");
+        }
+
+        // Second drain: crash AFTER the membership commit, BEFORE the settle.
+        let (hidden, epoch_id) = current_drain_epoch(&table).await;
+        inject_drain_test_failure(
+            epoch_id.clone(),
+            DrainTestFailurePhase::AfterMembershipCommit,
+            0,
+        );
+        let crashed = drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await;
+        assert!(
+            crashed.is_err(),
+            "the injected crash must stop the second drain before settle"
+        );
+
+        // The just-drained batch-2 rows must still be visible: the membership
+        // commit carried the graph, so a query on a batch-2 axis finds its exact
+        // match even though the settle never ran.
+        let mut q = vec![0.0f32; dim];
+        q[batch2_axis] = 1.0;
+        let batch2_visible = |label: &str| {
+            let hits = table
+                .reader()
+                .expect("reader")
+                .vector_hits(
+                    "emb",
+                    &q,
+                    2 * rows,
+                    crate::superfile::reader::VectorSearchOptions::new().with_nprobe(32),
+                    None,
+                )
+                .expect("vector search");
+            // Cosine distance ~0 means an exact batch-2 direction match was
+            // found; ~1 means only orthogonal batch-1 rows are served.
+            let best = hits
+                .iter()
+                .map(|h| h.score)
+                .min_by(|a, b| a.total_cmp(b))
+                .unwrap_or(f32::INFINITY);
+            assert!(
+                best < 0.05,
+                "{label}: a just-drained batch-2 row (axis {batch2_axis}) must be visible in \
+                 the drain window; nearest distance {best} (>= 1 means batch-2 was invisible), \
+                 {} hits",
+                hits.len()
+            );
+        };
+        batch2_visible("after mid-drain crash");
+
+        // A subsequent drain settles cleanly; the rows stay visible.
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("resume drain settles");
+        batch2_visible("after settle");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9418,13 +9942,43 @@ mod tests {
         .with_writer_pool(writer_pool_with(1))
     }
 
+    /// Like [`options_title_emb_serial`] but Sq16-coded, so the drain builds and
+    /// serves the resident `hnsw` graph (the graph is only assembled over Sq16
+    /// rows) — required to exercise the graph serving path.
+    fn options_title_emb_sq16(dim: usize) -> SupertableOptions {
+        SupertableOptions::new(
+            schema_id_title_emb(dim),
+            vec![],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq16,
+                provided_centroids: None,
+            }],
+            Some(tok()),
+        )
+        .expect("valid options")
+        .with_writer_pool(writer_pool_with(1))
+    }
+
     fn build_axis_vector_batch(n: usize, dim: usize) -> RecordBatch {
+        build_axis_vector_batch_range(n, dim, 0, dim)
+    }
+
+    /// `n` one-hot rows whose active axis cycles over `[lo, hi)` — lets two
+    /// batches occupy DISJOINT direction ranges so a query on one range's axis
+    /// distinguishes which batch's rows are visible.
+    fn build_axis_vector_batch_range(n: usize, dim: usize, lo: usize, hi: usize) -> RecordBatch {
+        let span = (hi - lo).max(1);
         let titles =
             LargeStringArray::from((0..n).map(|i| format!("doc {i} beta")).collect::<Vec<_>>());
         let mut flat = Vec::with_capacity(n * dim);
         for row in 0..n {
+            let active = lo + (row % span);
             for d in 0..dim {
-                flat.push(if d == row % dim { 1.0 } else { 0.0 });
+                flat.push(if d == active { 1.0 } else { 0.0 });
             }
         }
         let values = Arc::new(Float32Array::from(flat));

@@ -154,6 +154,14 @@ pub struct Manifest {
     /// Stamped and cleared together with the full ref; absent on older
     /// manifests (consumers fall back to per-superfile centroid reads).
     pub slow_vector_state_centroids: Option<RoutingRef>,
+    /// Graph-sections sibling of the slow-CAS state: one content-addressed
+    /// blob holding the persisted `hnsw` HNSW graphs — the per-row
+    /// data graph (present only when the table was within the data-graph
+    /// scale ceiling at drain) and the fp32 centroid graph (any scale).
+    /// Stamped and cleared together with the centroid ref; absent on older
+    /// manifests and above the scale ceiling (consumers fall back to the
+    /// lazy build or the scan path).
+    pub slow_vector_state_graphs: Option<RoutingRef>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -1216,6 +1224,10 @@ struct ManifestDto {
     slow_vector_state_centroids_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slow_vector_state_centroids_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_graphs_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_vector_state_graphs_content_hash: Option<String>, // "blake3:<64hex>"
     partition_strategy: PartitionStrategyDto,
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
@@ -1781,6 +1793,11 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .slow_vector_state_centroids
             .as_ref()
             .map(|r| encode_hash(&r.content_hash)),
+        slow_vector_state_graphs_uri: l.slow_vector_state_graphs.as_ref().map(|r| r.uri.clone()),
+        slow_vector_state_graphs_content_hash: l
+            .slow_vector_state_graphs
+            .as_ref()
+            .map(|r| encode_hash(&r.content_hash)),
         parts,
         tombstone_seqs: l
             .tombstone_seqs
@@ -1878,6 +1895,17 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
         slow_vector_state_centroids: match (
             d.slow_vector_state_centroids_uri,
             d.slow_vector_state_centroids_content_hash.as_deref(),
+        ) {
+            (Some(uri), Some(hash)) => Some(RoutingRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+            }),
+            _ => None,
+        },
+        // Same both-halves discipline as the centroid ref above.
+        slow_vector_state_graphs: match (
+            d.slow_vector_state_graphs_uri,
+            d.slow_vector_state_graphs_content_hash.as_deref(),
         ) {
             (Some(uri), Some(hash)) => Some(RoutingRef {
                 uri,
@@ -2492,6 +2520,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_vector_state_graphs: None,
             parts: vec![],
         }
     }
@@ -2627,6 +2656,25 @@ mod tests {
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");
         assert_lists_equal(&decoded, &list);
+    }
+
+    /// Version compat: a manifest serialized before the hnsw graph feature has
+    /// no `slow_vector_state_graphs_*` fields. The ref is `None`, so the wire
+    /// form omits them (skip_serializing_if) — byte-identical to a pre-feature
+    /// manifest — and it must decode back to `None`, never a missing-field
+    /// error. Older tables then fall back to ivf and rebuild on first drain.
+    #[test]
+    fn manifest_without_graph_ref_decodes_to_none() {
+        let list = empty_list();
+        assert!(list.slow_vector_state_graphs.is_none());
+        let bytes = encode(&list).expect("encode");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert!(
+            json.get("slow_vector_state_graphs_uri").is_none(),
+            "absent graph ref must be omitted from the wire form (pre-feature shape)"
+        );
+        let decoded = decode(&bytes).expect("pre-feature manifest must decode");
+        assert!(decoded.slow_vector_state_graphs.is_none());
     }
 
     #[test]

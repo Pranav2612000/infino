@@ -33,6 +33,7 @@ use uuid::Uuid;
 
 use crate::{
     storage::{StorageError, StorageProvider},
+    superfile::vector::hnsw,
     supertable::manifest::{
         SuperfileEntry, VectorSummary,
         encoding::SummaryWireMode,
@@ -364,6 +365,30 @@ impl CentroidSection {
         &self.uri
     }
 
+    /// Raw fp32-le fine-centroid bytes for one cell (cluster-major,
+    /// `n_cent × dim × 4`), exactly as they sit in the section. `Ok(None)`
+    /// when the `(superfile, column, cell)` triple is absent; a spill-read
+    /// fault is an error, never "absent". The global-fine router scores
+    /// against these bytes directly through the SIMD `score_centroids`
+    /// owner (which takes `&[u8]`), so no `Vec<f32>` round-trip.
+    pub(crate) fn read_cell_bytes(
+        &self,
+        superfile_id: Uuid,
+        column: &str,
+        cell_id: Option<u32>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let Some(cells) = self.cells.get(&(superfile_id, column.to_owned())) else {
+            return Ok(None);
+        };
+        let Some(cell) = cells.iter().find(|c| c.cell_id == cell_id) else {
+            return Ok(None);
+        };
+        let len = cell.n_cent as usize * cell.dim as usize * 4;
+        let mut buf = vec![0u8; len];
+        self.spill.as_file().read_exact_at(&mut buf, cell.offset)?;
+        Ok(Some(buf))
+    }
+
     /// Read one cell's fp32 fine centroids (cluster-major, `n_cent × dim`).
     /// `Ok(None)` when the `(superfile, column, cell)` triple is not in the
     /// section; a spill-read fault is an error, never "absent" — mapping it
@@ -374,20 +399,13 @@ impl CentroidSection {
         column: &str,
         cell_id: Option<u32>,
     ) -> io::Result<Option<Vec<f32>>> {
-        let Some(cells) = self.cells.get(&(superfile_id, column.to_owned())) else {
-            return Ok(None);
-        };
-        let Some(cell) = cells.iter().find(|c| c.cell_id == cell_id) else {
-            return Ok(None);
-        };
-        let len = cell.n_cent as usize * cell.dim as usize * 4;
-        let mut buf = vec![0u8; len];
-        self.spill.as_file().read_exact_at(&mut buf, cell.offset)?;
-        Ok(Some(
-            buf.chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().expect("chunks_exact(4)")))
-                .collect(),
-        ))
+        Ok(self
+            .read_cell_bytes(superfile_id, column, cell_id)?
+            .map(|buf| {
+                buf.chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().expect("chunks_exact(4)")))
+                    .collect()
+            }))
     }
 }
 
@@ -517,6 +535,83 @@ async fn write_blob_and_section(
             uri: centroids_uri,
             content_hash: centroids_hash,
         },
+    })
+}
+
+/// Content-address and PUT one `hnsw` graph section (the opaque
+/// bytes produced by `hnsw::encode_hnsw` for the data graph, or
+/// `Hnsw::to_bytes` for the centroid graph), returning its
+/// [`RoutingRef`]. A separate content-addressed object per section,
+/// exactly like the centroid section — the manifest carries the ref, GC
+/// retains it while referenced, and an identical rebuild is a no-op PUT.
+pub(crate) async fn write_graph_section(
+    storage: &dyn StorageProvider,
+    bytes: Vec<u8>,
+) -> Result<RoutingRef, SlowVectorStateError> {
+    let (uri, content_hash) = write_bytes(storage, bytes).await?;
+    Ok(RoutingRef { uri, content_hash })
+}
+
+/// Fetch a graph section written by [`write_graph_section`], verifying its
+/// bytes hash to `reference.content_hash`. Returns the raw section bytes
+/// (the caller decodes them with `hnsw::decode_hnsw` /
+/// `Hnsw::from_bytes`). Striped like every other slow-state fetch. Callers
+/// fall back to the lazy build / scan path on any error — a bad or missing
+/// graph blob must never fail an open or a query.
+pub(crate) async fn fetch_graph_section(
+    storage: &dyn StorageProvider,
+    reference: &RoutingRef,
+) -> Result<Vec<u8>, SlowVectorStateError> {
+    let bytes = fetch_blob_striped(storage, &reference.uri, STRIPED_FETCH_CHUNK_BYTES).await?;
+    if ContentHash::of(bytes.as_ref()) != reference.content_hash {
+        return Err(SlowVectorStateError::HashMismatch);
+    }
+    Ok(bytes.to_vec())
+}
+
+/// The graph sections of one published generation, decoded resident. Held
+/// on the table handle behind a single-slot cache keyed by `uri` (a new
+/// drain generation publishes a new URI and replaces it), mirroring
+/// [`CentroidSection`].
+///
+/// `data` is the self-contained per-row `hnsw` index (graph + Sq16
+/// plane + node→doc-id map), present only when the table was within the
+/// data-graph scale ceiling at drain.
+pub(crate) struct ResidentGraphSections {
+    pub uri: String,
+    /// Largest stable doc id the graph covers (the append-delta boundary an
+    /// incremental drain inserts past).
+    pub high_water_id: i128,
+    pub data: Option<hnsw::HnswIndex>,
+}
+
+/// Fetch + decode the combined graph bundle for one generation. A decode
+/// failure on a sub-section leaves that section `None` (the caller falls
+/// back) rather than failing the whole fetch — only a bad bundle frame or a
+/// hash mismatch is an error.
+pub(crate) async fn fetch_graph_sections(
+    storage: &dyn StorageProvider,
+    reference: &RoutingRef,
+) -> Result<ResidentGraphSections, SlowVectorStateError> {
+    let raw = fetch_graph_section(storage, reference).await?;
+    let bundle = hnsw::decode_graph_bundle(&raw)
+        .ok_or_else(|| SlowVectorStateError::Parse("graph bundle frame".into()))?;
+    let data = bundle.data_bundle.as_deref().and_then(hnsw::decode_hnsw);
+    if let Some(idx) = &data {
+        // Surface the stamped params every time the resident graph hydrates,
+        // so serving always shows what a table's graph is actually running.
+        tracing::debug!(
+            nodes = idx.graph.len(),
+            dim = idx.dim,
+            base_degree = idx.graph.base_degree(),
+            ef = idx.ef_search,
+            "hnsw: resident graph hydrated (stamped)"
+        );
+    }
+    Ok(ResidentGraphSections {
+        uri: reference.uri.clone(),
+        high_water_id: bundle.high_water_id,
+        data,
     })
 }
 
@@ -786,6 +881,41 @@ mod tests {
             .await
             .expect("striped fetch");
         assert_eq!(striped, whole, "striped reassembly must be byte-exact");
+    }
+
+    /// A graph section round-trips through publish + fetch byte-exact, is a
+    /// no-op PUT on republish (hash-derived URI), and a tampered ref hash is
+    /// rejected so the caller falls back rather than trusting bad bytes.
+    #[tokio::test]
+    async fn graph_section_roundtrips_and_verifies_hash() {
+        let dir = tempdir().expect("tempdir");
+        let storage = LocalFsStorageProvider::new(dir.path()).expect("storage");
+        // Opaque section bytes stand in for an encoded graph; this layer is
+        // format-agnostic (the encode/decode is tested in the hnsw module).
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i * 31) as u8).collect();
+
+        let reference = write_graph_section(&storage, bytes.clone())
+            .await
+            .expect("write graph section");
+        // Republish of identical bytes addresses the same object.
+        let again = write_graph_section(&storage, bytes.clone())
+            .await
+            .expect("republish");
+        assert_eq!(reference, again);
+
+        let fetched = fetch_graph_section(&storage, &reference)
+            .await
+            .expect("fetch graph section");
+        assert_eq!(fetched, bytes, "graph section must round-trip byte-exact");
+
+        let tampered = RoutingRef {
+            uri: reference.uri.clone(),
+            content_hash: ContentHash::of(b"different"),
+        };
+        let err = fetch_graph_section(&storage, &tampered)
+            .await
+            .expect_err("hash mismatch");
+        assert!(matches!(err, SlowVectorStateError::HashMismatch), "{err:?}");
     }
 
     #[tokio::test]

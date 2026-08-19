@@ -12,7 +12,7 @@
 //! eagerly at `open()`; per-query work happens on demand.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fmt,
     ops::Range,
     sync::{
@@ -1847,6 +1847,15 @@ impl VectorReader {
         !self.cell_ids.is_empty()
     }
 
+    /// Whether this blob carries the named vector index column. Mirrors the
+    /// column gate in [`Self::materialized_index_rows_async`] /
+    /// [`Self::materialized_index_rows_excluding_async`] (both return `None`
+    /// when the column is absent), so a metadata-only row count can skip the
+    /// same superfiles the decode passes skip.
+    pub(crate) fn has_index_column(&self, name: &str) -> bool {
+        self.column_id_by_name.contains_key(name)
+    }
+
     /// Map a flat cluster id (manifest / query fan-out) to
     /// `(cell_column_index, local_cluster)` for multi-cell blobs.
     pub(crate) fn resolve_flat_cluster(&self, flat: u32) -> Option<(usize, u32)> {
@@ -1874,6 +1883,75 @@ impl VectorReader {
             }
         }
         Some((lo, flat - bases[lo]))
+    }
+
+    /// Global-fine router scoring (`vector.search_mode = global_fine_centroid`):
+    /// score `query` against EVERY fine centroid of every cell in this superfile,
+    /// sourced from the resident centroid `section` (zero superfile opens —
+    /// the routing scan is a pure RAM op over the page-cache-backed spill).
+    /// Returns `(flat_cluster_id, score)` for all clusters, where the flat id
+    /// is the cumulative-`n_cent` numbering [`Self::resolve_flat_cluster`]
+    /// inverts — so the selected ids feed straight into
+    /// [`Self::search_clusters_async`]. Score is the same SIMD centroid
+    /// distance query-time fine ranking uses (smaller = nearer). Multi-cell
+    /// hidden readers only; others return empty (caller falls back to the
+    /// stamped-law path).
+    pub(crate) fn global_fine_cluster_scores(
+        &self,
+        column: &str,
+        query: &[f32],
+        section: &crate::supertable::slow_vector_state::CentroidSection,
+        superfile_id: uuid::Uuid,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        if !self.is_multi_cell() || !self.column_id_by_name.contains_key(column) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for (ci, col) in self.columns.iter().enumerate() {
+            if col.n_docs == 0 || col.n_cent == 0 {
+                continue;
+            }
+            // Section is keyed by the grid cell id; multi-cell readers carry
+            // one per column entry (parallel to `columns`).
+            let cell_id = self.cell_ids.get(ci).copied();
+            let Some(bytes) = section
+                .read_cell_bytes(superfile_id, column, cell_id)
+                .map_err(|e| VectorError::LazySource(e.to_string()))?
+            else {
+                continue;
+            };
+            let base = self.flat_cluster_base.get(ci).copied().unwrap_or(0);
+            // `score_centroids` is the SIMD (`f32x8`) owner query-time fine
+            // ranking uses; `nprobe = n_cent` scores every cluster.
+            for (local, score) in score_centroids(&bytes, col, query, col.n_cent as usize) {
+                out.push((base + local as u32, score));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Per-cell coalesced read plan for global-fine (`vector.global_fine_coalesce`):
+    /// given selected flat cluster ids, return every cluster in each touched
+    /// cell's `[min..max]` selected span. Clusters are stored in id order, so
+    /// a span is one CONTIGUOUS byte range that coalesces to a single GET
+    /// per cell — trading a bounded gap over-read (the unselected clusters
+    /// between the first and last selected) for far fewer, larger reads
+    /// instead of scattered per-cluster GETs. Multi-cell readers only.
+    pub(crate) fn coalesce_flats_to_cell_spans(&self, flats: &[u32]) -> Vec<u32> {
+        let mut span: HashMap<usize, (u32, u32)> = HashMap::new();
+        for &f in flats {
+            if let Some((cell, local)) = self.resolve_flat_cluster(f) {
+                let e = span.entry(cell).or_insert((local, local));
+                e.0 = e.0.min(local);
+                e.1 = e.1.max(local);
+            }
+        }
+        let mut out = Vec::new();
+        for (cell, (lo, hi)) in span {
+            let base = self.flat_cluster_base.get(cell).copied().unwrap_or(0);
+            out.extend((lo..=hi).map(|local| base + local));
+        }
+        out
     }
 
     pub fn n_docs(&self) -> u64 {
@@ -2738,6 +2816,51 @@ impl VectorReader {
             return Some(out);
         }
         self.materialized_cell_rows_async_at(0).await
+    }
+
+    /// Like [`Self::materialized_index_rows_async`], but drops the rows of any
+    /// cell whose global id is in `superseded` — the cells an in-place split
+    /// retired, whose rows survive under the split's successor cells. Ingesting
+    /// a retired parent alongside its live successor would put the same
+    /// `stable_id` into the graph twice.
+    ///
+    /// `local_doc_id` still counts file-local across EVERY cell (superseded
+    /// ones included), so a returned row indexes the stable-id vector that
+    /// [`crate::supertable::query::vector::stable_ids_by_local_for_routing`]
+    /// builds over the whole superfile. `None` exactly when
+    /// [`Self::materialized_index_rows_async`] returns `None` (column absent).
+    pub(crate) async fn materialized_index_rows_excluding_async(
+        &self,
+        index_name: &str,
+        superseded: Option<&BTreeSet<u32>>,
+    ) -> Option<Vec<MaterializedIvfRow>> {
+        // No exclusions ⇒ the plain path (also covers v1, whose synthetic cell
+        // id 0 does not correspond to a real split-retired cell).
+        if superseded.is_none_or(|s| s.is_empty()) {
+            return self.materialized_index_rows_async(index_name).await;
+        }
+        if !self.column_id_by_name.contains_key(index_name) {
+            return None;
+        }
+        if !self.is_multi_cell() {
+            return self.materialized_cell_rows_async_at(0).await;
+        }
+        let cells = self.materialized_cells_rows_async(None).await?;
+        let mut out = Vec::new();
+        let mut file_doc_base = 0u32;
+        for (cell_id, rows) in cells {
+            let n = rows.len() as u32;
+            if !superseded.is_some_and(|s| s.contains(&cell_id)) {
+                for mut row in rows {
+                    row.local_doc_id += file_doc_base;
+                    out.push(row);
+                }
+            }
+            // Advance across superseded cells too, so a kept row's file-local
+            // id keeps indexing the whole-superfile stable-id vector.
+            file_doc_base = file_doc_base.saturating_add(n);
+        }
+        Some(out)
     }
 
     /// Decode every IVF row from `sub` (the full subsection bytes) using the

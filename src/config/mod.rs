@@ -72,6 +72,8 @@ pub(crate) const DEFAULT_CONNECTION_BUDGET_BYTES: u64 = 0;
 pub enum ConfigError {
     #[error("config load failed: {0}")]
     Figment(Box<figment::Error>),
+    #[error("invalid config: {0}")]
+    Invalid(String),
 }
 
 impl From<figment::Error> for ConfigError {
@@ -148,7 +150,21 @@ impl Default for MemorySettings {
 /// never panics on a malformed host config.
 pub fn global() -> &'static Config {
     static GLOBAL: OnceLock<Config> = OnceLock::new();
-    GLOBAL.get_or_init(|| Config::load().unwrap_or_default())
+    GLOBAL.get_or_init(|| match Config::load() {
+        Ok(cfg) => cfg,
+        // A load failure here silently reverts the operator's ENTIRE config
+        // file — storage, commit thresholds, budgets, drain tuning — to the
+        // embedded defaults. Never do that quietly: log loudly, then fall back
+        // (a read site must not panic on a malformed host config).
+        Err(error) => {
+            tracing::error!(
+                "operator config failed to load ({error}); falling back to embedded \
+                 defaults — the host config file (storage, budgets, drain tuning) is NOT \
+                 being applied. Fix the config and restart."
+            );
+            Config::default()
+        }
+    })
 }
 
 /// Supertable subsection of [`Config`]. Keeps supertable-
@@ -271,11 +287,64 @@ const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 500_000;
 const DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D: f64 = 8.0;
 /// Default k-means training points per centroid for per-cell sub-builds.
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
+/// Default fine-cluster fanout for `search_mode = global_fine_centroid`.
+const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT: usize = 1024;
+/// Default exact-rerank over-fetch for `search_mode = global_fine_centroid` —
+/// the measured knee; scoped to this path so it never shifts the stamped,
+/// filtered, or user-table defaults.
+const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 128;
+/// Default upper bound on the `hnsw` calibration ef grid. High-dimensional
+/// cosine tables need a wide beam to reach the recall bar (e.g. glove-100
+/// clears ~0.99 only at ef=1024), so the ceiling allows that; the stamped
+/// per-table `ef` still lands well under it on easy tables.
+const DEFAULT_VECTOR_HNSW_EF_CEIL: usize = 2048;
+/// Default `ef_construction` for the `hnsw` HNSW build — the beam
+/// width used while inserting nodes. Higher builds a better-connected graph
+/// (same recall at a smaller search `ef`, so lower query latency) at a
+/// linearly higher one-time build cost and NO extra resident memory (degree
+/// is set by `m`, not this). 200 is the sweet spot for recall ~0.93–0.95;
+/// raising it mainly helps the >0.97 end.
+const DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION: usize = 200;
+/// Default base-layer degree knob: `0` means the drain calibrator picks it
+/// (search over `HNSW_M0_CANDIDATES`). A non-zero config value overrides.
+const DEFAULT_VECTOR_HNSW_M0: usize = 0;
+/// Recall/latency operating point the graph calibrator targets (shared with
+/// the ivf stamping law — one point per table, engine-agnostic). The graph
+/// aims to hit this recall *faster* than ivf; if it can't, ivf serves it.
+const DEFAULT_VECTOR_TARGET_RECALL: f64 = 0.99;
+/// How far below `target_recall` the drain calibrator still registers the
+/// graph (accepting the shortfall for the latency win) before giving up and
+/// serving ivf. The register floor is `target_recall - this`. Widen it to keep
+/// more hard high-dim tables on the graph; tighten it to demand near-target
+/// recall from the graph or step aside to ivf.
+const DEFAULT_VECTOR_HNSW_RECALL_SLACK: f64 = 0.01;
+/// Base-layer degree candidates the drain calibrator sweeps (ascending).
+pub const HNSW_M0_CANDIDATES: &[usize] = &[32, 64, 128, 256];
+/// Query-beam (`ef`) candidates the drain calibrator sweeps (ascending),
+/// bounded above by `hnsw_ef_ceil`.
+pub const HNSW_EF_CANDIDATES: &[usize] = &[128, 256, 512, 1024, 2048];
+/// Default scale ceiling for the `hnsw` **data** graph: the resident
+/// per-row HNSW is built (at drain) and persisted only when the table's doc
+/// count is at or below this. Above it, the whole-corpus graph would not fit
+/// in RAM, so only the (far smaller) centroid graph is built and the query
+/// falls back to the scan path. 10M rows of Sq16 codes at 768d is ~15 GiB
+/// resident — the practical single-host ceiling.
+const DEFAULT_VECTOR_HNSW_MAX_DOCS: u64 = 10_000_000;
+/// Row cap for the cheap calibration *probe*. On a corpus larger than this,
+/// the calibrator first builds + calibrates on a bounded subsample of this
+/// many rows before committing to the expensive full-corpus build. Subsample
+/// recall is optimistic (the `m0` requirement grows with N), so a probe that
+/// cannot register is a hard "graph-hostile distribution" signal → skip the
+/// full build and serve ivf. A probe that registers proceeds to the
+/// authoritative full-corpus calibration. This gates on distribution, not
+/// size: a large but graph-friendly corpus (e.g. a low-dim 10M set) passes the
+/// probe and keeps its graph. Because the probe is re-derived every drain, no
+/// pre-existing table is ever permanently locked out — a migrated table gets
+/// probed and, if friendly, fully built on its first drain.
+const DEFAULT_VECTOR_HNSW_PROBE_MAX_DOCS: u64 = 100_000;
 /// Default per-cell fine-probe floor: the minimum fine IVF clusters probed
 /// inside each selected cell. Small cells stay at this known-good minimum.
 const DEFAULT_VECTOR_FINE_NPROBE_FLOOR: usize = 4;
-/// Shipped `vector.target_recall`: the 0.99 bar the acceptance gates use.
-const DEFAULT_VECTOR_TARGET_RECALL: f64 = 0.99;
 /// Default proportional fine-probe fraction. `0.0` ⇒ proportional depth off:
 /// the probe is the fixed floor. `> 0` probes `floor(pct × cell fine clusters)`
 /// so depth tracks cell size (recall lever for large cells).
@@ -350,6 +419,34 @@ pub enum DrainConsolidate {
     Splice,
 }
 
+/// Query search mode for the hidden vector index on the UNFILTERED path.
+/// Selected by `vector.search_mode`. Filtered queries and pre-drain user
+/// tables always take the stamped grid path regardless of this setting.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorSearchMode {
+    /// DEFAULT. Grid routing to cells, then the manifest's stamped per-cell
+    /// width. The established IVF cell-scan path — also the automatic
+    /// fallback for any corpus above `hnsw_max_docs` (where the resident
+    /// graph won't fit RAM) and for filtered / pre-drain / undrained-user
+    /// queries.
+    #[default]
+    Ivf,
+    /// EXPERIMENTAL (opt-in): score every fine centroid globally and read the
+    /// top `vector.global_fine_fanout` clusters, bypassing the grid. A
+    /// cold-read win at scale, not at small scale — see `config.yaml`.
+    GlobalFineCentroid,
+    /// OPT-IN (`hnsw_ivf`): walk a resident in-memory HNSW graph built over
+    /// every row's Sq16 codes, bypassing the grid, cell selection, and disk
+    /// reads. Built at drain and held resident (RAM-pinned) for corpora
+    /// `<= hnsw_max_docs`; above that ceiling the graph is not built. The
+    /// `_ivf` suffix names the fallback: correctness never depends on the
+    /// graph being present — a missing graph (pre-drain, above the ceiling,
+    /// or a different column) always serves `ivf`. Search walks the graph at
+    /// the `k`-scaled `ef` law.
+    HnswIvf,
+}
+
 /// Vector-index build / search / drain tuning knobs. Grouped so the
 /// vector-specific levers don't crowd the top-level namespace. All
 /// have defaults equal to the engine's built-in behavior; a fresh
@@ -403,6 +500,58 @@ pub struct VectorSettings {
     /// sub-builds. Higher trains on more points (slower, tighter
     /// clusters).
     pub kmeans_pts_per_centroid: usize,
+    /// Query search mode for the hidden vector index (unfiltered path).
+    /// Default `ivf`; `global_fine_centroid` is experimental (see
+    /// [`VectorSearchMode`]).
+    pub search_mode: VectorSearchMode,
+    /// For `search_mode = global_fine_centroid`: number of fine clusters the
+    /// query reads (globally scored, clamped to the table's total). See
+    /// `config.yaml` for sizing guidance. Ignored under `search_mode = ivf`.
+    pub global_fine_fanout: usize,
+    /// For `search_mode = global_fine_centroid`: the exact-rerank over-fetch
+    /// multiplier for this path specifically (a caller-set `rerank_mult`
+    /// still wins). Scoped here rather than the shared default so tuning
+    /// it never touches the ivf / filtered / user-table paths.
+    pub global_fine_rerank_mult: usize,
+    /// For `search_mode = global_fine_centroid`: coalesce the selected
+    /// clusters within each cell into contiguous reads. Ignored under
+    /// `search_mode = ivf`.
+    pub global_fine_coalesce: bool,
+    /// For `search_mode = hnsw_ivf`: the upper bound on the calibration ef grid —
+    /// the drain sweeps [`HNSW_EF_CANDIDATES`] up to this ceiling and stamps
+    /// the winning `ef` per table into the persisted bundle. Must be at least
+    /// the smallest candidate (128). Ignored under any other search mode.
+    pub hnsw_ef_ceil: usize,
+    /// For `search_mode = hnsw_ivf`: the `ef_construction` beam used when
+    /// building the resident HNSW (build-time only). Higher = better-
+    /// connected graph => lower query latency at fixed recall, at a linear
+    /// build cost and no extra resident memory. Ignored under any other
+    /// search mode.
+    pub hnsw_ef_construction: usize,
+    /// For `search_mode = hnsw_ivf`: base-layer (layer-0) graph degree. This is
+    /// the recall lever for high-dimensional vectors — the base layer must be
+    /// denser as dimension grows or greedy search under-finds the true
+    /// neighbors. `0` (the default) lets the drain calibrator pick it (sweep
+    /// over `HNSW_M0_CANDIDATES` to the recall bar); a non-zero value overrides
+    /// that per table. Memory and the persisted graph scale with `docs × m0`,
+    /// bounded by `hnsw_max_docs`. The upper-layer degree stays fixed (cheap) —
+    /// only the base layer moves recall.
+    pub hnsw_m0: usize,
+    /// Recall shortfall below `target_recall` the hnsw graph is still accepted
+    /// at before the drain gives up and serves ivf (`floor = target - this`).
+    pub hnsw_recall_slack: f64,
+    /// For `search_mode = hnsw_ivf`: scale ceiling for the per-row **data**
+    /// graph. The resident data HNSW is built at drain and persisted only
+    /// when the table's doc count ≤ this; above it, only the centroid graph
+    /// is built and `hnsw` queries fall back to the scan path. The
+    /// centroid graph itself is built at any scale.
+    pub hnsw_max_docs: u64,
+    /// For `search_mode = hnsw_ivf`: row cap for the cheap calibration *probe*. On
+    /// a larger corpus, calibrate on a subsample of this many rows first; a
+    /// probe that cannot register (optimistic subsample recall) skips the
+    /// expensive full build → ivf, while a probe that registers proceeds to the
+    /// authoritative full-corpus calibration. Gates on distribution, not size.
+    pub hnsw_probe_max_docs: u64,
     /// Doc count above which a merged cell superfile is split into two
     /// sub-cells during hidden-index maintenance.
     pub cell_split_doc_cap: u64,
@@ -471,6 +620,16 @@ impl Default for VectorSettings {
             fine_nprobe_pct: DEFAULT_VECTOR_FINE_NPROBE_PCT,
             serve_near_tie_slack: DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK,
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
+            search_mode: VectorSearchMode::Ivf,
+            global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
+            global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
+            global_fine_coalesce: false,
+            hnsw_ef_ceil: DEFAULT_VECTOR_HNSW_EF_CEIL,
+            hnsw_ef_construction: DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION,
+            hnsw_m0: DEFAULT_VECTOR_HNSW_M0,
+            hnsw_recall_slack: DEFAULT_VECTOR_HNSW_RECALL_SLACK,
+            hnsw_max_docs: DEFAULT_VECTOR_HNSW_MAX_DOCS,
+            hnsw_probe_max_docs: DEFAULT_VECTOR_HNSW_PROBE_MAX_DOCS,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
             cell_split_modality_d: DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D,
             user_centroids: CentroidAlignment::Local,
@@ -783,9 +942,11 @@ impl Config {
     /// overrides. Useful for tests and for documenting what the
     /// shipped default is independent of any host environment.
     pub fn defaults() -> Result<Self, ConfigError> {
-        Ok(Figment::new()
+        let cfg: Config = Figment::new()
             .merge(Yaml::string(EMBEDDED_DEFAULT))
-            .extract()?)
+            .extract()?;
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     /// Extract from a caller-provided figment. Used by tests so they
@@ -794,7 +955,85 @@ impl Config {
     /// CLI that adds a `--config-file` source) without duplicating
     /// the embedded-default + extraction machinery.
     pub fn from_figment(fig: Figment) -> Result<Self, ConfigError> {
-        Ok(fig.extract()?)
+        let cfg: Config = fig.extract()?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Semantic checks that deserialization alone cannot express, run at
+    /// load time so a bad config fails fast with a clear message instead of
+    /// panicking or misbehaving at query time.
+    fn validate(&self) -> Result<(), ConfigError> {
+        let v = &self.vector;
+        // The calibrator's ef grid starts at the smallest [`HNSW_EF_CANDIDATES`]
+        // entry (128). A ceiling below that filters the grid to empty, so the
+        // drain finds no registrable (m0, ef) and logs "graph-hostile" though
+        // no sweep ever ran. Keep the ceiling at or above the smallest
+        // candidate.
+        const MIN_EF_CEIL: usize = 128;
+        if v.hnsw_ef_ceil < MIN_EF_CEIL {
+            return Err(ConfigError::Invalid(format!(
+                "vector.hnsw_ef_ceil ({}) must be >= {MIN_EF_CEIL} (the smallest \
+                 calibration ef candidate); a lower ceiling empties the sweep grid",
+                v.hnsw_ef_ceil
+            )));
+        }
+        // A recall target outside (0, 1] is meaningless and, shared with the
+        // ivf stamping law, would silently mis-stamp both engines; an
+        // unreachable one (e.g. > 1) would decline the graph on every table.
+        if !(v.target_recall > 0.0 && v.target_recall <= 1.0) {
+            return Err(ConfigError::Invalid(format!(
+                "vector.target_recall must be in (0.0, 1.0], got {}",
+                v.target_recall
+            )));
+        }
+        if !(0.0..=1.0).contains(&v.hnsw_recall_slack) {
+            return Err(ConfigError::Invalid(format!(
+                "vector.hnsw_recall_slack must be in [0.0, 1.0], got {}",
+                v.hnsw_recall_slack
+            )));
+        }
+        // The register floor is `target_recall - hnsw_recall_slack`. Slack at
+        // or above the target collapses that floor to <= 0, so ANY graph with
+        // recall > 0 registers and the recall bar stops meaning anything.
+        if v.hnsw_recall_slack >= v.target_recall {
+            return Err(ConfigError::Invalid(format!(
+                "vector.hnsw_recall_slack ({}) must be < vector.target_recall ({}) — \
+                 otherwise the register floor collapses to zero and every graph registers",
+                v.hnsw_recall_slack, v.target_recall
+            )));
+        }
+        // An explicit base degree far above `ef_construction` is pure sentinel
+        // padding: a build discovers at most ~`ef_construction` neighbors per
+        // node, so slots beyond that stay empty (`ADJ_SENTINEL`) — wasted
+        // persisted bytes (m0 = 1024 is ~40GB of sentinels at 10M rows for a
+        // degree-<=200 graph). `hnsw_m0 = 0` means the calibrator picks it, so
+        // only guard an explicit override. Allow modest headroom (the
+        // calibrator's own top candidate slightly exceeds the default
+        // `ef_construction`) but reject gross over-provisioning.
+        const M0_HEADROOM_OVER_EF_CONSTRUCTION: usize = 2;
+        let m0_ceiling = v
+            .hnsw_ef_construction
+            .saturating_mul(M0_HEADROOM_OVER_EF_CONSTRUCTION);
+        if v.hnsw_m0 != 0 && v.hnsw_m0 > m0_ceiling {
+            return Err(ConfigError::Invalid(format!(
+                "vector.hnsw_m0 ({}) must be <= {m0_ceiling} ({M0_HEADROOM_OVER_EF_CONSTRUCTION}× \
+                 vector.hnsw_ef_construction = {}) — a larger base degree is unreachable \
+                 sentinel padding",
+                v.hnsw_m0, v.hnsw_ef_construction
+            )));
+        }
+        // The probe subsamples a corpus down to ~`hnsw_probe_max_docs` rows by
+        // striding at `n / probe_cap`. A cap of 0 makes that stride a divide by
+        // zero on any non-empty table, so require at least one row of headroom.
+        if v.hnsw_probe_max_docs == 0 {
+            return Err(ConfigError::Invalid(
+                "vector.hnsw_probe_max_docs must be >= 1 — a 0 cap divides by zero when the \
+                 probe strides the corpus down to the sample"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -851,6 +1090,32 @@ mod tests {
     fn embedded_default_loads_with_expected_value() {
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.supertable.commit_threshold_size_mb, 1024);
+    }
+
+    /// The `hnsw` calibration knobs default to the shipped values, and
+    /// validation rejects the cross-field combinations that would silently
+    /// disable the recall bar or empty the calibration grid.
+    #[test]
+    fn hnsw_calibration_config_validates() {
+        let cfg = Config::defaults().expect("defaults parse");
+        assert_eq!(cfg.vector.hnsw_ef_ceil, 2048);
+
+        let invalid = |patch: serde_json::Value| {
+            let fig = Figment::new()
+                .merge(Yaml::string(EMBEDDED_DEFAULT))
+                .merge(Serialized::defaults(patch));
+            let err = Config::from_figment(fig).expect_err("must fail validation");
+            assert!(matches!(err, ConfigError::Invalid(_)), "{err:?}");
+        };
+
+        // A ceiling below the smallest ef candidate empties the sweep grid.
+        invalid(json!({ "vector": { "hnsw_ef_ceil": 64 } }));
+        // Slack >= target collapses the register floor to zero.
+        invalid(json!({ "vector": { "target_recall": 0.9, "hnsw_recall_slack": 0.95 } }));
+        // An explicit m0 far above ef_construction is sentinel padding.
+        invalid(json!({ "vector": { "hnsw_m0": 1024, "hnsw_ef_construction": 200 } }));
+        // A 0 probe cap divides by zero when the probe strides the corpus.
+        invalid(json!({ "vector": { "hnsw_probe_max_docs": 0 } }));
     }
 
     #[test]
