@@ -149,6 +149,49 @@ fn commit_surfaces_pointer_cas_fault_without_publishing() {
     assert_eq!(st.reader().expect("reader").n_superfiles(), 1);
 }
 
+/// A refused credential must reach the caller as
+/// [`InfinoError::PermissionDenied`], not as the generic backend fault a
+/// transient failure produces: the two call for different responses — retry
+/// the transient one, supply fresh credentials for this one — so collapsing
+/// them leaves a caller with no way to react.
+///
+/// The commit path is the one that erased it hardest: the condition crosses
+/// four wrappers (storage -> commit -> build -> append flush) on its way out.
+#[test]
+fn a_refused_credential_surfaces_as_permission_denied_not_a_generic_fault() {
+    // The superfile PUT is refused mid-commit.
+    let (st, faults, _dir) = faulted_table();
+    faults.fail_with(FaultKind::PermissionDenied, FaultOp::PutAtomic, "data/", 1);
+    let mut w = st.writer().expect("writer");
+    w.append(&build_title_batch(&["second commit beta"]))
+        .expect("append");
+    let err = InfinoError::from(w.commit().expect_err("a refused PUT must fail the commit"));
+    assert!(
+        matches!(err, InfinoError::PermissionDenied(_)),
+        "commit reported {err:?}"
+    );
+    assert_eq!(st.manifest_id(), 1, "nothing published");
+}
+
+/// Open reads the pointer before anything else, so a refused credential
+/// there is the first thing a caller sees.
+#[test]
+fn open_surfaces_a_refused_credential_as_permission_denied() {
+    let (st, faults, _dir) = faulted_table();
+    drop(st);
+
+    faults.fail_with(FaultKind::PermissionDenied, FaultOp::Get, POINTER_PATH, 1);
+    let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+    let err = InfinoError::from(
+        Supertable::open(default_supertable_options().with_storage(storage))
+            .expect_err("a refused pointer GET must fail the open"),
+    );
+    assert!(
+        matches!(err, InfinoError::PermissionDenied(_)),
+        "open reported {err:?}"
+    );
+}
+
 #[test]
 fn open_surfaces_pointer_get_fault_and_recovers() {
     let (st, faults, _dir) = faulted_table();

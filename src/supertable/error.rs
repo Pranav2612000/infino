@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::{
-    storage::StorageError,
+    storage::{StorageError, permission_denied_in_chain},
     superfile::error::BuildError as SuperfileBuildError,
     supertable::{ManifestLoadError, manifest::part},
 };
@@ -115,6 +115,15 @@ pub enum BuildError {
     #[error("superfile store: {0}")]
     Store(String),
 
+    /// The storage backend refused the credentials in use. Carried as its own
+    /// variant rather than folded into [`Self::Store`] for the same reason as
+    /// [`Self::TableGone`] and [`Self::WriteContention`]: a stringified error
+    /// can't be matched on, and the public mapping must report refused
+    /// credentials rather than a backend fault. See
+    /// `From<CommitError> for BuildError`.
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
     /// The table was dropped and purged while this handle was open, so the
     /// commit had no pointer to fence against. Carried as its own variant
     /// rather than folded into [`Self::Store`] so the public mapping can
@@ -181,6 +190,15 @@ impl BuildError {
             _ => false,
         }
     }
+
+    /// True when the backend refused the credentials in use.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            BuildError::PermissionDenied(_) => true,
+            BuildError::StorageConstruction(e) => e.is_permission_denied(),
+            _ => false,
+        }
+    }
 }
 
 impl From<CommitError> for BuildError {
@@ -193,6 +211,9 @@ impl From<CommitError> for BuildError {
         match e {
             CommitError::PointerVanished => BuildError::TableGone,
             other if other.is_conflict() => BuildError::WriteContention,
+            other if other.is_permission_denied() => {
+                BuildError::PermissionDenied(other.to_string())
+            }
             other => BuildError::Store(other.to_string()),
         }
     }
@@ -255,6 +276,15 @@ impl CommitError {
             CommitError::WriteContentionExhausted => true,
             CommitError::Storage(e) => e.is_conflict(),
             CommitError::Build(b) => b.is_conflict(),
+            _ => false,
+        }
+    }
+
+    /// True when the backend refused the credentials in use.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            CommitError::Storage(e) => e.is_permission_denied(),
+            CommitError::Build(b) => b.is_permission_denied(),
             _ => false,
         }
     }
@@ -357,6 +387,21 @@ impl OpenError {
             OpenError::PointerUnreadable(e) | OpenError::Storage(e) => e.is_conflict(),
             OpenError::Build(b) => b.is_conflict(),
             OpenError::Commit(c) => c.is_conflict(),
+            _ => false,
+        }
+    }
+
+    /// True when the backend refused the credentials in use.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            OpenError::PointerUnreadable(e) | OpenError::Storage(e) => e.is_permission_denied(),
+            OpenError::Build(b) => b.is_permission_denied(),
+            OpenError::Commit(c) => c.is_permission_denied(),
+            OpenError::ManifestLoadError(e) => e.is_permission_denied(),
+            // The part loader boxes its source, so read the chain.
+            OpenError::ManifestPartLoad { source, .. } => {
+                permission_denied_in_chain(source.as_ref())
+            }
             _ => false,
         }
     }
@@ -530,6 +575,12 @@ pub enum QueryError {
 
     #[error("manifest load error: {0}")]
     ManifestLoad(ManifestLoadError),
+
+    /// The storage backend refused the credentials in use. Classified at the
+    /// boundary — like [`Self::OverBudget`] — because the variants above carry
+    /// stringified sources; routes to `InfinoError::PermissionDenied`.
+    #[error("permission denied during query: {0}")]
+    PermissionDenied(String),
 }
 
 impl QueryError {
@@ -539,5 +590,53 @@ impl QueryError {
             QueryError::OverBudget(m) => Some(m),
             _ => None,
         }
+    }
+
+    /// True when the backend refused the credentials in use.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            QueryError::PermissionDenied(_) => true,
+            QueryError::ManifestLoad(e) => e.is_permission_denied(),
+            _ => false,
+        }
+    }
+
+    /// Classify a storage-backed query failure whose source is about to be
+    /// stringified: refused credentials get their own variant, everything else
+    /// stays a [`Self::Store`]. `message` is the text the caller would have
+    /// used either way, so no message changes shape.
+    pub(crate) fn build(message: String, source: &(dyn std::error::Error + 'static)) -> Self {
+        if permission_denied_in_chain(source) {
+            return QueryError::PermissionDenied(message);
+        }
+        QueryError::Store(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::supertable::reader_cache::disk::DiskCacheError;
+
+    #[test]
+    fn a_refused_credential_is_classified_through_the_disk_cache_wrapper() {
+        // The read path's real shape: the query layer stringifies whatever the
+        // disk cache hands it, so the classification has to read the typed
+        // chain through that wrapper. Anything else on the same path stays a
+        // store error.
+        let refused = DiskCacheError::Storage(StorageError::PermissionDenied { uri: "u".into() });
+        assert!(matches!(
+            QueryError::build(refused.to_string(), &refused),
+            QueryError::PermissionDenied(_)
+        ));
+
+        let transient = DiskCacheError::Storage(StorageError::TransientExhausted {
+            uri: "u".into(),
+            source: "boom".into(),
+        });
+        assert!(matches!(
+            QueryError::build(transient.to_string(), &transient),
+            QueryError::Store(_)
+        ));
     }
 }

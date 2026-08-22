@@ -1229,9 +1229,9 @@ impl SupertableReader {
                     // Tombstone bitmap for this superfile (None = no deletes).
                     let tomb = match tombstone_cache.as_ref() {
                         Some(c) => {
-                            let b = c
-                                .bitmap_for(entry.superfile_id, now)
-                                .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+                            let b = c.bitmap_for(entry.superfile_id, now).map_err(|e| {
+                                QueryError::build(format!("tombstone cache: {e}"), &e)
+                            })?;
                             if b.is_empty() { None } else { Some(b) }
                         }
                         None => None,

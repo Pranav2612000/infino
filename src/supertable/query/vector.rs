@@ -4894,7 +4894,7 @@ fn subtract_tombstones(
     if let Some(cache) = tombstone_cache {
         let deleted = cache
             .bitmap_for(entry.superfile_id, now)
-            .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+            .map_err(|e| QueryError::build(format!("tombstone cache: {e}"), &e))?;
         if !deleted.is_empty() {
             *bm -= &*deleted;
         }

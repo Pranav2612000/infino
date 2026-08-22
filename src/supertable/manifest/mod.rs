@@ -2341,6 +2341,16 @@ pub enum ManifestLoadError {
     SlowStateHydration(String),
 }
 
+impl ManifestLoadError {
+    /// True when the backend refused the credentials in use.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            ManifestLoadError::Storage(e) => e.is_permission_denied(),
+            _ => false,
+        }
+    }
+}
+
 /// One superfile's metadata + skip-pruning summaries. The bytes that
 /// back the superfile live in the superfile store keyed by `uri` —
 /// `superfile_id` is for debugging / observability, `uri` is for
