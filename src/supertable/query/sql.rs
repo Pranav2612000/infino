@@ -68,6 +68,7 @@ use datafusion::{
 use crate::{
     memory::budgeted_session_context,
     runtime_metrics::op_stats,
+    storage::permission_denied_in_chain,
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
@@ -155,10 +156,18 @@ fn cacheable_scalar_plan(plan: &LogicalPlan) -> bool {
 }
 
 /// Classify a SQL execution error: budget exhaustion -> [`QueryError::OverBudget`]
-/// (the catalog surfaces it as `InfinoError::OverBudget`), else an execute error.
+/// (the catalog surfaces it as `InfinoError::OverBudget`), refused credentials
+/// -> [`QueryError::PermissionDenied`], else an execute error.
+///
+/// The credential check reads the error's source chain rather than its message:
+/// a scan failure reaches DataFusion wrapped, and the underlying storage error
+/// is still typed inside it.
 fn exec_query_error(e: DataFusionError) -> QueryError {
     match e {
         DataFusionError::ResourcesExhausted(msg) => QueryError::OverBudget(msg),
+        other if permission_denied_in_chain(&other) => {
+            QueryError::PermissionDenied(other.to_string())
+        }
         other => QueryError::Execute(other.to_string()),
     }
 }

@@ -232,6 +232,19 @@ impl MutationError {
             _ => false,
         }
     }
+
+    /// True when the backend refused the credentials in use.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            MutationError::Storage(e) => e.is_permission_denied(),
+            MutationError::WalStore(e) => e.is_permission_denied(),
+            MutationError::AppendPhase(e) => e.is_permission_denied(),
+            MutationError::TombstonePhase(e) => e.is_permission_denied(),
+            MutationError::PredicateEval(q) => q.is_permission_denied(),
+            MutationError::TargetResolve(e) => e.is_permission_denied(),
+            _ => false,
+        }
+    }
 }
 
 /// Value returned from [`SupertableWriter::update`]. Carries the
@@ -330,6 +343,16 @@ impl CommitError {
         match self {
             CommitError::AppendFlush(b) => b.is_conflict(),
             CommitError::PartialCommit { cause, .. } => cause.is_conflict(),
+        }
+    }
+
+    /// True when the backend refused the credentials in use. On
+    /// `PartialCommit` this reports the *cause* of the stop, as `is_conflict`
+    /// does.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            CommitError::AppendFlush(b) => b.is_permission_denied(),
+            CommitError::PartialCommit { cause, .. } => cause.is_permission_denied(),
         }
     }
 }

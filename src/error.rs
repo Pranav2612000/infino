@@ -63,6 +63,10 @@ pub enum InfinoError {
     #[error("io: {0}")]
     Io(String),
 
+    /// The storage backend refused the credentials in use (HTTP 403 / 401).
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
     /// SQL planning or execution failure.
     #[error("query: {0}")]
     Query(String),
@@ -118,6 +122,7 @@ impl InfinoError {
             Self::Schema(m) => Self::Schema(format!("{prefix}: {m}")),
             Self::Cardinality(m) => Self::Cardinality(format!("{prefix}: {m}")),
             Self::Io(m) => Self::Io(format!("{prefix}: {m}")),
+            Self::PermissionDenied(m) => Self::PermissionDenied(format!("{prefix}: {m}")),
             Self::Query(m) => Self::Query(format!("{prefix}: {m}")),
             Self::OverBudget(m) => Self::OverBudget(format!("{prefix}: {m}")),
             Self::Conflict(m) => Self::Conflict(format!("{prefix}: {m}")),
@@ -133,6 +138,7 @@ impl From<StorageError> for InfinoError {
         match e {
             StorageError::NotFound { .. } => InfinoError::NotFound(msg),
             StorageError::PreconditionFailed { .. } => InfinoError::Conflict(msg),
+            StorageError::PermissionDenied { .. } => InfinoError::PermissionDenied(msg),
             StorageError::TransientExhausted { .. } | StorageError::Permanent { .. } => {
                 InfinoError::Io(msg)
             }
@@ -145,6 +151,9 @@ impl From<QueryError> for InfinoError {
         if let Some(msg) = e.over_budget() {
             return InfinoError::OverBudget(msg.to_string());
         }
+        if e.is_permission_denied() {
+            return InfinoError::PermissionDenied(e.to_string());
+        }
         InfinoError::Query(e.to_string())
     }
 }
@@ -152,6 +161,9 @@ impl From<QueryError> for InfinoError {
 impl From<ManifestLoadError> for InfinoError {
     fn from(e: ManifestLoadError) -> Self {
         let msg = e.to_string();
+        if e.is_permission_denied() {
+            return InfinoError::PermissionDenied(msg);
+        }
         match e {
             // The table this handle was reading has been dropped and purged, so
             // the name it was opened under no longer resolves to anything —
@@ -187,6 +199,9 @@ impl From<SupertableBuildError> for InfinoError {
         if let Some(msg) = e.over_budget() {
             return InfinoError::OverBudget(msg.to_string());
         }
+        if e.is_permission_denied() {
+            return InfinoError::PermissionDenied(e.to_string());
+        }
         if e.is_conflict() {
             return InfinoError::Conflict(e.to_string());
         }
@@ -203,6 +218,9 @@ impl From<SupertableBuildError> for InfinoError {
 impl From<SupertableCommitError> for InfinoError {
     fn from(e: SupertableCommitError) -> Self {
         let msg = e.to_string();
+        if e.is_permission_denied() {
+            return InfinoError::PermissionDenied(msg);
+        }
         match e {
             // Reached by commit paths that surface the typed error directly
             // (the append path converts to `BuildError::TableGone` first).
@@ -216,6 +234,9 @@ impl From<SupertableCommitError> for InfinoError {
 
 impl From<OpenError> for InfinoError {
     fn from(e: OpenError) -> Self {
+        if e.is_permission_denied() {
+            return InfinoError::PermissionDenied(e.to_string());
+        }
         if e.is_conflict() {
             return InfinoError::Conflict(e.to_string());
         }
@@ -228,6 +249,9 @@ impl From<MutationError> for InfinoError {
         let msg = e.to_string();
         if e.is_conflict() {
             return InfinoError::Conflict(msg);
+        }
+        if e.is_permission_denied() {
+            return InfinoError::PermissionDenied(msg);
         }
         match e {
             // Routes over-budget through From<QueryError> when the predicate
@@ -251,6 +275,9 @@ impl From<MutationCommitError> for InfinoError {
         }
         if e.is_conflict() {
             return InfinoError::Conflict(e.to_string());
+        }
+        if e.is_permission_denied() {
+            return InfinoError::PermissionDenied(e.to_string());
         }
         // `Supertable::append` lands here, so this is the arm that decides what
         // appending to a purged table reports. Narrow on purpose: every other
@@ -360,6 +387,73 @@ mod tests {
         assert!(matches!(
             InfinoError::from(SupertableBuildError::NoDocsToBuild),
             InfinoError::Schema(_)
+        ));
+    }
+
+    #[test]
+    fn refused_credentials_route_to_permission_denied_through_every_wrapper() {
+        // The condition a caller reacts to by supplying fresh credentials, so
+        // it must not arrive as a generic Io/Backend/Query fault on any path.
+        let denied = || StorageError::PermissionDenied { uri: "u".into() };
+
+        // Direct storage op.
+        assert!(matches!(
+            InfinoError::from(denied()),
+            InfinoError::PermissionDenied(_)
+        ));
+        // Manifest / part load — otherwise a retryable Io.
+        assert!(matches!(
+            InfinoError::from(ManifestLoadError::Storage(denied())),
+            InfinoError::PermissionDenied(_)
+        ));
+        // Open, build, and commit paths — otherwise Backend or Schema.
+        assert!(matches!(
+            InfinoError::from(OpenError::Storage(denied())),
+            InfinoError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(SupertableBuildError::StorageConstruction(denied())),
+            InfinoError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(SupertableCommitError::Storage(denied())),
+            InfinoError::PermissionDenied(_)
+        ));
+        // Mutation and its commit wrapper — otherwise Backend.
+        assert!(matches!(
+            InfinoError::from(MutationError::Storage(denied())),
+            InfinoError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(MutationCommitError::AppendFlush(
+                SupertableBuildError::StorageConstruction(denied())
+            )),
+            InfinoError::PermissionDenied(_)
+        ));
+        // Query path — otherwise a caller-fault Query (a 400 at an HTTP
+        // boundary), which is the one mislabel that hides the real cause.
+        assert!(matches!(
+            InfinoError::from(QueryError::PermissionDenied("q".into())),
+            InfinoError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            InfinoError::from(QueryError::ManifestLoad(ManifestLoadError::Storage(
+                denied()
+            ))),
+            InfinoError::PermissionDenied(_)
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_storage_fault_is_still_io_not_permission_denied() {
+        // The near miss: a permanent storage fault is not a credential
+        // problem, and fresh credentials would not fix it.
+        assert!(matches!(
+            InfinoError::from(StorageError::Permanent {
+                uri: "u".into(),
+                source: "bad region".into(),
+            }),
+            InfinoError::Io(_)
         ));
     }
 

@@ -99,9 +99,21 @@ pub enum StorageError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    /// Permanent failure (auth, schema/region mismatch,
-    /// corrupted response, malformed URI). Callers do **not**
-    /// retry.
+    /// The credentials in use were refused: the backend rejected the
+    /// request as unauthorized or unauthenticated (HTTP 403 / 401).
+    ///
+    /// Permanent for the credentials that produced it, but *not*
+    /// permanent for the URI: the same operation with valid
+    /// credentials can succeed, which is why this is its own variant
+    /// rather than a [`Self::Permanent`]. Callers do not retry with
+    /// the same credentials.
+    #[error("permission denied: {uri}")]
+    PermissionDenied { uri: String },
+
+    /// Permanent failure (schema/region mismatch, corrupted
+    /// response, malformed URI). Callers do **not** retry.
+    /// Refused credentials have their own variant — see
+    /// [`Self::PermissionDenied`].
     #[error("permanent error: {uri} — {source}")]
     Permanent {
         uri: String,
@@ -123,6 +135,33 @@ impl StorageError {
     pub(crate) fn is_conflict(&self) -> bool {
         matches!(self, StorageError::PreconditionFailed { .. })
     }
+
+    /// True when the backend refused the credentials in use.
+    ///
+    /// The distinguishing property is that neither retrying nor
+    /// reissuing against fresh state helps — only different
+    /// credentials do. Every layer above has its own
+    /// `is_permission_denied` that funnels into this one, and the
+    /// public boundary turns the answer into
+    /// [`InfinoError::PermissionDenied`](crate::InfinoError::PermissionDenied).
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        matches!(self, StorageError::PermissionDenied { .. })
+    }
+}
+
+/// True when `e` or anything in its source chain is a refused-credentials
+/// storage error.
+///
+/// For layers that stringify their source when converting (the query path
+/// carries formatted messages, not typed sources) — this reads the chain
+/// *before* it is flattened, so the classification stays typed rather than
+/// matching on message text. Every link in the chain must declare its
+/// `#[source]` / `#[from]` for the walk to reach the bottom.
+pub(crate) fn permission_denied_in_chain(e: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(e), |e| e.source()).any(|link| {
+        link.downcast_ref::<StorageError>()
+            .is_some_and(StorageError::is_permission_denied)
+    })
 }
 
 /// I/O diagnostics that are not the usage ledger: timeline and phase spans.
@@ -697,6 +736,32 @@ mod tests {
 
     /// Fixed etag the mock reports for any stored object.
     const MOCK_ETAG: &str = "mock-etag";
+
+    /// A two-link error chain over a source, standing in for the wrappers a
+    /// storage error picks up on its way through the query path.
+    #[derive(Debug, thiserror::Error)]
+    #[error("outer")]
+    struct Wrapper(#[source] Box<dyn Error + Send + Sync + 'static>);
+
+    #[test]
+    fn permission_denied_is_found_through_a_wrapped_source_chain() {
+        // The read path stringifies its source when converting, so the
+        // classification has to happen off the typed chain while it still
+        // exists — however deeply the storage error is nested.
+        let nested = Wrapper(Box::new(Wrapper(Box::new(
+            StorageError::PermissionDenied { uri: "u".into() },
+        ))));
+        assert!(permission_denied_in_chain(&nested));
+
+        // A chain with no storage error in it, and one whose storage error is
+        // a different condition, both read as false.
+        assert!(!permission_denied_in_chain(&Wrapper(Box::new(
+            StorageError::NotFound { uri: "u".into() }
+        ))));
+        assert!(!permission_denied_in_chain(&Wrapper(Box::new(
+            std::io::Error::other("disk")
+        ))));
+    }
 
     #[test]
     fn logical_list_key_strips_exact_provider_root() {

@@ -207,6 +207,16 @@ impl AppendPhaseError {
             _ => false,
         }
     }
+
+    /// True when the backend refused the credentials in use.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            AppendPhaseError::ManifestCommit(e) => e.is_permission_denied(),
+            AppendPhaseError::Storage(e) => e.is_permission_denied(),
+            AppendPhaseError::WalStore(e) => e.is_permission_denied(),
+            _ => false,
+        }
+    }
 }
 
 /// Drive one UPDATE WAL from `Intent` to `Appended`.
@@ -781,6 +791,16 @@ impl TombstonePhaseError {
             TombstonePhaseError::ManifestStamp(e) => e.is_conflict(),
             TombstonePhaseError::Storage(e) => e.is_conflict(),
             TombstonePhaseError::WalStore(e) => e.is_conflict(),
+            _ => false,
+        }
+    }
+
+    /// True when the backend refused the credentials in use.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            TombstonePhaseError::ManifestStamp(e) => e.is_permission_denied(),
+            TombstonePhaseError::Storage(e) => e.is_permission_denied(),
+            TombstonePhaseError::WalStore(e) => e.is_permission_denied(),
             _ => false,
         }
     }
