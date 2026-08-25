@@ -61,6 +61,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use super::options::SupertableOptions;
 use crate::{
+    runtime_bridge::carry_span,
     storage::{StorageError, StorageProvider},
     superfile::{
         builder::VectorConfig,
@@ -913,7 +914,7 @@ impl ManifestSnapshot {
                 prewarm_summary_admit_slabs(&entries, &vector_columns, &pool);
                 entries
             };
-            all_superfiles = match spawn_blocking(prewarm).await {
+            all_superfiles = match spawn_blocking(carry_span(prewarm)).await {
                 Ok(entries) => entries,
                 Err(join_error) => {
                     return Err(ManifestLoadError::SlowStateHydration(format!(
@@ -2252,7 +2253,7 @@ impl UserCentroidCache {
 /// `spawn_blocking` keeps the runtime free to drive the remaining
 /// fetches while decodes run in parallel on the blocking pool.
 async fn decode_part_off_thread(bytes: Bytes) -> Result<ManifestPart, ManifestLoadError> {
-    match spawn_blocking(move || part::decode(&bytes)).await {
+    match spawn_blocking(carry_span(move || part::decode(&bytes))).await {
         Ok(result) => Ok(result?),
         Err(join_error) => Err(ManifestLoadError::Parse(part::PartParseError::Avro(
             format!("part decode task failed: {join_error}"),
@@ -2277,7 +2278,7 @@ async fn verify_and_decode_part_off_thread(
         }
         part::decode(&bytes).map_err(ManifestLoadError::from)
     };
-    match spawn_blocking(verify_then_decode).await {
+    match spawn_blocking(carry_span(verify_then_decode)).await {
         Ok(result) => result,
         Err(join_error) => Err(ManifestLoadError::Parse(part::PartParseError::Avro(
             format!("part verify/decode task failed: {join_error}"),

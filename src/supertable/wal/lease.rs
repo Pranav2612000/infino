@@ -62,6 +62,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 use crate::supertable::wal::{
     persistence::{Etag, WalStore, WalStoreError},
@@ -422,35 +423,38 @@ pub fn spawn_heartbeat(
     let tracker_for_task = Arc::clone(&tracker);
     let stuck_threshold = lease_duration / 2;
 
-    let join = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        // First tick fires immediately (default); skip it so
-        // the work thread has a chance to do at least one
-        // storage op before we evaluate progress.
-        ticker.tick().await;
-        loop {
+    let join = tokio::spawn(
+        async move {
+            let mut ticker = tokio::time::interval(interval);
+            // First tick fires immediately (default); skip it so
+            // the work thread has a chance to do at least one
+            // storage op before we evaluate progress.
             ticker.tick().await;
-            if tracker_for_task.stop_requested() {
-                return;
-            }
-            // Stuck-worker check.
-            let last = tracker_for_task.last_progress_at();
-            if let Ok(elapsed) = SystemTime::now().duration_since(last)
-                && elapsed > stuck_threshold
-            {
-                tracker_for_task.request_stop();
-                return;
-            }
-            // Lease extension.
-            match try_heartbeat(&store, wal_id, owner, Utc::now(), lease_duration).await {
-                Ok(_) => {}
-                Err(_) => {
+            loop {
+                ticker.tick().await;
+                if tracker_for_task.stop_requested() {
+                    return;
+                }
+                // Stuck-worker check.
+                let last = tracker_for_task.last_progress_at();
+                if let Ok(elapsed) = SystemTime::now().duration_since(last)
+                    && elapsed > stuck_threshold
+                {
                     tracker_for_task.request_stop();
                     return;
                 }
+                // Lease extension.
+                match try_heartbeat(&store, wal_id, owner, Utc::now(), lease_duration).await {
+                    Ok(_) => {}
+                    Err(_) => {
+                        tracker_for_task.request_stop();
+                        return;
+                    }
+                }
             }
         }
-    });
+        .in_current_span(),
+    );
 
     HeartbeatHandle {
         join: Some(join),

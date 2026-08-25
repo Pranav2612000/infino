@@ -29,7 +29,7 @@ use object_store::{
 };
 
 use super::{ObjectMeta, StorageError, StorageProvider, counting};
-use crate::runtime_metrics::io::UsageMeter;
+use crate::{runtime_bridge::carry_span, runtime_metrics::io::UsageMeter};
 
 #[derive(Debug)]
 pub struct LocalFsStorageProvider {
@@ -336,9 +336,9 @@ impl StorageProvider for LocalFsStorageProvider {
                     })?;
                 // `flock` is a blocking syscall; run it on the
                 // blocking pool so it can't stall a tokio worker.
-                let lock_file = tokio::task::spawn_blocking(move || {
+                let lock_file = tokio::task::spawn_blocking(carry_span(move || {
                     lock_file.lock_exclusive().map(|_| lock_file)
-                })
+                }))
                 .await
                 .map_err(|e| StorageError::Permanent {
                     uri: uri.into(),
