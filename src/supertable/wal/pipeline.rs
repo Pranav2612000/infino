@@ -65,7 +65,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::{
-    runtime_bridge::bridge_sync_to_async,
+    runtime_bridge::{bridge_sync_to_async, run_on_pool},
     runtime_metrics::op_stats::{OpStatsCollector, timed_kernel},
     storage::StorageError,
     superfile::{ReadError, SuperfileReader, builder::SuperfileBuilder},
@@ -89,8 +89,9 @@ use crate::{
             tombstones_codec::TombstonesSidecar,
         },
         writer::{
-            CommitListMetadata, build_column_vector_summary, build_subsection_offsets,
-            persist_commit, read_vector_layout_from_bytes, stamp_tombstone_seqs,
+            CommitListMetadata, build_column_vector_summary, build_packed_update_superfile,
+            build_subsection_offsets, owned_vector_arrays, persist_commit,
+            read_vector_layout_from_bytes, stamp_tombstone_seqs,
         },
     },
 };
@@ -406,31 +407,67 @@ async fn do_apply(
     let scalar_with_id = prepend_id_column(&scalar_no_id, &flat_ids, &inner.options)?;
 
     // ---- Step 4: Build the superfile bytes ----
-    // The replacement superfile's build is the update's own CPU. It is
-    // synchronous, and it runs on whichever thread drives this future:
-    // `update` reaches here through `bridge_on_runtime`, so that is the
-    // caller's own thread inside `block_on` — or, with an ambient
-    // multi-thread runtime, a worker already inside `block_in_place`.
-    // Either way no runtime worker is silently starved behind it, and this
-    // thread's clock is the build's on-CPU time.
-    let bytes = timed_kernel(&op_stats, || {
-        let mut builder = SuperfileBuilder::new(inner.options.builder_options()).map_err(|e| {
+    //
+    // Vector tables route the replacement rows through the commit path's
+    // cell-assign + packed-shard build, so an update's superfile is
+    // cell-directory-packed like every other committed vector superfile —
+    // an unpacked plain build is not a valid drained-side maintenance input
+    // (the drain materializer and the per-cell compaction merges both fail
+    // closed on it), and it would skip cell routing + boundary replicas for
+    // the replacement rows. The pack is a CPU wave, so it rides the writer
+    // pool behind a oneshot per the standing rayon/tokio bridge contract.
+    // Tables without vector columns keep the plain build.
+    //
+    // Either way the build is the update's own CPU and is bracketed as
+    // such — but on the thread that does the work, not the one that waits
+    // for it. The plain build is synchronous here (`update` reaches this
+    // future through `bridge_on_runtime`, so "here" is the caller's own
+    // thread inside `block_on`), so it brackets here. The packed build
+    // carries the collector into `fanout_shards_metered`, which already
+    // brackets each shard on its own pool worker — bracketing the pool
+    // closure as well would count that CPU twice.
+    let bytes = if inner.options.vector_columns.is_empty() {
+        timed_kernel(&op_stats, || {
+            let mut builder =
+                SuperfileBuilder::new(inner.options.builder_options()).map_err(|e| {
+                    AppendPhaseError::SuperfileBuild {
+                        message: format!("builder construction: {e}"),
+                    }
+                })?;
+            builder
+                .add_batch(&scalar_with_id, &vector_slices)
+                .map_err(|e| AppendPhaseError::SuperfileBuild {
+                    message: format!("add_batch: {e}"),
+                })?;
+            let raw = builder
+                .finish()
+                .map_err(|e| AppendPhaseError::SuperfileBuild {
+                    message: format!("finish: {e}"),
+                })?;
+            Ok::<_, AppendPhaseError>(Bytes::from(raw))
+        })?
+    } else {
+        let vectors = owned_vector_arrays(&user_batch, &inner.options).map_err(|e| {
             AppendPhaseError::SuperfileBuild {
-                message: format!("builder construction: {e}"),
+                message: format!("vector handles: {e}"),
             }
         })?;
-        builder
-            .add_batch(&scalar_with_id, &vector_slices)
-            .map_err(|e| AppendPhaseError::SuperfileBuild {
-                message: format!("add_batch: {e}"),
-            })?;
-        let raw = builder
-            .finish()
-            .map_err(|e| AppendPhaseError::SuperfileBuild {
-                message: format!("finish: {e}"),
-            })?;
-        Ok::<_, AppendPhaseError>(Bytes::from(raw))
-    })?;
+        let pool_inner = Arc::clone(inner);
+        let pool_batch = scalar_with_id.clone();
+        let pool_stats = op_stats.clone();
+        run_on_pool(
+            Some(&inner.options.writer_pool),
+            "update packed superfile build",
+            move || build_packed_update_superfile(&pool_inner, pool_batch, vectors, &pool_stats),
+        )
+        .await
+        .map_err(|e| AppendPhaseError::SuperfileBuild {
+            message: format!("packed build: {e}"),
+        })?
+        .map_err(|e| AppendPhaseError::SuperfileBuild {
+            message: format!("packed build: {e}"),
+        })?
+    };
 
     // ---- Step 5: Per-superfile summaries + SuperfileEntry ----
     //

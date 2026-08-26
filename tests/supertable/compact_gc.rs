@@ -16,13 +16,15 @@
 
 use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 
-use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+};
 use arrow_schema::{DataType, Field, Schema};
 use chrono::{Duration as ChronoDuration, Utc};
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
     CompactionSettings, GcSettings, OptimizeOptions,
-    superfile::{builder::FtsConfig, fts::reader::BoolMode},
+    superfile::{builder::FtsConfig, fts::reader::BoolMode, vector::rerank_codec::RerankCodec},
     supertable::{
         Supertable, SupertableOptions,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
@@ -502,13 +504,18 @@ fn hidden_vector_options() -> SupertableOptions {
             false,
         ),
     ]));
+    // Use the engine-default rerank codec (what catalog-created tables get);
+    // `default_vector_config` still hands out the legacy Fp32 codec, which no
+    // production path writes.
+    let mut vector_config = default_vector_config("emb", HIDDEN_ROT_SEED);
+    vector_config.rerank_codec = RerankCodec::default();
     SupertableOptions::new(
         schema,
         vec![FtsConfig {
             column: "title".into(),
             positions: false,
         }],
-        vec![default_vector_config("emb", HIDDEN_ROT_SEED)],
+        vec![vector_config],
         Some(default_tokenizer()),
     )
     .expect("valid options")
@@ -601,5 +608,119 @@ fn gc_on_the_hidden_vector_index_drops_its_cache_copies() {
         cache.stats().n_gc_drops > drops_before_hidden,
         "the hidden sweep must drop its own cache copies (before={drops_before_hidden}, after={})",
         cache.stats().n_gc_drops
+    );
+}
+
+/// One replacement row for the update regression below: `title` plus a
+/// one-hot vector pointing at `hot_dim`, matching [`hidden_batch`]'s shape.
+fn hidden_row(schema: Arc<Schema>, title: &str, hot_dim: usize) -> RecordBatch {
+    let mut flat = vec![0.0_f32; HIDDEN_DIM];
+    flat[hot_dim] = 1.0;
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let embedding = FixedSizeListArray::try_new(
+        item,
+        HIDDEN_DIM as i32,
+        Arc::new(Float32Array::from(flat)),
+        None,
+    )
+    .expect("fixed list");
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(LargeStringArray::from(vec![title])),
+        Arc::new(embedding),
+    ];
+    RecordBatch::try_new(schema, cols).expect("batch")
+}
+
+/// Merge-qualifying settings for the mixed-layout regression below: the
+/// count leg (two superfiles) must fire on its own, because the drained side
+/// holds one cell-packed base plus one tiny staging replacement file — far
+/// below any byte floor.
+fn mixed_layout_optimize_opts() -> OptimizeOptions {
+    OptimizeOptions::compact(CompactionSettings {
+        target_superfile_size_mb: 1,
+        min_fill_percent: 1,
+        min_superfiles_for_merge: 2,
+        ..CompactionSettings::default()
+    })
+}
+
+/// Regression: `optimize()` after an `update` on a drained vector table must
+/// not fail.
+///
+/// A vector commit packs its superfiles' IVF subsections per cell behind a
+/// cell directory (`commit_shards_via_drain`), but an update's WAL append
+/// phase still builds its replacement superfile with the plain
+/// `SuperfileBuilder` — one unpacked IVF subsection, no cell directory.
+/// `optimize()` drains the update commit before compacting, which moves the
+/// replacement superfile to the drained side of the compaction split — into
+/// the same merge job as the packed base. The merge kind is picked from the
+/// first input only, so the mixed job routes everything into the per-cell
+/// merge path, which fails closed on the unpacked input
+/// ("build_from_multi_cell_sq8_ivf_readers requires multi-cell inputs") and
+/// takes the whole `optimize()` down with it.
+#[test]
+fn optimize_after_update_on_a_drained_vector_table_succeeds() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(hidden_vector_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+
+    // One commit of 32 one-hot rows -> cell-packed user superfiles.
+    let schema = st.options().schema.clone();
+    {
+        let mut w = st.writer().expect("writer");
+        w.append(&hidden_batch(Arc::clone(&schema), 0))
+            .expect("append");
+        w.append(&hidden_batch(Arc::clone(&schema), 1))
+            .expect("append");
+        w.commit().expect("commit");
+    }
+    st.drain_vectors_to_cells_sync().expect("drain");
+
+    // Update one row: the replacement superfile is staging-layout.
+    let stats = st
+        .update(
+            col("title").eq(lit("hidden doc 0 3")),
+            &hidden_row(Arc::clone(&schema), "updated doc 3", 3),
+        )
+        .expect("update");
+    assert_eq!(stats.matched(), 1);
+    assert_eq!(stats.n_tombstoned(), 1);
+
+    st.optimize(&mixed_layout_optimize_opts())
+        .expect("optimize after update on a drained vector table");
+
+    // The table stays intact and queryable: same row count, the replacement
+    // row visible, the replaced row gone.
+    let titles: Vec<String> = st
+        .reader()
+        .expect("reader")
+        .query_sql("SELECT title FROM supertable")
+        .expect("sql")
+        .iter()
+        .flat_map(|batch| {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("title column");
+            (0..col.len())
+                .map(|i| col.value(i).to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        titles.len(),
+        2 * HIDDEN_DIM,
+        "update preserves the row count"
+    );
+    assert!(
+        titles.iter().any(|t| t == "updated doc 3"),
+        "replacement row visible after optimize"
+    );
+    assert!(
+        titles.iter().all(|t| t != "hidden doc 0 3"),
+        "replaced row gone after optimize"
     );
 }
