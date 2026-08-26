@@ -33,6 +33,7 @@ use tokio::{
     sync::{Notify, OnceCell, Semaphore, oneshot},
     task::{JoinHandle, spawn_blocking},
 };
+use tracing::Instrument;
 
 use super::{
     block_source::BlockCachedSource,
@@ -40,6 +41,7 @@ use super::{
 };
 use crate::{
     config::global as global_config,
+    runtime_bridge::carry_span,
     runtime_metrics::io::scope_background,
     storage::{StorageError, StorageProvider},
     superfile::{
@@ -1207,26 +1209,32 @@ impl DiskCacheStore {
             let (write_tx, write_rx) = oneshot::channel::<JoinHandle<Result<(), DiskCacheError>>>();
             write_handles.push(write_rx);
 
-            fetch_handles.push(tokio::spawn(async move {
-                let bytes = storage.get_range(&uri_s, start..end).await?;
-                // Save Bytes for the foreground.
-                {
-                    let mut guard = chunks.lock().await;
-                    guard[i as usize] = Some((start, bytes.clone()));
-                }
-                // Spawn the pwrite as a fire-and-forget task.
-                // Its JoinHandle goes to the background
-                // finalizer (via oneshot) so the foreground
-                // doesn't wait for it.
-                let pwrite_handle = tokio::spawn(async move {
-                    let mut guard = file.lock().await;
-                    guard.seek(SeekFrom::Start(start)).await?;
-                    guard.write_all(&bytes).await?;
+            fetch_handles.push(tokio::spawn(
+                async move {
+                    let bytes = storage.get_range(&uri_s, start..end).await?;
+                    // Save Bytes for the foreground.
+                    {
+                        let mut guard = chunks.lock().await;
+                        guard[i as usize] = Some((start, bytes.clone()));
+                    }
+                    // Spawn the pwrite as a fire-and-forget task.
+                    // Its JoinHandle goes to the background
+                    // finalizer (via oneshot) so the foreground
+                    // doesn't wait for it.
+                    let pwrite_handle = tokio::spawn(
+                        async move {
+                            let mut guard = file.lock().await;
+                            guard.seek(SeekFrom::Start(start)).await?;
+                            guard.write_all(&bytes).await?;
+                            Ok::<(), DiskCacheError>(())
+                        }
+                        .in_current_span(),
+                    );
+                    let _ = write_tx.send(pwrite_handle);
                     Ok::<(), DiskCacheError>(())
-                });
-                let _ = write_tx.send(pwrite_handle);
-                Ok::<(), DiskCacheError>(())
-            }));
+                }
+                .in_current_span(),
+            ));
         }
 
         // 2. Await all fetches (NOT pwrites). Foreground bytes
@@ -1288,19 +1296,22 @@ impl DiskCacheStore {
         let tmp_owned = tmp.clone();
         let final_owned = final_path.clone();
         let file_owned = Arc::clone(&file);
-        tokio::spawn(async move {
-            let _ = finalize_to_mmap(
-                store,
-                uri_owned,
-                tmp_owned,
-                final_owned,
-                file_owned,
-                write_handles,
-                size,
-                reserved_bytes,
-            )
-            .await;
-        });
+        tokio::spawn(
+            async move {
+                let _ = finalize_to_mmap(
+                    store,
+                    uri_owned,
+                    tmp_owned,
+                    final_owned,
+                    file_owned,
+                    write_handles,
+                    size,
+                    reserved_bytes,
+                )
+                .await;
+            }
+            .in_current_span(),
+        );
 
         Ok(entry)
     }
@@ -1406,27 +1417,30 @@ impl DiskCacheStore {
         let uri_owned = *uri;
         let storage_uri_owned = Self::storage_path(uri);
         let fetch_storage = self.resolve_storage(storage);
-        tokio::spawn(async move {
-            if needs_reserve {
-                let Some(s) = store.upgrade() else {
-                    return;
-                };
-                if s.reserve_manual(size).await.is_err() {
-                    return;
+        tokio::spawn(
+            async move {
+                if needs_reserve {
+                    let Some(s) = store.upgrade() else {
+                        return;
+                    };
+                    if s.reserve_manual(size).await.is_err() {
+                        return;
+                    }
                 }
+                let _ = lazy_background_fill(
+                    store,
+                    reader,
+                    uri_owned,
+                    storage_uri_owned,
+                    size,
+                    size,
+                    fetch_storage,
+                    skip_vec,
+                )
+                .await;
             }
-            let _ = lazy_background_fill(
-                store,
-                reader,
-                uri_owned,
-                storage_uri_owned,
-                size,
-                size,
-                fetch_storage,
-                skip_vec,
-            )
-            .await;
-        });
+            .in_current_span(),
+        );
     }
 
     /// Lazy cold-fetch path. Foreground builds a reader via
@@ -1921,22 +1935,25 @@ impl DiskCacheStore {
             let file = Arc::clone(&file);
             let uri = storage_uri.to_string();
             let stream_sem = Arc::clone(&stream_sem);
-            joins.push(tokio::spawn(async move {
-                let _permit = stream_sem.acquire_owned().await.map_err(|e| {
-                    DiskCacheError::SuperfileOpen(format!("stream semaphore closed: {e}"))
-                })?;
-                let bytes = storage.get_range(&uri, start..end).await?;
-                spawn_blocking(move || file.write_all_at(&bytes, start))
-                    .await
-                    .map_err(|e| DiskCacheError::SuperfileOpen(format!("write join: {e}")))??;
-                Ok::<(), DiskCacheError>(())
-            }));
+            joins.push(tokio::spawn(
+                async move {
+                    let _permit = stream_sem.acquire_owned().await.map_err(|e| {
+                        DiskCacheError::SuperfileOpen(format!("stream semaphore closed: {e}"))
+                    })?;
+                    let bytes = storage.get_range(&uri, start..end).await?;
+                    spawn_blocking(carry_span(move || file.write_all_at(&bytes, start)))
+                        .await
+                        .map_err(|e| DiskCacheError::SuperfileOpen(format!("write join: {e}")))??;
+                    Ok::<(), DiskCacheError>(())
+                }
+                .in_current_span(),
+            ));
         }
         for h in joins {
             h.await
                 .map_err(|e| DiskCacheError::SuperfileOpen(format!("join error: {e}")))??;
         }
-        spawn_blocking(move || file.sync_all())
+        spawn_blocking(carry_span(move || file.sync_all()))
             .await
             .map_err(|e| DiskCacheError::SuperfileOpen(format!("fsync join: {e}")))??;
         Ok(())
@@ -2242,7 +2259,7 @@ async fn cold_fetch_to_disk_cancelable(
                     let bytes =
                         scope_background(storage.get_range(&uri, range_start..range_end)).await?;
                     let file = Arc::clone(&file);
-                    spawn_blocking(move || file.write_all_at(&bytes, range_start))
+                    spawn_blocking(carry_span(move || file.write_all_at(&bytes, range_start)))
                         .await
                         .map_err(|error| {
                             DiskCacheError::SuperfileOpen(format!("write join: {error}"))
@@ -2296,7 +2313,7 @@ async fn cold_fetch_to_disk_cancelable(
     if reader_blocks_background_fill(reader) {
         return Ok(BackgroundFillOutcome::Paused);
     }
-    spawn_blocking(move || file.sync_all())
+    spawn_blocking(carry_span(move || file.sync_all()))
         .await
         .map_err(|error| DiskCacheError::SuperfileOpen(format!("fsync join: {error}")))??;
     Ok(BackgroundFillOutcome::Complete)

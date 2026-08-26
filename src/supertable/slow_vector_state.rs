@@ -33,6 +33,7 @@ use uuid::Uuid;
 
 use crate::{
     config,
+    runtime_bridge::carry_span,
     storage::{StorageError, StorageProvider},
     superfile::vector::hnsw,
     supertable::{
@@ -735,12 +736,12 @@ pub(crate) async fn load_full_state(
     // blake3 over the whole blob plus the Avro parse is a CPU wave
     // (multi-GiB at 100M docs); run it on the blocking pool so the
     // runtime keeps driving I/O instead of stalling behind the decode.
-    match spawn_blocking(move || {
+    match spawn_blocking(carry_span(move || {
         if ContentHash::of(bytes.as_ref()) != expected {
             return Err(SlowVectorStateError::HashMismatch);
         }
         decode_state(bytes.as_ref())
-    })
+    }))
     .await
     {
         Ok(result) => result,

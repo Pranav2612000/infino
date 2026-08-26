@@ -44,7 +44,7 @@ use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
 use arrow_array::Decimal128Array;
 use futures::future::try_join_all;
 use roaring::RoaringBitmap;
-use tracing::trace;
+use tracing::{Instrument, trace};
 use uuid::Uuid;
 
 use super::SuperfileHit;
@@ -598,18 +598,21 @@ where
         let tombstone_cache = tombstone_cache.clone();
         let body = body.clone();
         let vector_columns = Arc::clone(&vector_columns);
-        let handle = tokio::spawn(async move {
-            let r = open_reader(
-                &store,
-                disk_cache.as_ref(),
-                storage.as_ref(),
-                &entry,
-                allow_background_fill,
-            )
-            .await?;
-            verify_superfile_vector_codecs(&r, &vector_columns)?;
-            body(r, entry, tombstone_cache, now, params).await
-        });
+        let handle = tokio::spawn(
+            async move {
+                let r = open_reader(
+                    &store,
+                    disk_cache.as_ref(),
+                    storage.as_ref(),
+                    &entry,
+                    allow_background_fill,
+                )
+                .await?;
+                verify_superfile_vector_codecs(&r, &vector_columns)?;
+                body(r, entry, tombstone_cache, now, params).await
+            }
+            .in_current_span(),
+        );
         // Flatten the join error into a QueryError so `try_join_all`
         // short-circuits on the first failing superfile.
         async move {

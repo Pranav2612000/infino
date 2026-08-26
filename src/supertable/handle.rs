@@ -27,7 +27,7 @@ use arrow_schema::SchemaRef;
 use chrono::Utc;
 use datafusion::{execution::context::SessionContext, logical_expr::LogicalPlan};
 use tokio::runtime::Runtime;
-use tracing::{debug, warn};
+use tracing::{Instrument, debug, warn};
 
 use super::{
     error::{BuildError, CommitError, OpenError},
@@ -1185,7 +1185,7 @@ impl Supertable {
                             true,
                         )
                         .await
-                    })
+                    }.in_current_span())
                 })
                 .collect();
             for h in handles {
