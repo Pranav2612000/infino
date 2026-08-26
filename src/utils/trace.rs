@@ -31,7 +31,7 @@
 //! engine-side code. The engine's job is only to never orphan the chain
 //! — see the thread hand-off helpers in `runtime_bridge`.
 
-use tracing::Span;
+use tracing::{Span, field::Value};
 
 /// What kind of operation a span's work is being done for.
 ///
@@ -124,4 +124,25 @@ impl TableRole {
 pub(crate) fn detached(span: Span) -> Span {
     span.follows_from(Span::current());
     span
+}
+
+/// Record `value` into `field` on the currently-entered span.
+///
+/// For the outcome of an operation — a cache hit, a byte count, which of
+/// three branches a refresh took — which isn't known until the work is
+/// done. The enclosing `#[instrument]` declares the field as
+/// `tracing::field::Empty` and this fills it in before the span closes,
+/// so the span carries both its duration and what it did.
+///
+/// Compiles to nothing without `detailed-tracing`: the body is behind a
+/// `cfg!` so it still type-checks in every configuration (a field/value
+/// mistake can't hide in the feature-off build) while folding away in a
+/// release build that doesn't want it. Recording into a field the
+/// enclosing span never declared — or with no span entered — is a
+/// silent no-op, which is what makes the call sites safe to leave
+/// unconditional.
+pub(crate) fn record<V: Value>(field: &'static str, value: V) {
+    if cfg!(feature = "detailed-tracing") {
+        Span::current().record(field, value);
+    }
 }

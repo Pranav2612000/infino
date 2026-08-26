@@ -67,7 +67,7 @@ use crate::{
             recovery::{RecoveryError, RecoveryReport, scan_and_recover},
         },
     },
-    utils::trace::TableRole,
+    utils::trace::{TableRole, record},
 };
 
 /// Top-level handle. Cheap to clone (one `Arc::clone`); all clones
@@ -277,6 +277,18 @@ impl SupertableInner {
     /// Lives on the inner because the deferred storage reclaim holds only an `Arc<SupertableInner>`
     /// and still has to resolve the committed manifest when it fires.
     /// [`Supertable::refresh`] is the handle-level spelling of the same call.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "manifest.refresh",
+            skip_all,
+            fields(
+                role = self.role.as_str(),
+                outcome = tracing::field::Empty,
+                manifest_id = tracing::field::Empty
+            )
+        )
+    )]
     pub(super) async fn refresh(&self) -> Result<bool, ManifestLoadError> {
         let storage = self
             .options
@@ -303,10 +315,15 @@ impl SupertableInner {
             // already has a pointer by then, since `open` fails with `PointerNotFound` without one
             // and `create` publishes an empty manifest first.
             PointerProbe::Absent => {
+                record("outcome", "pointer_vanished");
                 let _ = self.pointer_vanished.set(());
                 return Err(ManifestLoadError::PointerVanished);
             }
-            PointerProbe::NotModified => return Ok(false),
+            // The steady state: one conditional roundtrip, no body, no parse.
+            PointerProbe::NotModified => {
+                record("outcome", "not_modified");
+                return Ok(false);
+            }
             PointerProbe::Read(pointer, meta) => (pointer, meta),
         };
 
@@ -330,6 +347,7 @@ impl SupertableInner {
             // this process's own commit leaves behind. Nothing newer to load, so record the etag
             // and let the next probe be a cheap 304.
             Err(ManifestLoadError::AlreadyLoaded) => {
+                record("outcome", "already_loaded");
                 *self
                     .last_pointer_etag
                     .lock()
@@ -350,10 +368,10 @@ impl SupertableInner {
             .lock()
             .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
 
-        debug!(
-            manifest_id = self.manifest.load().manifest_id,
-            "refreshed manifest"
-        );
+        let manifest_id = self.manifest.load().manifest_id;
+        record("outcome", "advanced");
+        record("manifest_id", manifest_id);
+        debug!(manifest_id, "refreshed manifest");
 
         Ok(true)
     }
