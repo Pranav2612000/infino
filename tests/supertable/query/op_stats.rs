@@ -220,16 +220,21 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
 }
 
 #[test]
-fn work_stats_are_deterministic_across_cache_temperature() {
-    // The first run decodes from a cold state, the repeat hits every
-    // warm structure — the whole point of the counter is that the
-    // reported work is identical either way. Compare the full masked
-    // snapshot (like the vector/SQL siblings), not just posting bytes,
-    // so a warm/cold divergence in any FTS counter is caught.
+fn fts_work_stats_repeat_identically_on_the_same_table_state() {
+    // Named for what it guards. It used to claim the first run decodes
+    // from a cold state and the repeat hits warm structures, but this
+    // fixture has no cache-temperature axis at all: `demo_two_superfiles`
+    // attaches no storage, so every published superfile's bytes sit in
+    // the table's in-memory reader cache for its lifetime and both runs
+    // are served from the same resident reader. What it really pins is
+    // run-to-run repeatability across the full masked snapshot, which is
+    // worth having — the genuine cold-open axis is covered by
+    // `sql_work_stats_do_not_depend_on_reader_open_shape` for SQL and by
+    // the reader-lifetime transposition in the vector sibling.
     let st = demo_two_superfiles();
-    let cold = deterministic(scoped_fts_stats(&st, "rust"));
-    let warm = deterministic(scoped_fts_stats(&st, "rust"));
-    assert_eq!(cold, warm, "same plan, same table state, same work");
+    let first = deterministic(scoped_fts_stats(&st, "rust"));
+    let second = deterministic(scoped_fts_stats(&st, "rust"));
+    assert_eq!(first, second, "same plan, same table state, same work");
 }
 
 #[test]
@@ -783,6 +788,29 @@ fn vector_work_stats_are_deterministic_across_cache_temperature() {
     assert_eq!(cold, warm, "same plan, same table state, same work");
 }
 
+/// The reader-level SQL surface (test/bench only) meters CPU through the
+/// plan root, but its session context is cached and deliberately carries
+/// no collector — so the scan-level wrappers are inert there and the
+/// row count has to come from DataFusion's own leaf metrics. Without
+/// that harvest the benches driving this surface got a CPU number with no
+/// row denominator to divide it by.
+#[test]
+fn the_reader_level_sql_surface_reports_materialized_rows() {
+    let st = demo_two_superfiles();
+    let (batches, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .query_sql("SELECT title FROM supertable")
+            .expect("reader-level query_sql")
+    });
+    let returned: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+    assert!(returned > 0, "the fixture must return rows");
+    assert_eq!(
+        stats.rows_materialized, returned,
+        "every row the scan decoded must reach the counter"
+    );
+}
+
 // ---- SQL: the per-query channel through the catalog `query_sql` path ----
 
 /// Rows in the SQL fixture.
@@ -843,9 +871,63 @@ fn a_scoped_sql_scan_reports_page_bytes() {
         stats.rows_materialized > 0,
         "the scan's decoded rows come from DataFusion's own metrics; got 0"
     );
+}
+
+/// A whole-table aggregate is answerable from statistics the provider
+/// attaches to the scan, so the planner folds it to a constant and never
+/// opens a page. Measuring must not change that. `MeteredExec` sits
+/// directly between the aggregate and the scan, and an `ExecutionPlan`
+/// wrapper that takes the trait defaults reports unknown statistics —
+/// which silently turns an O(1) manifest read into a full columnar scan
+/// that the customer is then billed for. This asserts the billing-visible
+/// consequence rather than a plan string, so it holds whichever rule does
+/// the folding.
+#[test]
+fn a_whole_table_aggregate_folds_instead_of_scanning() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    for sql in [
+        "SELECT COUNT(*) FROM docs",
+        "SELECT MIN(rating), MAX(rating) FROM docs",
+    ] {
+        let stats = scoped_sql_stats(&db, sql);
+        assert_eq!(
+            stats.sql_page_bytes, 0,
+            "{sql} folds from statistics; it must not read Parquet pages"
+        );
+        assert_eq!(
+            stats.planned_read_ranges, 0,
+            "{sql} folds from statistics; it must not plan a read range"
+        );
+        assert_eq!(
+            stats.rows_materialized, 0,
+            "{sql} folds from statistics; it must not decode rows"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "per-thread CPU clock is Linux procfs (schedstat); off Linux kernel_cpu_ns is always 0"
+)]
+fn a_scoped_sql_scan_reports_kernel_cpu() {
+    // SQL CPU is bracketed per scan poll on the thread clock, like every
+    // other kernel — not DataFusion's `elapsed_compute`, which is wall
+    // time and omits Parquet decode. Same granularity handling as the
+    // BM25 and vector kernel-CPU tests: schedstat advances at scheduler
+    // events, so one sub-tick scan can legitimately read zero and only a
+    // batch is guaranteed to register.
+    const KERNEL_CPU_BATCH: usize = 200;
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_fixture(&dir);
+    let mut total = 0u64;
+    for _ in 0..KERNEL_CPU_BATCH {
+        total += scoped_sql_stats(&db, "SELECT rating FROM docs WHERE rating > 5").kernel_cpu_ns;
+    }
     assert!(
-        stats.kernel_cpu_ns > 0,
-        "the plan's elapsed compute comes from DataFusion's own metrics; got 0"
+        total > 0,
+        "the bracketed SQL scan reports on-CPU time over {KERNEL_CPU_BATCH} queries; got 0"
     );
 }
 

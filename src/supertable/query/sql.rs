@@ -59,15 +59,16 @@ use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
 use arrow_schema::SchemaRef;
 use datafusion::{
+    dataframe::DataFrame,
     datasource::DefaultTableSource,
     error::DataFusionError,
-    execution::context::SessionContext,
+    execution::{TaskContext, context::SessionContext},
     logical_expr::{Expr, LogicalPlan},
 };
 
 use crate::{
     memory::budgeted_session_context,
-    runtime_metrics::op_stats,
+    runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::permission_denied_in_chain,
     supertable::{
         error::QueryError,
@@ -76,8 +77,9 @@ use crate::{
         query::{
             covered_agg::CoveredAggregateRewrite,
             exec::{
-                fts_exec::register_bm25, hybrid_exec::register_hybrid_search,
-                match_exec::register_match, vector_exec::register_vector_search,
+                common::collect_plan_metered, fts_exec::register_bm25,
+                hybrid_exec::register_hybrid_search, match_exec::register_match,
+                vector_exec::register_vector_search,
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
         },
@@ -220,9 +222,10 @@ impl SupertableReader {
     /// Not metered: this entry runs on the cached, collector-detached
     /// [`SessionContext`] (see [`Self::sql_session_context`]), so a
     /// surrounding `with_op_stats` scope reports zero SQL work for it.
-    /// The metered SQL surface is the catalog `Connection::query_sql`,
-    /// which builds a fresh per-query provider that carries the scope's
-    /// collector.
+    /// The metered SQL surfaces are the catalog `Connection::query_sql`,
+    /// which builds a fresh per-query provider carrying the scope's
+    /// collector, and mutation predicate resolves, which go through
+    /// [`Self::metered_session_context`] for the same reason.
     // Single-table SQL — off the public surface; catalog-level SQL is the
     // public entry point. Reachable from tests/benches via `test-helpers`.
     #[cfg(any(test, feature = "test-helpers"))]
@@ -247,6 +250,12 @@ impl SupertableReader {
         });
         let cached_plan = self.cached_sql_logical_plan(sql);
         let cache_reader = self.clone();
+        // Picked up on the caller's thread, like reader mint: the drive
+        // future polls on runtime threads where the scope's slot is
+        // invisible. This is what lets the cached, collector-detached
+        // context still report the plan's CPU — the meter rides the
+        // wrapper below, not the context.
+        let op_stats = op_stats::current();
 
         let sql = sql.to_owned();
         let drive = async move {
@@ -278,7 +287,11 @@ impl SupertableReader {
                     df
                 }
             };
-            df.collect().await.map_err(exec_query_error)
+            // Meter the executed plan on the thread-CPU clock, the same
+            // way the catalog path does. The context is cached and
+            // deliberately carries no collector, so without this the
+            // reader-level SQL surface reports nothing at all.
+            Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await
         };
 
         // Drive through the shared sync→async bridge: ambient
@@ -327,20 +340,49 @@ impl SupertableReader {
             return Ok(ctx.clone());
         }
 
+        let ctx = op_stats::suppressed(|| self.build_session_context(reader))?;
+        *guard = Some((Arc::clone(&manifest), ctx.clone()));
+        Ok(ctx)
+    }
+
+    /// A context bound to **this** reader, collector and all, built fresh
+    /// on every call and never cached.
+    ///
+    /// [`Self::sql_session_context`] detaches the collector because its
+    /// context is shared across queries, and one that captured a live
+    /// collector would attribute later queries' work back into an old
+    /// scope. That makes it unusable for anything whose work should be
+    /// reported: a caller running through it measures zero no matter how
+    /// much it scans.
+    ///
+    /// Not caching is what makes carrying the collector safe — nothing
+    /// outlives the scope that created it — and it is the same trade the
+    /// catalog's `Connection::query_sql` already makes, building a fresh
+    /// provider per query so the scope's collector rides along.
+    fn metered_session_context(&self) -> Result<SessionContext, QueryError> {
+        self.build_session_context(Arc::new(self.clone()))
+    }
+
+    /// Assemble a context over `reader`'s pinned snapshot: pushdown-aware
+    /// provider, the covered-aggregate rewrite, and the search TVFs.
+    ///
+    /// Whether the result may be cached is the caller's call, and it turns
+    /// entirely on whether `reader` carries a work collector — see the two
+    /// callers above.
+    fn build_session_context(&self, reader: Arc<Self>) -> Result<SessionContext, QueryError> {
+        let manifest = Arc::clone(reader.manifest());
         let store = Arc::clone(&self.options().store);
         let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
         // Cached per-table schemas: the provider scans the string-viewed `scan`
         // schema; the TVFs bind to the plain `scalar` schema.
         let schemas = self.sql_schemas();
-        let provider = op_stats::suppressed(|| {
-            SupertableProvider::new(
-                schemas.scan().clone(),
-                Arc::clone(&manifest),
-                store,
-                disk_cache,
-                reader.tombstone_cache.clone(),
-            )
-        });
+        let provider = SupertableProvider::new(
+            schemas.scan().clone(),
+            Arc::clone(&manifest),
+            store,
+            disk_cache,
+            reader.tombstone_cache.clone(),
+        );
 
         // Gate SQL heap on the connection budget (shared across contexts, so
         // this reader's SQL counts against the same ceiling as the rest).
@@ -364,9 +406,24 @@ impl SupertableReader {
         register_match(&ctx, Arc::clone(&reader), schemas.scalar().clone());
         register_hybrid_search(&ctx, Arc::clone(&reader), schemas.scalar().clone());
 
-        *guard = Some((Arc::clone(&manifest), ctx.clone()));
-
         Ok(ctx)
+    }
+
+    /// Plan one DataFrame, then run it through the shared
+    /// meter-collect-harvest step every SQL execution site uses
+    /// ([`collect_plan_metered`]).
+    async fn collect_metered_df(
+        df: DataFrame,
+        task_ctx: Arc<TaskContext>,
+        op_stats: &Option<Arc<OpStatsCollector>>,
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        let plan = df
+            .create_physical_plan()
+            .await
+            .map_err(|e| QueryError::Plan(e.to_string()))?;
+        collect_plan_metered(&plan, task_ctx, op_stats)
+            .await
+            .map_err(exec_query_error)
     }
 
     /// Resolve a predicate to the matching `_id` values. Used by
@@ -389,11 +446,17 @@ impl SupertableReader {
     /// captured-at-call semantics match SQL `UPDATE WHERE` /
     /// `DELETE WHERE`.
     pub(crate) fn scan_ids_matching(&self, expr: Expr) -> Result<Vec<i128>, QueryError> {
+        // Picked up on the caller's thread, before any runtime hop, so the
+        // harvest below folds into this op's collector.
+        let op_stats = op_stats::current();
         let _foreground = ForegroundQueryGuard::enter();
         // Resolve against this reader's pinned snapshot. Callers that need
         // current-state semantics create a fresh reader immediately before
         // invoking this helper.
-        let ctx = self.sql_session_context()?;
+        // Metered deliberately: this scan is real read work the caller
+        // asked for, and routing it through the cached context would
+        // report zero for an arbitrarily large table scan.
+        let ctx = self.metered_session_context()?;
         let id_column = self.options().id_column.clone();
 
         let drive = async move {
@@ -405,7 +468,12 @@ impl SupertableReader {
                 .map_err(|e| QueryError::Plan(e.to_string()))?
                 .select_columns(&[id_column.as_str()])
                 .map_err(|e| QueryError::Plan(e.to_string()))?;
-            let batches = df.collect().await.map_err(exec_query_error)?;
+            // Same three steps as `query_sql`, and for the same reason:
+            // this scan's rows are real decoded rows. Collecting the
+            // DataFrame directly reported CPU, page bytes and ranges for a
+            // mutation's predicate resolve while leaving its row count at
+            // zero.
+            let batches = Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await?;
             extract_id_column(&batches)
         };
 

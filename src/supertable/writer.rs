@@ -88,7 +88,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{
-    build::fanout_shards,
+    build::{fanout_shards, fanout_shards_metered},
     error::BuildError,
     handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner},
     manifest::{
@@ -116,6 +116,10 @@ use crate::{
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
     memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::{bridge_on_runtime, run_on_pool},
+    runtime_metrics::{
+        ingest::visible_array_bytes,
+        op_stats::{self, OpStatsCollector},
+    },
     storage::{StorageError, StorageProvider},
     superfile::{
         BuildError as SuperfileBuildError, ReadError, SuperfileReader,
@@ -367,8 +371,22 @@ pub struct SupertableWriter {
     /// Byte size of the FTS-indexed text columns within `buffer`. A
     /// subset of `buffer_scalar_bytes`, not extra held memory; tracked
     /// only to weight the build-scratch reserve, since the FTS index
-    /// structures built at commit scale with the text input.
+    /// structures built at commit scale with the text input. Measured as
+    /// visible (slice-aware) bytes — what the build will actually index —
+    /// unlike `buffer_scalar_bytes` above, which measures resident
+    /// allocation. (`buffer_vector_bytes` is the exact f32 payload on
+    /// either reading; slices share nothing wider than their rows.)
     buffer_fts_bytes: usize,
+    /// Ingested work for the batches sitting in `buffer`, computed at
+    /// `append` time from the caller's own batch and held here until the
+    /// commit that publishes them returns `Ok`. Counting at append time is
+    /// what keeps the values invariant to the shard split and to OCC
+    /// retries; holding them until the publish succeeds is what keeps a
+    /// failed or abandoned commit from reporting rows nobody stored. Every
+    /// other write counter already follows this discipline — the update
+    /// path stashes on `PendingUpdateEntry`, the commit outputs and
+    /// `rows_tombstoned` flush after `Ok`.
+    pending_ingest: IngestTally,
     /// Pending update entries, in buffer order. Each is
     /// fully-resolved at `update()` call time (predicate
     /// captured, `_id` range minted, IPC sidecar bytes encoded);
@@ -379,6 +397,15 @@ pub struct SupertableWriter {
     /// `wal_id`; `commit()` builds the WAL state doc and drives
     /// the tombstone phase.
     pending_deletes: Vec<PendingDeleteEntry>,
+    /// Per-op work collector, captured at construction — the writer is
+    /// minted on the caller's thread inside its [`with_op_stats`]
+    /// scope (the same pickup contract as the reader), and the write
+    /// counters flush through this `Arc` from wherever the commit
+    /// runs. `None` outside a scope: every flush is one `Option`
+    /// check.
+    ///
+    /// [`with_op_stats`]: crate::runtime_metrics::op_stats::with_op_stats
+    op_stats: Option<Arc<OpStatsCollector>>,
 }
 
 /// One buffered update. Resources here are all reserved at the
@@ -393,6 +420,12 @@ struct PendingUpdateEntry {
     new_row_count: u32,
     new_row_content_hash: String,
     ipc_bytes: Bytes,
+    /// Ingested-byte legs of the replacement batch, measured at call time
+    /// the same way an append measures its own — the batch itself is
+    /// dropped once IPC-encoded, so they cannot be recomputed at commit.
+    scalar_bytes_written: u64,
+    vector_bytes_written: u64,
+    fts_text_bytes_written: u64,
 }
 
 /// One buffered delete. Just the call-time resolved target_ids
@@ -420,6 +453,17 @@ impl fmt::Debug for SupertableWriter {
 struct BufferedBatch {
     scalar: RecordBatch,
     vectors: Vec<Arc<Float32Array>>,
+}
+
+/// Ingested work accumulated across the buffered appends of one commit.
+/// Input-shaped by construction, so it is the same at every writer-pool
+/// width; published into the collector only once the commit succeeds.
+#[derive(Default, Clone, Copy)]
+struct IngestTally {
+    rows: u64,
+    scalar_bytes: u64,
+    vector_bytes: u64,
+    fts_text_bytes: u64,
 }
 
 /// Zero-copy view of one vector column across the buffered batches:
@@ -913,8 +957,10 @@ impl Supertable {
                 buffer_scalar_bytes: 0,
                 buffer_vector_bytes: 0,
                 buffer_fts_bytes: 0,
+                pending_ingest: IngestTally::default(),
                 pending_updates: Vec::new(),
                 pending_deletes: Vec::new(),
+                op_stats: op_stats::current(),
             }),
             Err(_) => Err(BuildError::SupertableInUse),
         }
@@ -1062,22 +1108,38 @@ impl SupertableWriter {
         // Arrow buffer allocations (rough but good enough); the vector payload is
         // its exact f32 size. The FTS text columns are a subset of the scalar
         // columns, summed separately only to weight the build-scratch reserve.
+        //
+        // The priced legs measure `scalar_no_id` — the caller's own columns,
+        // without the engine-minted `_id`. `update` meters the same shape, so
+        // an update and an equivalent append report identical payload bytes
+        // instead of the update looking artificially cheaper.
+        let (scalar_bytes_u64, vector_bytes_u64, fts_bytes_u64) = ingested_byte_legs(
+            &scalar_no_id,
+            vectors.iter().map(|v| v.len()).sum(),
+            options,
+        );
+        // Buffer accounting is a different question — held memory — and the
+        // buffer owns `scalar`, ids included, so it measures that instead.
         let scalar_bytes = scalar.get_array_memory_size();
-        let vector_bytes = vectors
-            .iter()
-            .map(|v| v.len() * mem::size_of::<f32>())
-            .sum::<usize>();
-        let fts_bytes = options
-            .fts_columns
-            .iter()
-            .filter_map(|fc| scalar.schema().index_of(&fc.column).ok())
-            .map(|idx| scalar.column(idx).get_array_memory_size())
-            .sum::<usize>();
+        let vector_bytes = vector_bytes_u64 as usize;
+        let fts_bytes = fts_bytes_u64 as usize;
 
         self.buffer.push(BufferedBatch { scalar, vectors });
         self.buffer_scalar_bytes += scalar_bytes;
         self.buffer_vector_bytes += vector_bytes;
         self.buffer_fts_bytes += fts_bytes;
+
+        // Per-op work stats: the write's input shape, counted here from
+        // the caller's batch — before any shard split or commit retry — so
+        // the values are deterministic by construction (see the op_stats
+        // module's write-side determinism note). They are held on the
+        // writer rather than published now: nothing is durable until the
+        // commit below returns Ok, and a counter that says "rows written"
+        // must not describe rows that were dropped with the buffer.
+        self.pending_ingest.rows += n_rows as u64;
+        self.pending_ingest.scalar_bytes += scalar_bytes_u64;
+        self.pending_ingest.vector_bytes += vector_bytes_u64;
+        self.pending_ingest.fts_text_bytes += fts_bytes_u64;
 
         // Auto-flush on held bytes (scalar + vector); the FTS weighting is a
         // reserve-time concern, not held memory.
@@ -1261,6 +1323,18 @@ impl SupertableWriter {
         // call time (rather than commit time) means the caller
         // can drop the `RecordBatch` immediately — the buffer
         // owns the bytes from here on.
+        // Measure the replacement payload before the batch is dropped: the
+        // entry keeps only the IPC bytes from here on, so this is the last
+        // point the byte legs can be derived. Same helper `append` uses, so
+        // an updated row is measured exactly like an appended one.
+        let (upd_scalar_bytes, upd_vector_bytes, upd_fts_bytes) = {
+            let options = &self.inner.options;
+            let (scalar_no_id, vector_slices) =
+                split_vectors(&new_rows, options).map_err(MutationError::InvalidNewRows)?;
+            let elems = vector_slices.iter().map(|v| v.len()).sum();
+            ingested_byte_legs(&scalar_no_id, elems, options)
+        };
+
         let ipc_bytes = encode_record_batch_ipc(&new_rows).map_err(|e| {
             MutationError::Storage(StorageError::Permanent {
                 uri: "ipc encode".into(),
@@ -1277,6 +1351,9 @@ impl SupertableWriter {
             new_row_count: matched as u32,
             new_row_content_hash: content_hash,
             ipc_bytes,
+            scalar_bytes_written: upd_scalar_bytes,
+            vector_bytes_written: upd_vector_bytes,
+            fts_text_bytes_written: upd_fts_bytes,
         });
         Ok(PendingUpdate { matched })
     }
@@ -1461,6 +1538,7 @@ impl SupertableWriter {
         let wal_id = entry.wal_id;
         let ipc_bytes = entry.ipc_bytes.clone();
         let owner = self.inner.handle_id;
+        let drive_op_stats = self.op_stats.clone();
         let drive = async move {
             wal_store
                 .put_arrow(wal_id, ipc_bytes)
@@ -1470,7 +1548,14 @@ impl SupertableWriter {
                 .create(&wal_doc)
                 .await
                 .map_err(MutationError::WalStore)?;
-            let append = pipeline::run_append_phase(&supertable, &wal_store, &wal_doc, &etag).await;
+            let append = pipeline::run_append_phase(
+                &supertable,
+                &wal_store,
+                &wal_doc,
+                &etag,
+                drive_op_stats,
+            )
+            .await;
             let (_outcome, doc_after_append, etag_after_append) = match append {
                 Ok(appended) => appended,
                 Err(cause) => {
@@ -1508,6 +1593,26 @@ impl SupertableWriter {
             Ok::<_, MutationError>((n_t, n_nf))
         };
         let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
+        // Per-op work stats: the update's replacement rows are appended
+        // through the WAL pipeline (not the buffered append above), so
+        // they count here — after the drive returns Ok — alongside the
+        // rows its tombstone phase retired.
+        if let Some(stats) = &self.op_stats {
+            stats.add_ingested_write(
+                u64::from(entry.new_row_count),
+                entry.scalar_bytes_written,
+                entry.vector_bytes_written,
+                entry.fts_text_bytes_written,
+            );
+            stats.add_rows_tombstoned(n_tombstoned as u64);
+            // An update commits a manifest (replacement superfile +
+            // manifest json + pointer); a pure delete does not — its
+            // tombstone CAS-writes stay recorded-only, see
+            // `add_planned_commit_requests`.
+            if entry.new_row_count > 0 {
+                stats.add_planned_commit_requests(UPDATE_PLANNED_DATA_OBJECTS);
+            }
+        }
         Ok(MutationStats {
             wal_id: entry.wal_id,
             matched: entry.target_ids.len(),
@@ -1631,6 +1736,11 @@ impl SupertableWriter {
             Ok::<_, MutationError>((n_t, n_nf))
         };
         let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
+        // Per-op work stats: rows this delete retired, after the drive
+        // returns Ok.
+        if let Some(stats) = &self.op_stats {
+            stats.add_rows_tombstoned(n_tombstoned as u64);
+        }
         Ok(MutationStats {
             wal_id: entry.wal_id,
             matched: entry.target_ids.len(),
@@ -1670,18 +1780,33 @@ impl SupertableWriter {
         let saved_scalar = self.buffer_scalar_bytes;
         let saved_vector = self.buffer_vector_bytes;
         let saved_fts = self.buffer_fts_bytes;
+        let saved_ingest = mem::take(&mut self.pending_ingest);
         let buffer = mem::take(&mut self.buffer);
         self.buffer_scalar_bytes = 0;
         self.buffer_vector_bytes = 0;
         self.buffer_fts_bytes = 0;
 
         match self.commit_appends_with_taken_buffer(&buffer) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Durable now, so the ingested work is real work. An
+                // all-empty-batch commit publishes nothing and reports
+                // nothing.
+                if let (Some(stats), true) = (&self.op_stats, saved_ingest.rows > 0) {
+                    stats.add_ingested_write(
+                        saved_ingest.rows,
+                        saved_ingest.scalar_bytes,
+                        saved_ingest.vector_bytes,
+                        saved_ingest.fts_text_bytes,
+                    );
+                }
+                Ok(())
+            }
             Err(e) => {
                 self.buffer = buffer;
                 self.buffer_scalar_bytes = saved_scalar;
                 self.buffer_vector_bytes = saved_vector;
                 self.buffer_fts_bytes = saved_fts;
+                self.pending_ingest = saved_ingest;
                 Err(e)
             }
         }
@@ -1726,6 +1851,18 @@ impl SupertableWriter {
             return Ok(());
         }
 
+        // The commit's payload, read off the taken buffer before either
+        // shard-count helper is consulted, so both arms price the same
+        // number. Deliberately not the sealed output: every shard carries
+        // its own dictionary, FST and index headers, so sealed bytes scale
+        // with the shard split — and the split follows the writer pool's
+        // width. On a shared-vocabulary corpus the same input seals to
+        // roughly four times more bytes at width 16 than at width 1, so
+        // pricing off sealed bytes makes an identical append plan more
+        // requests on a wider host, which is precisely what the write-side
+        // determinism contract forbids.
+        let payload_bytes = buffered_payload_bytes(buffer);
+
         let list_metadata = CommitListMetadata {
             partition_strategy: None,
             global_vector_index: pending_gvi.clone(),
@@ -1760,7 +1897,7 @@ impl SupertableWriter {
                 .map(|vc| vc.metric)
                 .unwrap_or(Metric::L2Sq);
             let (outputs, cell_hints) =
-                commit_shards_via_drain(buffer, &self.inner, &pack_grid, metric)?;
+                commit_shards_via_drain(buffer, &self.inner, &pack_grid, metric, &self.op_stats)?;
             let build_elapsed = commit_t0.elapsed();
             let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
             let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
@@ -1770,11 +1907,24 @@ impl SupertableWriter {
                 .iter()
                 .map(|(_, bytes)| bytes.len())
                 .sum();
+            // Computed before the batch moves into the publish future;
+            // flushed only after Ok below, so a failed or retried commit
+            // never counts.
+            let output_stats = self
+                .op_stats
+                .as_ref()
+                .map(|_| commit_output_stats(&user_batch));
             let publish_t0 = time::Instant::now();
             bridge_on_runtime(
                 persist_superfile_publish_batch_async(&self.inner, user_batch, list_metadata),
                 &self.inner.query_runtime(),
             )?;
+            if let (Some(stats), Some((superfiles, bytes, fts_terms))) =
+                (&self.op_stats, output_stats)
+            {
+                stats.add_commit_outputs(superfiles, bytes, fts_terms);
+                stats.add_planned_commit_requests(planned_data_objects(payload_bytes));
+            }
             if crate::storage::io_counters::timeline_enabled() {
                 eprintln!(
                     "[supertable commit] build {:.1}ms ({:.1} MiB output) + prepare {:.1}ms + \
@@ -1892,7 +2042,9 @@ impl SupertableWriter {
         // Phase B: user-only build + publish. No hidden incoming build/publish;
         // the hidden cell index is drained later straight from these user
         // superfiles, and pre-drain queries fall back to them.
-        let outputs = fanout_shards(&writer_pool, &shards, |slice| {
+        // The shard build is the append's own CPU — measured on the pool
+        // threads that run it, folded into the op's collector.
+        let outputs = fanout_shards_metered(&writer_pool, &self.op_stats, &shards, |slice| {
             build_one_shard_with_layout(
                 slice.as_slice(),
                 &user_options,
@@ -1902,10 +2054,21 @@ impl SupertableWriter {
         })?;
         let superfiles = outputs.len();
         let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
+        // Same pre-move / post-Ok discipline as the vector arm above.
+        let output_stats = self
+            .op_stats
+            .as_ref()
+            .map(|_| commit_output_stats(&user_batch));
         bridge_on_runtime(
             persist_superfile_publish_batch_async(&user_inner, user_batch, list_metadata),
             &self.inner.query_runtime(),
         )?;
+        if let (Some(stats), Some((n_superfiles, bytes, fts_terms))) =
+            (&self.op_stats, output_stats)
+        {
+            stats.add_commit_outputs(n_superfiles, bytes, fts_terms);
+            stats.add_planned_commit_requests(planned_data_objects(payload_bytes));
+        }
         if self.inner.options.storage.is_some() {
             schedule_background_storage_reclaim(Arc::clone(&self.inner));
         }
@@ -2706,6 +2869,132 @@ fn collect_prepared_superfiles(
         pending_cache_inserts,
         pending_store_inserts,
     })
+}
+
+/// The three ingested-byte legs of one caller batch: scalar footprint,
+/// exact vector payload, and the FTS text subset of the scalar columns.
+///
+/// Shared by `append` and `update` so a replacement batch is measured the
+/// same way an appended one is — the update path reported zeros for all
+/// three before this existed, which under-counted every non-empty update.
+/// `vector_elems` is the total f32 count across the batch's vector
+/// columns — taken as a count rather than the arrays themselves because
+/// the two callers hold different representations of the same payload
+/// (`append` has built `Float32Array`s, `update` still has raw slices).
+fn ingested_byte_legs(
+    scalar: &RecordBatch,
+    vector_elems: usize,
+    options: &SupertableOptions,
+) -> (u64, u64, u64) {
+    // Visible bytes, not buffer capacity. `get_array_memory_size` sums
+    // `Buffer::capacity()` — the whole shared allocation — and is blind to
+    // an array's offset and length, so a zero-copy slice reports its
+    // parent's footprint. Chunked ingest (read one large batch, append it
+    // as N slices) is the ordinary pattern arrow-rs makes cheap precisely
+    // because slices share buffers, and it would bill N times the whole
+    // batch. Capacity remains right for `buffer_scalar_bytes`, which
+    // measures resident allocation and keeps `get_array_memory_size`;
+    // `buffer_vector_bytes` was never capacity-based — it reuses this
+    // function's exact f32 payload (`elems * 4`). The FTS leg moves with
+    // the priced legs deliberately: it weights the build-scratch reserve,
+    // and the builder's scratch scales with the text it will actually
+    // index — a slice's visible rows — not with the parent allocation the
+    // slice shares.
+    let scalar_bytes = scalar
+        .columns()
+        .iter()
+        .map(|c| visible_array_bytes(c.as_ref()))
+        .sum::<u64>();
+    let vector_bytes = (vector_elems * mem::size_of::<f32>()) as u64;
+    let fts_bytes = options
+        .fts_columns
+        .iter()
+        .filter_map(|fc| scalar.schema().index_of(&fc.column).ok())
+        .map(|idx| visible_array_bytes(scalar.column(idx).as_ref()))
+        .sum::<u64>();
+    (scalar_bytes, vector_bytes, fts_bytes)
+}
+
+/// The object size a table's data converges to — compaction's target, in
+/// bytes. The divisor that turns a commit's ingested payload into the
+/// number of objects the data itself occupies, independent of how many
+/// shards this particular commit happened to split into.
+fn commit_target_object_bytes() -> u64 {
+    crate::config::global()
+        .compaction
+        .target_superfile_size_mb
+        .saturating_mul(1024 * 1024)
+}
+
+/// Data objects a buffered append's plan implies: the objects its
+/// ingested payload occupies at the target object size.
+///
+/// Takes the payload, never the sealed output. Sealed bytes are a
+/// function of the shard split, which follows the writer pool's width, so
+/// pricing off them would make the same append cost different amounts on
+/// different hosts. See [`buffered_payload_bytes`].
+fn planned_data_objects(payload_bytes: u64) -> u64 {
+    if payload_bytes == 0 {
+        return 0;
+    }
+    let target = commit_target_object_bytes();
+    if target == 0 {
+        // A zero target is a misconfiguration, not a license to write for
+        // free: any committed payload occupies at least one object.
+        1
+    } else {
+        payload_bytes.div_ceil(target)
+    }
+}
+
+/// Bytes a taken buffer will write: the Arrow scalar footprint (the
+/// engine-minted `_id` included — it is stored too) plus the exact f32
+/// vector payload. Input-shaped, so it reads the same at every
+/// writer-pool width and across an OCC retry, which re-uses this buffer.
+fn buffered_payload_bytes(buffer: &[BufferedBatch]) -> u64 {
+    buffer
+        .iter()
+        .map(|b| {
+            b.scalar
+                .columns()
+                .iter()
+                .map(|c| visible_array_bytes(c.as_ref()))
+                .sum::<u64>()
+                + b.vectors
+                    .iter()
+                    .map(|v| (v.len() * mem::size_of::<f32>()) as u64)
+                    .sum::<u64>()
+        })
+        .sum()
+}
+
+/// Data objects an update's plan implies: its replacement rows land in
+/// the WAL's single preallocated superfile, always exactly one.
+const UPDATE_PLANNED_DATA_OBJECTS: u64 = 1;
+
+/// One committed publish batch's output shape for the per-op work stats:
+/// superfile count, sealed on-storage bytes (from each entry's own
+/// `SubsectionOffsets::total_size`, so the figure is identical across
+/// storage backends), and the distinct-FTS-term sum across the new
+/// entries. All three are width-dependent and recorded-only — the shard
+/// split decides them. Callers compute this before the batch moves into
+/// the publish future and flush it only after the commit returns Ok, so a
+/// failed or retried publish never counts.
+fn commit_output_stats(batch: &SuperfilePublishBatch) -> (u64, u64, u64) {
+    let superfiles = batch.new_entries.len() as u64;
+    let bytes: u64 = batch
+        .new_entries
+        .iter()
+        .filter_map(|entry| entry.subsection_offsets.as_ref())
+        .map(|offsets| offsets.total_size)
+        .sum();
+    let fts_terms: u64 = batch
+        .new_entries
+        .iter()
+        .flat_map(|entry| entry.fts_summary.values())
+        .map(|agg| agg.n_terms_distinct)
+        .sum();
+    (superfiles, bytes, fts_terms)
 }
 
 fn apply_pending_store_inserts(inner: &SupertableInner, inserts: Vec<(SuperfileUri, Bytes)>) {
@@ -5406,6 +5695,7 @@ fn commit_shards_via_drain(
     inner: &SupertableInner,
     clusters: &ClusterCentroids,
     metric: Metric,
+    op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<(Vec<ShardOutput>, Vec<Option<u32>>), BuildError> {
     let stage_t0 = time::Instant::now();
     let vc = inner
@@ -5499,18 +5789,23 @@ fn commit_shards_via_drain(
         group_cells_by_packed_shard(assigned_cells, packed_cell_shard_count(&inner.options));
 
     let options = &inner.options;
-    let shard_outputs = fanout_shards(&inner.options.writer_pool, &packed_shards, |task| {
-        let (shard_id, cells) = task;
-        build_one_packed_shard_via_drain(
-            cells,
-            &source_scalar,
-            &vector_views,
-            &local_by_id,
-            options,
-            &vc,
-        )
-        .map(|output| output.map(|output| (*shard_id, output)))
-    })?;
+    let shard_outputs = fanout_shards_metered(
+        &inner.options.writer_pool,
+        op_stats,
+        &packed_shards,
+        |task| {
+            let (shard_id, cells) = task;
+            build_one_packed_shard_via_drain(
+                cells,
+                &source_scalar,
+                &vector_views,
+                &local_by_id,
+                options,
+                &vc,
+            )
+            .map(|output| output.map(|output| (*shard_id, output)))
+        },
+    )?;
     let fanout_elapsed = stage_t0
         .elapsed()
         .saturating_sub(flatten_elapsed)
@@ -10104,6 +10399,54 @@ mod tests {
             scalar_plus_fts > scalar_only,
             "the FTS term is additive on top of scalar ({scalar_plus_fts} vs {scalar_only})"
         );
+    }
+
+    #[test]
+    fn planned_data_objects_counts_objects_at_the_target_boundary() {
+        // Every integration fixture seals three orders of magnitude below
+        // the shipped target, so `div_ceil` is 1 at every writer-pool width
+        // there and the arithmetic itself never runs. Pin it directly, or
+        // the counter could be replaced by a hardcoded 1 and every
+        // width-invariance assertion would still pass.
+        let target = commit_target_object_bytes();
+        assert!(target > 0, "the shipped config defines a target size");
+        assert_eq!(
+            planned_data_objects(0),
+            0,
+            "an empty payload plans no data object"
+        );
+        assert_eq!(planned_data_objects(1), 1);
+        assert_eq!(
+            planned_data_objects(target),
+            1,
+            "exactly one target's worth fills exactly one object"
+        );
+        assert_eq!(
+            planned_data_objects(target + 1),
+            2,
+            "one byte past the target spills into a second object"
+        );
+        assert_eq!(planned_data_objects(target.saturating_mul(3)), 3);
+    }
+
+    #[test]
+    fn a_refused_append_reports_no_ingested_work() {
+        // `rows_written` means rows the op durably indexed. A commit that
+        // never published must report nothing, or a failed write counts
+        // rows that do not exist. The 1-byte budget floors the build gate
+        // to 0, so the buffered commit is refused before anything seals.
+        let mut opts = options_id_title_serial();
+        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
+        let st = Supertable::create(opts).expect("create");
+        let (result, stats) = op_stats::with_op_stats(|| st.append(&build_simple_batch(0, 8)));
+        assert!(result.is_err(), "a 0-byte gate refuses the build");
+        assert_eq!(
+            stats.rows_written, 0,
+            "a refused append durably indexed no rows"
+        );
+        assert_eq!(stats.scalar_bytes_written, 0);
+        assert_eq!(stats.vector_bytes_written, 0);
+        assert_eq!(stats.fts_text_bytes_written, 0);
     }
 
     #[test]

@@ -1394,9 +1394,11 @@ impl SupertableReader {
                         .token_match(&column_arc, &refs, BoolMode::And)
                         .await
                         .map_err(fts_read_error)?;
-                    // The prune pass's posting walk. The verify pass's
-                    // row reads count through the take path's own
-                    // collector accounting below.
+                    // The prune pass's posting walk. The verify pass's own
+                    // decode is folded into `rows_materialized` below; its
+                    // byte and range legs are deliberately unpriced — both
+                    // take paths report no planned ranges by design, so the
+                    // counter stays identical warm or cold.
                     if let Some(stats) = &op_stats {
                         stats.add_fts_postings_bytes(work.postings_bytes);
                         stats.add_planned_read_ranges(work.planned_ranges);
@@ -1407,37 +1409,69 @@ impl SupertableReader {
                 if candidates.is_empty() {
                     return Ok(Vec::new());
                 }
-                let batch = if r.can_take_by_local_doc_ids() {
-                    r.take_by_local_doc_ids(&candidates, &[column_arc.as_str()])
-                        .map_err(|e| QueryError::Parquet(e.to_string()))?
-                } else {
-                    take_rows_byte_source(&r, &candidates, &[column_arc.as_str()])
+                // The verify pass — candidate decode + string compare — is
+                // this query's dominant CPU (a token-less value decodes the
+                // whole column), so it is bracketed like any other kernel.
+                // Only the warm take is inside this bracket; the cold arm's
+                // decode is not separable from the fetch it is interleaved
+                // with, which the comment on that arm explains.
+                let warm_batch = op_stats::timed_kernel(&op_stats, || {
+                    if r.can_take_by_local_doc_ids() {
+                        r.take_by_local_doc_ids(&candidates, &[column_arc.as_str()])
+                            .map(Some)
+                            .map_err(|e| QueryError::Parquet(e.to_string()))
+                    } else {
+                        Ok(None)
+                    }
+                })?;
+                let batch = match warm_batch {
+                    Some(batch) => batch,
+                    // Cold: the fetch and its Parquet decode are interleaved
+                    // inside the async reader, so the decode leg is not
+                    // separable here and goes uncharged. Bracketing the await
+                    // itself would be worse than leaving it at zero — a thread
+                    // clock spanning an await bills whatever else the runtime
+                    // ran on this thread to this query. The verify comparison
+                    // below is charged on both arms.
+                    None => take_rows_byte_source(&r, &candidates, &[column_arc.as_str()])
                         .await
-                        .map_err(|e| QueryError::Execute(e.to_string()))?
+                        .map_err(|e| QueryError::Execute(e.to_string()))?,
                 };
-                let values = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<LargeStringArray>()
-                    .ok_or_else(|| {
-                        QueryError::Execute(format!(
-                            "exact_match column '{}' is not LargeUtf8",
-                            column_arc
-                        ))
-                    })?;
-                let mut hits: Vec<SuperfileHit> = candidates
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| {
-                        !values.is_null(*index) && values.value(*index) == value_arc.as_str()
-                    })
-                    .map(|(_, &local_doc_id)| SuperfileHit {
-                        superfile: entry.uri,
-                        local_doc_id,
-                        score: 0.0,
-                        stable_id: None,
-                    })
-                    .collect();
+                // The verify decode materialized one row per candidate,
+                // on either arm. Folding it here rather than per-arm keeps
+                // the count invariant to which take served the batch.
+                if let Some(stats) = &op_stats {
+                    stats.add_rows_materialized(candidates.len() as u64);
+                }
+                let hits = op_stats::timed_kernel(&op_stats, || {
+                    let values = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .ok_or_else(|| {
+                            QueryError::Execute(format!(
+                                "exact_match column '{}' is not LargeUtf8",
+                                column_arc
+                            ))
+                        })?;
+                    Ok::<_, QueryError>(
+                        candidates
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| {
+                                !values.is_null(*index)
+                                    && values.value(*index) == value_arc.as_str()
+                            })
+                            .map(|(_, &local_doc_id)| SuperfileHit {
+                                superfile: entry.uri,
+                                local_doc_id,
+                                score: 0.0,
+                                stable_id: None,
+                            })
+                            .collect::<Vec<SuperfileHit>>(),
+                    )
+                });
+                let mut hits: Vec<SuperfileHit> = hits?;
                 dispatch::apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut hits, now)?;
                 Ok(hits)
             }
