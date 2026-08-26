@@ -750,8 +750,8 @@ pub enum TombstonePhaseError {
     /// (the writer must block on compaction's forward progress);
     /// the implementation here bounds it so a stuck supertable
     /// surfaces a typed error instead of hanging a test process.
-    #[error("tombstone sidecar for target {target_id:?} remained sealed past retry budget")]
-    SealedSidecarRetryExhausted { target_id: String },
+    #[error("tombstone sidecars for {targets} remained sealed past retry budget")]
+    SealedSidecarRetryExhausted { targets: String },
 
     /// CAS-loss retry budget for one sidecar exhausted. Each
     /// loss costs one GET + PUT round-trip; a high-contention
@@ -763,12 +763,15 @@ pub enum TombstonePhaseError {
     )]
     CasRetryExhausted { superfile_id: Uuid, attempts: u32 },
 
-    /// Failure scanning a superfile's `_id` column when resolving
-    /// `target_id → (superfile_id, doc_id)`. The underlying error
-    /// is preserved as a string because the resolve path crosses
-    /// crate-internal Parquet error types we don't re-export.
-    #[error("failed to scan _id column for target {target_id:?}: {message}")]
-    IdLookupFailed { target_id: String, message: String },
+    /// Failure scanning a superfile's `_id` column while resolving a
+    /// batch of targets to their `(superfile_id, doc_id)` homes.
+    /// `targets` labels the id window the scan covered — a single id
+    /// when the batch held one, otherwise `first..last` and a count.
+    /// The underlying error is preserved as a string because the
+    /// resolve path crosses crate-internal Parquet error types we
+    /// don't re-export.
+    #[error("failed to scan _id column for {targets}: {message}")]
+    IdLookupFailed { targets: String, message: String },
 
     /// The post-sidecar manifest stamp (tombstone seqs) failed. The
     /// sidecar bits are durable and the WAL stays incomplete, so the
@@ -838,11 +841,13 @@ impl TombstonePhaseError {
 ///   the state-doc's existing `tombstone_progress`.
 ///
 /// **What happens on intermediate failure:** the WAL stays at
-/// whatever state was durable when the failure occurred. Per-target
-/// progress is the recovery cursor — a fresh process re-runs this
-/// function and picks up at the first `Pending` entry. The sidecar
-/// bitmap union is a set so re-issuing is bit-identical; per-target
-/// state CAS is one atomic write that either landed or didn't.
+/// whatever state was durable when the failure occurred. The
+/// `tombstone_progress` outcomes are the recovery cursor — a fresh
+/// process re-runs this function and re-resolves whichever entries
+/// are still `Pending`, which may be a whole batch's worth if the
+/// failure landed before the next state write. The sidecar bitmap
+/// union is a set so re-issuing is bit-identical; each state CAS is
+/// one atomic write that either landed or didn't.
 pub async fn run_tombstone_phase(
     supertable: &Supertable,
     wal_store: &WalStore,
@@ -900,6 +905,14 @@ fn count_outcomes(progress: &[TombstoneEntry]) -> (usize, usize) {
 /// error.
 const MAX_CAS_RETRIES: u32 = 10;
 
+/// Fraction of the granted lease span the tombstone loop lets elapse
+/// before folding a renewal into its next WAL state write. A third of
+/// the span leaves two further renewal opportunities before expiry, so
+/// a slow sidecar phase can't lapse the lease between batched writes.
+/// Only writes made while bits are landing renew; see [`renew_lease`]
+/// for why the pre-backoff write is exempt.
+const LEASE_RENEW_FRACTION: i32 = 3;
+
 /// Bounded sealed-sidecar retry budget. Architecturally this
 /// loop should be unbounded — the writer blocks until
 /// compaction's forward progress publishes a merged target and
@@ -936,25 +949,30 @@ fn granted_lease_span(doc: &WalStateDoc) -> Option<ChronoDuration> {
 /// Push the WAL's lease expiry out one full span from now, in the caller's
 /// in-memory doc, so the next state-doc write carries a fresh lease.
 ///
-/// The tombstone phase can easily outlive a single lease grant: the
-/// per-target loop is sequential and spends three storage round trips per
-/// target, so a delete of a few thousand rows runs well past the default
-/// 60 s. Without renewal the lease lapses mid-phase, a recovery sweep
-/// preempts, and the driver's next CAS fails — losing the phase (and, for a
-/// writer-driven delete, the caller's whole `commit`) after the work had
-/// already landed.
+/// The tombstone phase can easily outlive a single lease grant: the id-scan
+/// sweep opens and scans every candidate superfile, and the sidecar phase
+/// spends a GET + PUT round trip per touched superfile, so a delete
+/// spanning a large table runs well past the default 60 s. Without renewal
+/// the lease lapses mid-phase, a recovery sweep preempts, and the driver's
+/// next CAS fails — losing the phase (and, for a writer-driven delete, the
+/// caller's whole `commit`) after the work had already landed.
 ///
 /// Renewal rides on writes the phase is making anyway: no extra round trip,
 /// and — unlike a background heartbeat task — no second writer racing the
 /// `etag_cur` chain. A heartbeat's own CAS would invalidate the driver's
-/// etag and break the very phase it was meant to protect.
+/// etag and break the very phase it was meant to protect. Because the
+/// tombstone loop batches its state writes, it also *schedules* one on
+/// [`LEASE_RENEW_FRACTION`] of the span so the gap between two writes that
+/// carry a renewal can never grow past the grant.
 ///
 /// Tying the expiry to writes ties it to observable forward progress: a
 /// wedged driver stops landing writes, its lease lapses, and recovery takes
 /// the WAL over — the same outcome the heartbeat's stuck-worker check exists
 /// to produce. A driver parked in the sealed-sidecar backoff below is
 /// therefore preemptible, which is deliberate: that wait is unbounded from
-/// the lease's point of view and a peer deserves the chance to try.
+/// the lease's point of view and a peer deserves the chance to try. The
+/// loop's pre-backoff state write is the one write that deliberately skips
+/// this call, so parking stays a lapse and not a reprieve.
 ///
 /// `span` comes from [`granted_lease_span`], so whoever took the lease keeps
 /// the duration they chose — a writer stamping its default at create time, or
@@ -969,17 +987,48 @@ fn renew_lease(doc: &mut WalStateDoc, span: Option<ChronoDuration>, now: DateTim
     }
 }
 
-/// The non-idempotent fast path for the tombstone loop. For each
-/// `Pending` target in `wal_doc.tombstone_progress`: resolve →
-/// CAS-PUT the bit → CAS-update the WAL state doc. Once every
-/// target is non-`Pending`, advance the WAL itself to `Complete`.
+/// Whether enough of the granted lease span has elapsed that the caller
+/// should fold a [`renew_lease`] into the state write it is about to make.
 ///
-/// Resume-on-replay is automatic: the WAL state doc is the
-/// recovery cursor, so a crash mid-loop leaves the first remaining
-/// `Pending` entry at the front of the next run. Each step is
-/// idempotent — the sidecar bitmap is a set, the per-target CAS
-/// is one atomic write, and the final `Complete` transition is
-/// one CAS.
+/// The deadline is read off the lease itself rather than tracked locally:
+/// `expires_at - span` is the instant the lease was last stamped — by the
+/// writer at create time, or by this phase's own last renewal. That matters
+/// twice over. The phase can be entered with a partly-consumed lease (the
+/// append phase writes without renewing, so an UPDATE arrives here having
+/// already spent some of its grant), and a state write that deliberately
+/// does *not* renew — the one before the sealed-sidecar backoff — must not
+/// look like a renewal to the next check.
+///
+/// A WAL with no lease has nothing to keep alive, so nothing is ever due.
+fn lease_renewal_due(doc: &WalStateDoc, span: Option<ChronoDuration>, now: DateTime<Utc>) -> bool {
+    match (doc.lease.as_ref(), span) {
+        (Some(lease), Some(span)) => now - (lease.expires_at - span) >= span / LEASE_RENEW_FRACTION,
+        _ => false,
+    }
+}
+
+/// The non-idempotent fast path for the tombstone loop. Every
+/// `Pending` target in `wal_doc.tombstone_progress` is resolved in
+/// one manifest sweep; the hits are then grouped by superfile so
+/// each sidecar takes a single CAS-PUT covering all of its bits.
+/// Once every target is non-`Pending`, advance the WAL itself to
+/// `Complete`.
+///
+/// Resume-on-replay is automatic: the WAL state doc is the recovery
+/// cursor, so a crash mid-loop leaves the entries that hadn't been
+/// written back still `Pending`, and the next run re-resolves
+/// exactly those. Every step is idempotent — the sidecar bitmap is
+/// a set, each state write is one atomic CAS, and the final
+/// `Complete` transition is one CAS.
+///
+/// State writes are batched rather than per-target, so the phase
+/// folds a lease renewal into a write whenever
+/// [`LEASE_RENEW_FRACTION`] of the granted span has elapsed (see
+/// [`renew_lease`]). Without that, a mutation whose sidecar phase
+/// outlives one lease grant would lapse mid-flight. The write before
+/// a sealed-sidecar backoff is the exception: it persists settled
+/// outcomes without renewing, so a driver waiting on a compactor
+/// still ages out and a peer can take the WAL over.
 async fn do_tombstone_apply(
     supertable: &Supertable,
     wal_store: &WalStore,
@@ -998,28 +1047,132 @@ async fn do_tombstone_apply(
     // from the original `acquired_at` and hand back elapsed + span.
     let lease_span = granted_lease_span(&wal_cur);
 
-    // Per-target loop. A `Pending` entry walks through resolve
-    // + sidecar-CAS + per-target WAL state CAS; anything else
-    // (Tombstoned, NotFound) is left as-is so this function is
-    // safe to call against a partially-completed WAL during
-    // recovery.
-    for idx in 0..wal_cur.tombstone_progress.len() {
-        if wal_cur.tombstone_progress[idx].outcome != TombstoneOutcome::Pending {
-            continue;
-        }
-        let target_id = wal_cur.tombstone_progress[idx].target_id;
-        let (outcome, in_sf) = resolve_and_tombstone_one(inner, wal_store, target_id).await?;
-        wal_cur.tombstone_progress[idx].outcome = outcome;
-        wal_cur.tombstone_progress[idx].tombstoned_in_superfile = in_sf;
+    // Batched target loop. Every `Pending` entry is resolved in one
+    // manifest sweep, then the hits are grouped by superfile so each
+    // sidecar takes a single CAS covering all of its bits. Anything
+    // already non-`Pending` (Tombstoned, NotFound) keeps its outcome,
+    // so this function is safe to call against a partially-completed
+    // WAL during recovery and resumes where the last run stopped.
+    //
+    // A sealed sidecar sends its targets around the loop again: the
+    // compactor that sealed it may be about to publish a merged
+    // superfile, and the target's `(superfile_id, doc_id)` moves with
+    // it — so those targets must be re-resolved against a fresh
+    // manifest rather than retried at the old coordinates. Bounded by
+    // `MAX_SEALED_RETRIES` with exponential backoff.
+    let mut pending: Vec<(usize, RowId)> = wal_cur
+        .tombstone_progress
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.outcome == TombstoneOutcome::Pending)
+        .map(|(idx, entry)| (idx, entry.target_id))
+        .collect();
+    tracing::debug!(
+        "tombstoning {} of {} targets",
+        pending.len(),
+        wal_cur.tombstone_progress.len()
+    );
 
-        // Per-target WAL state CAS. We persist after each
-        // target so recovery has a fresh cursor and a crash
-        // never wastes more than one target's work.
-        renew_lease(&mut wal_cur, lease_span, Utc::now());
+    let mut sealed_attempts = 0u32;
+    while !pending.is_empty() {
+        let pending_ids: Vec<RowId> = pending.iter().map(|(_, target_id)| *target_id).collect();
+
+        // One manifest sweep for the whole pending set, instead of a
+        // manifest walk plus a full `_id`-column scan per target.
+        let resolved = resolve_all(inner, &pending_ids)?;
+
+        let mut doc_ids_in_superfile_map = HashMap::<Uuid, Vec<(u32, usize)>>::new();
+        for &(idx, target_id) in &pending {
+            match resolved.get(&target_id) {
+                Some(&(superfile_id, doc_id)) => {
+                    doc_ids_in_superfile_map
+                        .entry(superfile_id)
+                        .or_default()
+                        .push((doc_id, idx));
+                }
+                None => {
+                    wal_cur.tombstone_progress[idx].outcome = TombstoneOutcome::NotFound;
+                    wal_cur.tombstone_progress[idx].tombstoned_in_superfile = None;
+                }
+            }
+        }
+
+        let mut sealed: Vec<(usize, RowId)> = Vec::new();
+        let mut landed_any = false;
+        for (superfile_id, hits) in doc_ids_in_superfile_map {
+            let doc_ids: Vec<u32> = hits.iter().map(|&(doc_id, _)| doc_id).collect();
+            match cas_tombstone_bits(wal_store, superfile_id, &doc_ids).await? {
+                SidecarCasOutcome::Landed => {
+                    landed_any = true;
+                    for (_, idx) in hits {
+                        wal_cur.tombstone_progress[idx].tombstoned_in_superfile =
+                            Some(superfile_id);
+                        wal_cur.tombstone_progress[idx].outcome = TombstoneOutcome::Tombstoned;
+                    }
+                }
+                SidecarCasOutcome::Sealed => sealed.extend(
+                    hits.into_iter()
+                        .map(|(_, idx)| (idx, wal_cur.tombstone_progress[idx].target_id)),
+                ),
+            }
+
+            // A mutation spanning many superfiles pays a GET + PUT per
+            // sidecar, so this walk alone can outlive the lease grant.
+            // Fold a renewal into a state write once the gap since the
+            // last one reaches a fraction of the span.
+            if lease_renewal_due(&wal_cur, lease_span, Utc::now()) {
+                renew_lease(&mut wal_cur, lease_span, Utc::now());
+                etag_cur = wal_store
+                    .update_with_etag(wal_cur.wal_id, &etag_cur, &wal_cur)
+                    .await?;
+            }
+        }
+
+        if sealed.is_empty() {
+            break;
+        }
+        // Forward progress refunds the budget: a batch spanning several
+        // concurrently-compacting superfiles would otherwise burn one
+        // shared allowance on seals it is steadily working through.
+        if landed_any {
+            sealed_attempts = 0;
+        }
+        sealed_attempts += 1;
+        if sealed_attempts > MAX_SEALED_RETRIES {
+            return Err(TombstonePhaseError::SealedSidecarRetryExhausted {
+                targets: pending_batch_label(&sealed),
+            });
+        }
+
+        // Persist what settled before parking, so a peer that preempts us
+        // inherits the outcomes instead of redoing them. Deliberately *not*
+        // a renewal: the backoff is a wait, not forward progress, and
+        // [`renew_lease`]'s contract is that a parked driver ages out so a
+        // peer gets its turn. Renewing here would hand the driver a fresh
+        // span every time it parked and it would hold the WAL forever.
         etag_cur = wal_store
             .update_with_etag(wal_cur.wal_id, &etag_cur, &wal_cur)
             .await?;
+
+        let ms = SEALED_RETRY_BASE_MS
+            .saturating_mul(1u64 << (sealed_attempts - 1).min(SEALED_RETRY_MAX_SHIFT))
+            .min(SEALED_RETRY_CAP_MS);
+        sleep(Duration::from_millis(ms)).await;
+        // Loop back and re-resolve against a fresh manifest.
+        pending = sealed;
     }
+
+    // Final state write for whatever the last pass settled. A crash before
+    // this costs that pass's resolve work, not its durability — the sidecar
+    // bits are already down, and replay re-resolves the entries still
+    // marked `Pending` idempotently.
+    renew_lease(&mut wal_cur, lease_span, Utc::now());
+    etag_cur = wal_store
+        .update_with_etag(wal_cur.wal_id, &etag_cur, &wal_cur)
+        .await?;
+
+    let (n_tombstoned, n_not_found) = count_outcomes(&wal_cur.tombstone_progress);
+    tracing::debug!("tombstone apply settled {n_tombstoned} tombstoned, {n_not_found} not found");
 
     // Stamp the touched superfiles' tombstone seqs into the manifest
     // so readers — this process's own cache included — learn the
@@ -1056,7 +1209,6 @@ async fn do_tombstone_apply(
         .update_with_etag(wal_cur.wal_id, &etag_cur, &wal_cur)
         .await?;
 
-    let (n_tombstoned, n_not_found) = count_outcomes(&wal_cur.tombstone_progress);
     Ok((
         TombstonePhaseOutcome::Applied {
             n_tombstoned,
@@ -1067,48 +1219,19 @@ async fn do_tombstone_apply(
     ))
 }
 
-/// Drive one target through resolve + sidecar CAS-PUT, looping
-/// on seal-detected re-resolves until the bit lands or the
-/// target is determined to be `NotFound`.
+/// Resolve every `target_id` of one mutation against the current
+/// manifest snapshot in a single batched sweep.
 ///
-/// Sealed retries: bounded by [`MAX_SEALED_RETRIES`] with
-/// exponential backoff. A sealed sidecar means a compactor is
-/// mid-flight against the target's superfile; we re-read the
-/// manifest each retry so a freshly-published merged superfile
-/// routes the next resolve to the new id-range.
-async fn resolve_and_tombstone_one(
+/// One snapshot for the whole batch, so every target resolves
+/// against the same view of the table (the per-target predecessor
+/// re-loaded the manifest for each id and could straddle a
+/// concurrent commit mid-batch).
+fn resolve_all(
     inner: &Arc<SupertableInner>,
-    wal_store: &WalStore,
-    target_id: RowId,
-) -> Result<(TombstoneOutcome, Option<Uuid>), TombstonePhaseError> {
-    let mut sealed_attempts = 0u32;
-    loop {
-        let manifest = inner.manifest.load_full();
-        let resolved = resolve_target_id_in_manifest(inner, &manifest, target_id)?;
-
-        let Some((superfile_id, doc_id)) = resolved else {
-            return Ok((TombstoneOutcome::NotFound, None));
-        };
-
-        match cas_tombstone_bit(wal_store, superfile_id, doc_id).await? {
-            SidecarCasOutcome::Landed => {
-                return Ok((TombstoneOutcome::Tombstoned, Some(superfile_id)));
-            }
-            SidecarCasOutcome::Sealed => {
-                sealed_attempts += 1;
-                if sealed_attempts > MAX_SEALED_RETRIES {
-                    return Err(TombstonePhaseError::SealedSidecarRetryExhausted {
-                        target_id: target_id.to_hex(),
-                    });
-                }
-                let ms = SEALED_RETRY_BASE_MS
-                    .saturating_mul(1u64 << (sealed_attempts - 1).min(SEALED_RETRY_MAX_SHIFT))
-                    .min(SEALED_RETRY_CAP_MS);
-                sleep(Duration::from_millis(ms)).await;
-                // Loop back and re-resolve against a fresh manifest.
-            }
-        }
-    }
+    target_ids: &[RowId],
+) -> Result<HashMap<RowId, (Uuid, u32)>, TombstonePhaseError> {
+    let manifest = inner.manifest.load_full();
+    resolve_targets_in_manifest(inner, &manifest, target_ids)
 }
 
 /// Outcome of one sidecar CAS-PUT attempt.
@@ -1120,20 +1243,23 @@ enum SidecarCasOutcome {
     /// compactor is presumed still mid-flight against this
     /// superfile. The caller must re-read the manifest and re-resolve.
     /// A *stale* seal doesn't produce this outcome; we take it over
-    /// instead (see `cas_tombstone_bit`).
+    /// instead (see `cas_tombstone_bits`).
     Sealed,
 }
 
-/// GET → union-the-bit → PUT with bounded CAS-loss retries.
-/// Detects *fresh* sealed sidecars and surfaces them up via the typed
+/// GET → union-the-bits → PUT with bounded CAS-loss retries: one
+/// round trip lands every `doc_id` this mutation resolved to the
+/// superfile, rather than one round trip per bit.
+///
+/// Detects *fresh* sealed sidecars and surfaces them via the typed
 /// outcome so the caller's outer loop can re-resolve. A stale seal
 /// (its compactor crashed before unsealing) is treated as no seal at
-/// all: we proceed to land the bit and clear it, same as
+/// all: we proceed to land the bits and clear it, same as
 /// `tombstones_admin::seal`'s own steal-if-stale behavior.
-async fn cas_tombstone_bit(
+async fn cas_tombstone_bits(
     wal_store: &WalStore,
     superfile_id: Uuid,
-    doc_id: u32,
+    doc_ids: &[u32],
 ) -> Result<SidecarCasOutcome, TombstonePhaseError> {
     for _attempt in 0..MAX_CAS_RETRIES {
         // Read the current sidecar (None ↔ no tombstones yet).
@@ -1167,12 +1293,16 @@ async fn cas_tombstone_bit(
         let bitmap = match existing {
             Some(sc) => {
                 let mut b = sc.bitmap;
-                b.insert(doc_id);
+                for doc_id in doc_ids {
+                    b.insert(*doc_id);
+                }
                 b
             }
             None => {
                 let mut b = RoaringBitmap::new();
-                b.insert(doc_id);
+                for doc_id in doc_ids {
+                    b.insert(*doc_id);
+                }
                 b
             }
         };
@@ -1198,110 +1328,193 @@ async fn cas_tombstone_bit(
     })
 }
 
-/// Walk the manifest's superfiles in order, restricting to those
-/// whose `[id_min, id_max]` brackets `target_id`, and scan each
-/// candidate's `_id` column for the row whose `_id == target_id`.
-/// Returns the (superfile_id, local doc_id) of the first hit.
+/// Resolve a batch of target `_id`s to the `(superfile_id, local
+/// doc_id)` pair that owns each, in a single sweep over the manifest.
 ///
-/// O(N · S) worst case where N is the number of `[id_min, id_max]`
-/// candidates and S is the superfile row count; in practice the
-/// `[id_min, id_max]` range filter eliminates all but a handful
-/// of candidates per target.
-fn resolve_target_id_in_manifest(
+/// Resolving one target at a time costs a manifest walk plus a full
+/// `_id`-column scan per target: deleting T rows from a table of S
+/// superfiles pays up to T×S superfile opens and column scans, and
+/// re-scans the same column once per target that lives in it. This
+/// batched form sorts the target ids once and walks the manifest
+/// once — each candidate superfile is opened and scanned at most
+/// once no matter how many targets it owns, and the scan probes the
+/// sorted target list by binary search (merging the small sorted
+/// target side against the column, see
+/// [`SuperfileReader::id_lookup_many`]). Cost drops to S opens and
+/// `O(rows · log T)` comparisons.
+///
+/// Superfiles are visited in manifest order and a target leaves the
+/// pending set as soon as it resolves, so when several overlapping
+/// `[id_min, id_max]` ranges could claim a target it lands in the
+/// same superfile a per-target walk would have picked.
+///
+/// Only resolved targets appear in the returned map; a target that
+/// is absent from it is claimed by no superfile — the caller's
+/// `NotFound` outcome.
+fn resolve_targets_in_manifest(
     inner: &Arc<SupertableInner>,
     manifest: &ManifestSnapshot,
-    target_id: RowId,
-) -> Result<Option<(Uuid, u32)>, TombstonePhaseError> {
-    let target = target_id.0;
+    targets: &[RowId],
+) -> Result<HashMap<RowId, (Uuid, u32)>, TombstonePhaseError> {
+    // Sorted + deduped once: `id_lookup_many` requires it, and it
+    // turns "which of my targets could this superfile own?" into a
+    // pair of binary searches per manifest entry.
+    let mut pending: Vec<i128> = targets.iter().map(|t| t.0).collect();
+    pending.sort_unstable();
+    pending.dedup();
+
+    let mut resolved: HashMap<RowId, (Uuid, u32)> = HashMap::with_capacity(pending.len());
+    if pending.is_empty() {
+        return Ok(resolved);
+    }
 
     for entry in manifest.get_all_superfiles().iter() {
-        if target < entry.id_min || target > entry.id_max {
+        // `pending` is sorted, so the targets this entry's
+        // `[id_min, id_max]` could claim are one contiguous window.
+        let lo = pending.partition_point(|&t| t < entry.id_min);
+        let hi = pending.partition_point(|&t| t <= entry.id_max);
+        if lo == hi {
             continue;
         }
-        // Tiered open: in-memory reader cache → disk cache →
-        // direct storage GET. The first two are the production
-        // reader path; the third covers cross-process recovery
-        // where neither cache layer has the bytes pinned. The
-        // recovery sweep on `Supertable::open` lands here when
-        // the freshly-opened handle's in-memory tier is empty
-        // and no disk cache is attached.
-        let reader = match bridge_sync_to_async(superfile_reader(
-            &inner.options.store,
-            inner.options.disk_cache.as_ref(),
-            inner.options.storage.as_ref(),
-            &entry.uri,
-            entry.subsection_offsets.as_ref(),
-            true,
-        )) {
-            Ok(r) => r,
-            Err(_) => {
-                let bytes =
-                    fetch_superfile_bytes_for_id_scan(inner, entry.uri.0).map_err(|message| {
-                        TombstonePhaseError::IdLookupFailed {
-                            target_id: target_id.to_hex(),
-                            message: format!(
-                                "open superfile {} (storage fallback): {message}",
-                                entry.uri.0
-                            ),
-                        }
-                    })?;
-                Arc::new(SuperfileReader::open(bytes).map_err(|e| {
-                    TombstonePhaseError::IdLookupFailed {
-                        target_id: target_id.to_hex(),
-                        message: format!(
-                            "SuperfileReader::open {} (storage fallback): {e}",
-                            entry.uri.0
-                        ),
-                    }
-                })?)
-            }
-        };
+        let candidates = &pending[lo..hi];
 
-        // id_lookup requires the full superfile bytes (eager open).
-        // A lazy-opened reader from the cache path will return an Io
-        // error here; fall back to a direct storage fetch in that case.
-        let lookup_result = match reader.id_lookup(target) {
-            Ok(result) => result,
-            Err(ReadError::Io(_)) => {
-                // Lazy reader — re-open eagerly from storage.
-                let bytes =
-                    fetch_superfile_bytes_for_id_scan(inner, entry.uri.0).map_err(|message| {
-                        TombstonePhaseError::IdLookupFailed {
-                            target_id: target_id.to_hex(),
-                            message: format!(
-                                "open superfile {} (eager fallback for id_lookup): {message}",
-                                entry.uri.0
-                            ),
-                        }
-                    })?;
-                let eager_reader = SuperfileReader::open(bytes).map_err(|e| {
+        for (target, doc_id) in lookup_ids_in_superfile(inner, entry, candidates)? {
+            resolved.insert(RowId(target), (entry.superfile_id, doc_id));
+        }
+
+        // A resolved target never needs another superfile scanned.
+        pending.retain(|&t| !resolved.contains_key(&RowId(t)));
+        if pending.is_empty() {
+            break;
+        }
+    }
+
+    Ok(resolved)
+}
+
+/// Scan one superfile's `_id` column for `sorted_targets`, opening
+/// it through the tiered reader path. Returns the `(target, local
+/// doc_id)` pairs it owns.
+fn lookup_ids_in_superfile(
+    inner: &Arc<SupertableInner>,
+    entry: &SuperfileEntry,
+    sorted_targets: &[i128],
+) -> Result<Vec<(i128, u32)>, TombstonePhaseError> {
+    // A batch has no single target to name in error context, so
+    // errors carry the id window being scanned instead.
+    let scan_label = id_window_label(sorted_targets);
+
+    // Tiered open: in-memory reader cache → disk cache →
+    // direct storage GET. The first two are the production
+    // reader path; the third covers cross-process recovery
+    // where neither cache layer has the bytes pinned. The
+    // recovery sweep on `Supertable::open` lands here when
+    // the freshly-opened handle's in-memory tier is empty
+    // and no disk cache is attached.
+    let reader = match bridge_sync_to_async(superfile_reader(
+        &inner.options.store,
+        inner.options.disk_cache.as_ref(),
+        inner.options.storage.as_ref(),
+        &entry.uri,
+        entry.subsection_offsets.as_ref(),
+        true,
+    )) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(
+                "tiered open of superfile {} failed ({e}); falling back to a direct \
+                 storage fetch for the id scan",
+                entry.uri.0
+            );
+            let bytes =
+                fetch_superfile_bytes_for_id_scan(inner, entry.uri.0).map_err(|message| {
                     TombstonePhaseError::IdLookupFailed {
-                        target_id: target_id.to_hex(),
+                        targets: scan_label.clone(),
                         message: format!(
-                            "SuperfileReader::open {} (eager fallback for id_lookup): {e}",
+                            "open superfile {} (storage fallback): {message}",
                             entry.uri.0
                         ),
                     }
                 })?;
-                eager_reader
-                    .id_lookup(target)
-                    .map_err(|e| TombstonePhaseError::IdLookupFailed {
-                        target_id: target_id.to_hex(),
-                        message: format!("id_lookup in superfile {}: {e}", entry.uri.0),
-                    })?
-            }
-            Err(e) => {
-                return Err(TombstonePhaseError::IdLookupFailed {
-                    target_id: target_id.to_hex(),
-                    message: format!("id_lookup in superfile {}: {e}", entry.uri.0),
-                });
-            }
-        };
-        if let Some(doc_id) = lookup_result {
-            return Ok(Some((entry.superfile_id, doc_id)));
+            Arc::new(SuperfileReader::open(bytes).map_err(|e| {
+                TombstonePhaseError::IdLookupFailed {
+                    targets: scan_label.clone(),
+                    message: format!(
+                        "SuperfileReader::open {} (storage fallback): {e}",
+                        entry.uri.0
+                    ),
+                }
+            })?)
         }
+    };
+
+    // id_lookup_many requires the full superfile bytes (eager open).
+    // A lazy-opened reader from the cache path will return an Io
+    // error here; fall back to a direct storage fetch in that case.
+    match reader.id_lookup_many(sorted_targets) {
+        Ok(hits) => Ok(hits),
+        Err(ReadError::Io(e)) => {
+            tracing::debug!(
+                "superfile {} opened lazily ({e}); re-opening eagerly for the id scan",
+                entry.uri.0
+            );
+            // Lazy reader — re-open eagerly from storage.
+            let bytes =
+                fetch_superfile_bytes_for_id_scan(inner, entry.uri.0).map_err(|message| {
+                    TombstonePhaseError::IdLookupFailed {
+                        targets: scan_label.clone(),
+                        message: format!(
+                            "open superfile {} (eager fallback for id_lookup): {message}",
+                            entry.uri.0
+                        ),
+                    }
+                })?;
+            let eager_reader =
+                SuperfileReader::open(bytes).map_err(|e| TombstonePhaseError::IdLookupFailed {
+                    targets: scan_label.clone(),
+                    message: format!(
+                        "SuperfileReader::open {} (eager fallback for id_lookup): {e}",
+                        entry.uri.0
+                    ),
+                })?;
+            eager_reader.id_lookup_many(sorted_targets).map_err(|e| {
+                TombstonePhaseError::IdLookupFailed {
+                    targets: scan_label,
+                    message: format!("id_lookup in superfile {}: {e}", entry.uri.0),
+                }
+            })
+        }
+        Err(e) => Err(TombstonePhaseError::IdLookupFailed {
+            targets: scan_label,
+            message: format!("id_lookup in superfile {}: {e}", entry.uri.0),
+        }),
     }
-    Ok(None)
+}
+
+/// Label for the still-unresolved `(progress index, target)` pairs a
+/// sealed-sidecar retry gave up on, for the typed error's `targets`
+/// context.
+fn pending_batch_label(pending: &[(usize, RowId)]) -> String {
+    let mut ids: Vec<i128> = pending.iter().map(|&(_, target_id)| target_id.0).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    id_window_label(&ids)
+}
+
+/// Human-readable label for a batch of target ids, used as the
+/// `targets` context on id-scan errors: the single id when the
+/// batch holds one, otherwise its `first..last` window and size.
+fn id_window_label(sorted_targets: &[i128]) -> String {
+    match sorted_targets {
+        [] => "<empty batch>".to_string(),
+        [single] => RowId(*single).to_hex(),
+        [first, .., last] => format!(
+            "{}..{} ({} targets)",
+            RowId(*first).to_hex(),
+            RowId(*last).to_hex(),
+            sorted_targets.len()
+        ),
+    }
 }
 
 /// Fetch a superfile's full bytes directly from storage.
@@ -1309,7 +1522,7 @@ fn resolve_target_id_in_manifest(
 /// in-memory + disk-cache tiers are both cold.
 ///
 /// Sync-bridged because the call site
-/// (`resolve_target_id_in_manifest`) is sync (called from inside
+/// (`lookup_ids_in_superfile`) is sync (called from inside
 /// the pipeline orchestrator); we mirror the
 /// `query::superfile_reader::superfile_reader` async-bridge
 /// pattern.
@@ -1490,6 +1703,10 @@ mod tests {
         Bytes::from(out)
     }
 
+    /// Preallocated superfile uuid the single-superfile fixtures
+    /// publish under.
+    const FIXTURE_SUPERFILE_UUID: u128 = 0xDEAD_BEEF_CAFE;
+
     /// Set up a fixture where the WAL's IPC payload and state
     /// doc are consistent: matching `new_row_count`, blake3,
     /// minted_id_spans. The supertable's storage is shared with
@@ -1508,6 +1725,29 @@ mod tests {
                 .expect("create");
         let wal_store = WalStore::new(Arc::clone(&storage));
 
+        let (wal_doc, etag) = seed_update_wal(
+            &wal_store,
+            titles,
+            wal_id_value,
+            minted_first,
+            Uuid::from_u128(FIXTURE_SUPERFILE_UUID),
+        )
+        .await;
+        (dir, supertable, wal_store, wal_doc, etag)
+    }
+
+    /// Write the `.arrow` payload and the matching UPDATE state doc
+    /// for one append, against an existing WalStore. Factored out of
+    /// [`fixture_with_ipc_payload`] so a test can seed a *second*
+    /// append (distinct superfile uuid + `_id` range) into the same
+    /// supertable.
+    async fn seed_update_wal(
+        wal_store: &WalStore,
+        titles: &[&str],
+        wal_id_value: i128,
+        minted_first: i128,
+        superfile_id: Uuid,
+    ) -> (WalStateDoc, Etag) {
         let user_batch = build_title_batch(titles);
         let ipc_bytes = encode_ipc(&user_batch);
         let content_hash = blake3::hash(&ipc_bytes).to_hex().to_string();
@@ -1530,7 +1770,7 @@ mod tests {
             target_ids: (0..n).map(|i| RowId(1000 + i as i128)).collect(),
             new_row_count: Some(n),
             new_row_content_hash: Some(content_hash),
-            preallocated_superfile_id: Some(Uuid::from_u128(0xDEAD_BEEF_CAFE)),
+            preallocated_superfile_id: Some(superfile_id),
             minted_id_spans: vec![IdSpan {
                 first: RowId(minted_first),
                 last: RowId(minted_first + (n as i128) - 1),
@@ -1544,7 +1784,7 @@ mod tests {
                 .collect(),
         };
         let etag = wal_store.create(&wal_doc).await.expect("wal create");
-        (dir, supertable, wal_store, wal_doc, etag)
+        (wal_doc, etag)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2230,6 +2470,112 @@ mod tests {
         (wal, etag)
     }
 
+    /// Build a leased WAL state doc whose lease was stamped at `stamped_at`
+    /// for `span`. `lease_renewal_due` reads its deadline straight off this
+    /// doc, so the tests drive it by constructing the lease rather than by
+    /// tracking a write time.
+    fn doc_leased_at(stamped_at: DateTime<Utc>, span: ChronoDuration) -> WalStateDoc {
+        WalStateDoc {
+            wal_id: WalId(262),
+            schema_version: SCHEMA_VERSION,
+            op_kind: OpKind::Delete,
+            state: WalState::Intent,
+            created_at: stamped_at,
+            lease: Some(Lease {
+                owner: SupertableHandleId(LEASE_RENEWAL_OWNER),
+                acquired_at: stamped_at,
+                expires_at: stamped_at + span,
+            }),
+            predicate_repr: "renewal scheduling".into(),
+            target_ids: vec![RowId(1)],
+            new_row_count: None,
+            new_row_content_hash: None,
+            preallocated_superfile_id: None,
+            minted_id_spans: Vec::new(),
+            tombstone_progress: Vec::new(),
+        }
+    }
+
+    /// The renewal scheduler fires once a third of the granted span has
+    /// elapsed, and never when the WAL carries no lease. Batched state
+    /// writes make this the thing standing between a long sidecar phase
+    /// and a lapsed lease, so it gets its own coverage.
+    #[test]
+    fn lease_renewal_comes_due_after_a_third_of_the_span() {
+        let span = ChronoDuration::seconds(60);
+        let stamped = Utc::now();
+        let doc = doc_leased_at(stamped, span);
+
+        assert!(
+            !lease_renewal_due(&doc, Some(span), stamped),
+            "no elapsed time, nothing due"
+        );
+        assert!(
+            !lease_renewal_due(&doc, Some(span), stamped + ChronoDuration::seconds(19)),
+            "under a third of the span is not due yet"
+        );
+        assert!(
+            lease_renewal_due(&doc, Some(span), stamped + ChronoDuration::seconds(20)),
+            "a third of the span is due"
+        );
+        assert!(
+            lease_renewal_due(&doc, Some(span), stamped + ChronoDuration::seconds(59)),
+            "still due right up to expiry"
+        );
+
+        let mut unleased = doc_leased_at(stamped, span);
+        unleased.lease = None;
+        assert!(
+            !lease_renewal_due(&unleased, None, stamped + ChronoDuration::seconds(600)),
+            "no lease means nothing to renew, however long the phase runs"
+        );
+    }
+
+    /// The deadline is measured from when the lease was *stamped*, not from
+    /// when the tombstone phase happened to start. An UPDATE reaches the
+    /// phase having already spent part of its grant on the append phase
+    /// (which writes without renewing), so a scheduler anchored at phase
+    /// entry would let that lease lapse before its first renewal.
+    #[test]
+    fn lease_renewal_measures_from_the_stamp_not_the_phase_start() {
+        let span = ChronoDuration::seconds(60);
+        let stamped = Utc::now();
+        // The append phase burned 40s of the grant; the tombstone phase
+        // starts now, with only 20s of lease left.
+        let phase_start = stamped + ChronoDuration::seconds(40);
+        let doc = doc_leased_at(stamped, span);
+
+        assert!(
+            lease_renewal_due(&doc, Some(span), phase_start),
+            "a lease already two-thirds spent is due at once, not a third of \
+             a span after the phase happened to begin"
+        );
+    }
+
+    /// `renew_lease` re-stamps the lease, which moves the scheduler's own
+    /// deadline with it — that is what makes reading `expires_at - span`
+    /// equivalent to tracking the last renewal, without a second variable
+    /// that a non-renewing write could desynchronize.
+    #[test]
+    fn renewing_pushes_the_next_renewal_deadline_out() {
+        let span = ChronoDuration::seconds(60);
+        let stamped = Utc::now();
+        let mut doc = doc_leased_at(stamped, span);
+
+        let renewed_at = stamped + ChronoDuration::seconds(20);
+        assert!(lease_renewal_due(&doc, Some(span), renewed_at));
+        renew_lease(&mut doc, Some(span), renewed_at);
+
+        assert!(
+            !lease_renewal_due(&doc, Some(span), renewed_at + ChronoDuration::seconds(19)),
+            "the renewal reset the clock"
+        );
+        assert!(
+            lease_renewal_due(&doc, Some(span), renewed_at + ChronoDuration::seconds(20)),
+            "and the next one comes due a third of a span later"
+        );
+    }
+
     /// The phase pushes the driver's lease expiry out on the state-doc
     /// writes it is already making, so a phase that runs longer than one
     /// lease grant can't be preempted out from under its driver. Ownership
@@ -2392,6 +2738,124 @@ mod tests {
         // No sidecar should have been written.
         let bitmap = read_sidecar_bitmap(&ws, sf_id).await;
         assert!(bitmap.is_empty());
+    }
+
+    // ---- batched target resolution ------------------------------------
+
+    /// Publish a second superfile into an existing fixture's
+    /// supertable, so the batched resolver has more than one manifest
+    /// entry to sweep. Returns its `superfile_id`.
+    async fn publish_extra_superfile(
+        st: &Supertable,
+        ws: &WalStore,
+        titles: &[&str],
+        wal_id_value: i128,
+        minted_first: i128,
+        superfile_id: Uuid,
+    ) -> Uuid {
+        let (wal, etag) =
+            seed_update_wal(ws, titles, wal_id_value, minted_first, superfile_id).await;
+        run_append_phase(st, ws, &wal, &etag, None)
+            .await
+            .expect("append phase");
+        superfile_id
+    }
+
+    /// The batched resolver returns one map covering targets that live
+    /// in different superfiles, and simply omits ids no superfile
+    /// claims (the caller's `NotFound` outcome).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resolve_all_maps_targets_across_multiple_superfiles() {
+        const FIRST_IDS: i128 = 70_000;
+        const SECOND_IDS: i128 = 80_000;
+        let (_dir, st, ws, sf_a, _id_min, _id_max) =
+            published_superfile_fixture(&["aa", "bb", "cc"], FIRST_IDS).await;
+        let sf_b = publish_extra_superfile(
+            &st,
+            &ws,
+            &["dd", "ee"],
+            701,
+            SECOND_IDS,
+            Uuid::from_u128(0xB0B_B0B),
+        )
+        .await;
+
+        let absent = RowId(SECOND_IDS + 500);
+        let targets = vec![
+            RowId(FIRST_IDS + 2),
+            RowId(SECOND_IDS + 1),
+            absent,
+            RowId(FIRST_IDS),
+        ];
+        let resolved = resolve_all(st.inner(), &targets).expect("batched resolve");
+
+        assert_eq!(resolved.len(), 3, "only the present targets resolve");
+        assert_eq!(resolved.get(&RowId(FIRST_IDS)), Some(&(sf_a, 0u32)));
+        assert_eq!(resolved.get(&RowId(FIRST_IDS + 2)), Some(&(sf_a, 2u32)));
+        assert_eq!(resolved.get(&RowId(SECOND_IDS + 1)), Some(&(sf_b, 1u32)));
+        assert!(
+            !resolved.contains_key(&absent),
+            "an unclaimed id is absent from the map"
+        );
+    }
+
+    /// Batched resolution agrees with resolving the same ids one at a
+    /// time — the property that lets the phase batch at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resolve_all_agrees_with_one_target_at_a_time() {
+        const FIRST_IDS: i128 = 71_000;
+        const SECOND_IDS: i128 = 81_000;
+        let (_dir, st, ws, _sf_a, _id_min, _id_max) =
+            published_superfile_fixture(&["aa", "bb"], FIRST_IDS).await;
+        publish_extra_superfile(
+            &st,
+            &ws,
+            &["cc", "dd"],
+            702,
+            SECOND_IDS,
+            Uuid::from_u128(0xB0B_B0C),
+        )
+        .await;
+
+        let targets = vec![
+            RowId(FIRST_IDS),
+            RowId(FIRST_IDS + 1),
+            RowId(FIRST_IDS + 9),
+            RowId(SECOND_IDS),
+            RowId(SECOND_IDS + 1),
+        ];
+        let batched = resolve_all(st.inner(), &targets).expect("batched resolve");
+        for target in targets {
+            let single = resolve_all(st.inner(), &[target]).expect("single resolve");
+            assert_eq!(
+                batched.get(&target),
+                single.get(&target),
+                "{target:?} disagreed between batched and single resolve"
+            );
+        }
+    }
+
+    /// Repeated ids in one batch are deduped for the scan yet every
+    /// progress entry that names them still resolves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resolve_all_tolerates_duplicate_targets() {
+        const FIRST_IDS: i128 = 72_000;
+        let (_dir, st, _ws, sf_a, _id_min, _id_max) =
+            published_superfile_fixture(&["aa", "bb"], FIRST_IDS).await;
+
+        let target = RowId(FIRST_IDS + 1);
+        let resolved = resolve_all(st.inner(), &[target, target, target]).expect("batched resolve");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved.get(&target), Some(&(sf_a, 1u32)));
+    }
+
+    #[test]
+    fn id_window_label_names_a_single_target_and_summarizes_a_batch() {
+        assert_eq!(id_window_label(&[]), "<empty batch>");
+        assert_eq!(id_window_label(&[7]), RowId(7).to_hex());
+        let label = id_window_label(&[7, 8, 9]);
+        assert!(label.starts_with(&RowId(7).to_hex()), "got {label}");
+        assert!(label.ends_with("(3 targets)"), "got {label}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

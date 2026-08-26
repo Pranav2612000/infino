@@ -602,7 +602,7 @@ mod tests {
         assert!(matches!(
             InfinoError::from(MutationError::TombstonePhase(
                 TombstonePhaseError::IdLookupFailed {
-                    target_id: "7".into(),
+                    targets: "7".into(),
                     message: "boom".into(),
                 }
             )),

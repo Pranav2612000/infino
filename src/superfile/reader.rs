@@ -841,25 +841,45 @@ impl SuperfileReader {
         RecordBatch::try_new(out_schema, columns).map_err(|e| ReadError::Columnar(e.to_string()))
     }
 
-    /// Sequential scan of the `_id` column for an exact `target`
-    /// match. Returns the matching row's local doc_id (the row
-    /// offset within this superfile, used by tombstones / FTS /
-    /// vector indices) or `None` if the target isn't present.
+    /// Sequential scan of the `_id` column resolving many targets
+    /// in **one** pass instead of one pass per target. Returns
+    /// `(target, local doc_id)` pairs for the targets present in
+    /// this superfile, ascending by target; absent targets are
+    /// simply missing from the result. A `doc_id` is the row offset
+    /// within this superfile, as used by tombstones / FTS / vector
+    /// indices.
+    ///
+    /// `sorted_targets` must be sorted ascending and deduped — the
+    /// scan probes it by binary search, merging the (small, sorted)
+    /// target side against the (large) id column, so the cost is
+    /// `O(rows · log targets)` for the whole batch rather than
+    /// `O(targets · rows)`. The scan stops early once every target
+    /// has been located.
     ///
     /// `_id` is stored as `Decimal128` with the supertable's
     /// fixed precision/scale; we decode each value as `i128`.
     ///
-    /// Used by the WAL recovery sweep's `resolve_target_id`
-    /// path: given a `target_id`, scan the candidate superfile to
-    /// find where the row lives so the tombstone phase can mark
-    /// its bit. Rebuilds a `ParquetRecordBatchReader` each call
-    /// (cold recovery path), rather than reusing the cached
-    /// `arrow_meta` like `take_by_local_doc_ids` does.
-    pub fn id_lookup(&self, target: i128) -> Result<Option<u32>, ReadError> {
+    /// Used by the WAL tombstone phase's target-resolution sweep:
+    /// given the mutation's target ids, scan each candidate
+    /// superfile once to find where those rows live so the phase
+    /// can mark their bits. Rebuilds a `ParquetRecordBatchReader`
+    /// each call (cold recovery path), rather than reusing the
+    /// cached `arrow_meta` like `take_by_local_doc_ids` does.
+    pub(crate) fn id_lookup_many(
+        &self,
+        sorted_targets: &[i128],
+    ) -> Result<Vec<(i128, u32)>, ReadError> {
+        debug_assert!(
+            sorted_targets.windows(2).all(|w| w[0] < w[1]),
+            "id_lookup_many requires ascending, deduped targets"
+        );
+        if sorted_targets.is_empty() {
+            return Ok(Vec::new());
+        }
         let bytes = self.bytes.clone().ok_or_else(|| {
             ReadError::Io(io::Error::other(
-                "id_lookup requires an eager-opened superfile; this reader was opened via \
-                 the lazy path and does not hold the full superfile bytes",
+                "id_lookup_many requires an eager-opened superfile; this reader was \
+                 opened via the lazy path and does not hold the full superfile bytes",
             ))
         })?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
@@ -871,8 +891,13 @@ impl SuperfileReader {
             .build()
             .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
 
+        // Parallel to `sorted_targets`: the doc_id each target
+        // resolved to, or `None` while it is still unfound.
+        let mut hits: Vec<Option<u32>> = vec![None; sorted_targets.len()];
+        let mut n_found: usize = 0;
+
         let mut row_offset: u32 = 0;
-        for batch_res in reader {
+        'scan: for batch_res in reader {
             // `batch_res` is `Result<RecordBatch, ArrowError>`;
             // funnel through ParquetError so the whole id_lookup
             // path surfaces a single error variant.
@@ -895,15 +920,32 @@ impl SuperfileReader {
                     ))
                 })?;
             for i in 0..id_arr.len() {
-                if id_arr.value(i) == target {
-                    return Ok(Some(row_offset + i as u32));
+                // Probe the small sorted target side rather than
+                // re-scanning the column per target. Nothing is
+                // assumed about the column's own ordering, so this
+                // stays correct for merged / rewritten superfiles.
+                if let Ok(t) = sorted_targets.binary_search(&id_arr.value(i)) {
+                    // First occurrence wins, matching the
+                    // single-target scan's semantics.
+                    if hits[t].is_none() {
+                        hits[t] = Some(row_offset + i as u32);
+                        n_found += 1;
+                        if n_found == sorted_targets.len() {
+                            break 'scan;
+                        }
+                    }
                 }
             }
             row_offset = row_offset.checked_add(id_arr.len() as u32).ok_or_else(|| {
                 ReadError::MalformedKv("row_offset overflow scanning id column".to_string())
             })?;
         }
-        Ok(None)
+
+        Ok(sorted_targets
+            .iter()
+            .zip(hits)
+            .filter_map(|(&target, hit)| hit.map(|doc_id| (target, doc_id)))
+            .collect())
     }
 
     /// Single-column BM25 search across the unified FTS reader.
@@ -1829,13 +1871,153 @@ mod tests {
     fn id_lookup_returns_only_matching_ids() {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
-        let s = r.id_lookup(10).expect("should return result");
-        assert_eq!(s.expect("should find id"), 0);
-        let s = r.id_lookup(12).expect("should return result");
-        assert_eq!(s.expect("should find id"), 2);
+        assert_eq!(r.id_lookup_many(&[10]).expect("lookup"), vec![(10, 0)]);
+        assert_eq!(r.id_lookup_many(&[12]).expect("lookup"), vec![(12, 2)]);
+        assert!(
+            r.id_lookup_many(&[20]).expect("lookup").is_empty(),
+            "an id the superfile does not hold resolves to nothing"
+        );
+    }
 
-        let s = r.id_lookup(20).expect("should return result");
-        assert!(s.is_none());
+    #[test]
+    fn id_lookup_many_resolves_present_targets_and_skips_absent() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open superfile");
+        // 9 and 20 bracket the stored range (10..=13) on both sides;
+        // 11 and 13 are present. One scan, three requested.
+        let hits = r
+            .id_lookup_many(&[9, 11, 13, 20])
+            .expect("should return result");
+        assert_eq!(hits, vec![(11, 1), (13, 3)]);
+    }
+
+    /// Rows in the shuffled-id fixture. Comfortably past the parquet
+    /// reader's 1024-row batch size, so the scan crosses several batches
+    /// and its `row_offset` accumulation is exercised.
+    const SHUFFLED_ID_ROWS: usize = 5_000;
+    /// First `_id` in the shuffled fixture.
+    const SHUFFLED_ID_BASE: i128 = 1_000;
+    /// Stride of the fixture's id permutation. Coprime with
+    /// [`SHUFFLED_ID_ROWS`], so `i -> i * STRIDE % ROWS` is a bijection
+    /// and every id appears exactly once, in non-monotonic order.
+    const SHUFFLED_ID_STRIDE: usize = 37;
+
+    /// A superfile whose `_id` column is deliberately *not* sorted, so the
+    /// scan can't accidentally depend on column order (merged and rewritten
+    /// superfiles don't guarantee it). Returns the bytes alongside the ids
+    /// in row order, which is the oracle's ground truth.
+    fn build_shuffled_id_superfile() -> (Bytes, Vec<i128>) {
+        let schema = schema_with_text();
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+
+        let ids: Vec<i128> = (0..SHUFFLED_ID_ROWS)
+            .map(|i| SHUFFLED_ID_BASE + (i * SHUFFLED_ID_STRIDE % SHUFFLED_ID_ROWS) as i128)
+            .collect();
+        let id_arr = Decimal128Array::from_iter_values(ids.iter().copied())
+            .with_precision_and_scale(38, 0)
+            .expect("Decimal128(38,0)");
+        let titles: Vec<String> = ids.iter().map(|id| format!("row {id}")).collect();
+        let title = LargeStringArray::from(titles.iter().map(|t| t.as_str()).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(title)])
+            .expect("build RecordBatch");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        (Bytes::from(b.finish().expect("finish builder")), ids)
+    }
+
+    /// Independent oracle: the first row offset at which each target
+    /// appears, computed by a naive linear scan of the known id order.
+    /// Deliberately shares no code with `id_lookup_many` — the point is to
+    /// disagree with it if the batched scan is wrong.
+    fn id_lookup_oracle(ids: &[i128], sorted_targets: &[i128]) -> Vec<(i128, u32)> {
+        sorted_targets
+            .iter()
+            .filter_map(|&target| {
+                ids.iter()
+                    .position(|&id| id == target)
+                    .map(|row| (target, row as u32))
+            })
+            .collect()
+    }
+
+    /// The batched scan agrees with a brute-force scan over a multi-batch,
+    /// non-monotonic id column, for a mix of present and absent targets.
+    #[test]
+    fn id_lookup_many_matches_a_brute_force_scan() {
+        let (bytes, ids) = build_shuffled_id_superfile();
+        let r = SuperfileReader::open(bytes).expect("open superfile");
+
+        // Present ids spread across the whole column, interleaved with ids
+        // inside the stored range that were never written and ids outside
+        // it on both sides.
+        let mut targets: Vec<i128> = (0..SHUFFLED_ID_ROWS)
+            .step_by(311)
+            .map(|i| SHUFFLED_ID_BASE + i as i128)
+            .collect();
+        targets.push(SHUFFLED_ID_BASE - 1);
+        targets.push(SHUFFLED_ID_BASE + SHUFFLED_ID_ROWS as i128);
+        targets.sort_unstable();
+        targets.dedup();
+
+        assert_eq!(
+            r.id_lookup_many(&targets).expect("batched lookup"),
+            id_lookup_oracle(&ids, &targets),
+            "batched scan disagreed with the brute-force scan"
+        );
+    }
+
+    /// A repeated `_id` resolves to its *first* row, which is the
+    /// semantics the single-target scan had and which merged or rewritten
+    /// superfiles can actually produce. Without this the "first occurrence
+    /// wins" branch is unreachable from the unique-id fixtures.
+    #[test]
+    fn id_lookup_many_takes_the_first_occurrence_of_a_repeated_id() {
+        let schema = schema_with_text();
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        // Row 1 and row 3 carry the same `_id`.
+        let ids = Decimal128Array::from_iter_values([70i128, 71, 72, 71, 73])
+            .with_precision_and_scale(38, 0)
+            .expect("Decimal128(38,0)");
+        let title = LargeStringArray::from(vec!["a", "b", "c", "b again", "d"]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(title)])
+            .expect("build RecordBatch");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let r = SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open");
+
+        assert_eq!(
+            r.id_lookup_many(&[71, 73]).expect("lookup"),
+            vec![(71, 1), (73, 4)],
+            "the duplicate resolves to row 1, not row 3"
+        );
+    }
+
+    /// Every single-target lookup over the same fixture agrees with the
+    /// oracle too, so a bug that only shows up at batch size one — or only
+    /// past the early-exit — still gets caught.
+    #[test]
+    fn id_lookup_many_matches_the_oracle_one_target_at_a_time() {
+        let (bytes, ids) = build_shuffled_id_superfile();
+        let r = SuperfileReader::open(bytes).expect("open superfile");
+
+        for i in (0..SHUFFLED_ID_ROWS).step_by(499) {
+            let target = SHUFFLED_ID_BASE + i as i128;
+            assert_eq!(
+                r.id_lookup_many(&[target]).expect("single-target lookup"),
+                id_lookup_oracle(&ids, &[target]),
+                "target {target} disagreed with the brute-force scan"
+            );
+        }
+    }
+
+    #[test]
+    fn id_lookup_many_on_empty_batch_is_empty() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open superfile");
+        assert!(
+            r.id_lookup_many(&[]).expect("empty batch").is_empty(),
+            "empty target batch resolves to no hits"
+        );
     }
 
     #[test]
@@ -2680,12 +2862,12 @@ mod tests {
 
     #[tokio::test]
     async fn id_lookup_on_lazy_reader_is_unsupported() {
-        // id_lookup needs resident bytes; a lazy-opened reader must
+        // The id scan needs resident bytes; a lazy-opened reader must
         // surface an Io error rather than silently scanning nothing.
         let bytes = build_simple_fts_only_superfile();
         let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
         let r = SuperfileReader::open_lazy(src).await.expect("open_lazy");
-        let err = r.id_lookup(10).expect_err("lazy id_lookup rejected");
+        let err = r.id_lookup_many(&[10]).expect_err("lazy id scan rejected");
         assert!(matches!(err, ReadError::Io(_)));
     }
 
