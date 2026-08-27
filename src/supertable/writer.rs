@@ -111,6 +111,8 @@ use super::{
         },
     },
 };
+#[cfg(feature = "detailed-tracing")]
+use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
@@ -862,7 +864,7 @@ impl Supertable {
     /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(rows = batch.num_rows()))
+        tracing::instrument(skip_all, fields(rows = batch.num_rows(), role = self.role().as_str(), origin = OpOrigin::Ingest.as_str()))
     )]
     pub fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
         let mut w = self
@@ -901,7 +903,7 @@ impl Supertable {
     /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(new_rows = new_rows.num_rows()))
+        tracing::instrument(skip_all, fields(new_rows = new_rows.num_rows(), role = self.role().as_str(), origin = OpOrigin::Ingest.as_str()))
     )]
     pub fn update(
         &self,
@@ -945,7 +947,10 @@ impl Supertable {
     /// assert_eq!(stats.n_tombstoned(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(role = self.role().as_str(), origin = OpOrigin::Ingest.as_str()))
+    )]
     pub fn delete(&self, predicate: Expr) -> Result<MutationStats, InfinoError> {
         let mut w = self
             .writer()
@@ -1079,7 +1084,7 @@ impl SupertableWriter {
     /// id column at position 0.
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(rows = batch.num_rows(), buffered = self.buffer.len()))
+        tracing::instrument(skip_all, fields(rows = batch.num_rows(), buffered = self.buffer.len(), role = self.inner.role.as_str(), origin = OpOrigin::Ingest.as_str()))
     )]
     pub fn append(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
         let options = &self.inner.options;
@@ -1402,6 +1407,8 @@ impl SupertableWriter {
             buffered = self.buffer.len(),
             updates = self.pending_updates.len(),
             deletes = self.pending_deletes.len(),
+            role = self.inner.role.as_str(),
+            origin = OpOrigin::Ingest.as_str(),
         ))
     )]
     pub fn commit(&mut self) -> Result<CommitResult, CommitError> {

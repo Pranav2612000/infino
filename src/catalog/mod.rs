@@ -46,6 +46,8 @@ use tokio::runtime::Runtime;
 use tracing::{debug, info};
 use uri::{Backend, parse_uri};
 
+#[cfg(feature = "detailed-tracing")]
+use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
@@ -765,7 +767,9 @@ impl Connection {
     /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(sql = sql))
+        // Connection-level entry: no table handle yet, so no `role` — the
+        // per-table spans beneath this one carry it.
+        tracing::instrument(skip_all, fields(sql = sql, origin = OpOrigin::Query.as_str()))
     )]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(sql, "running sql query");
