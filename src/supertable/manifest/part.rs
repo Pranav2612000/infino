@@ -45,7 +45,9 @@ use crate::{
 /// Major-version-incompatible readers must reject; minor-
 /// version-newer readers must ignore unknown minor fields
 /// (see [`PartParseError::IncompatibleMajorVersion`]). This reader accepts
-/// the majors in [`SUPPORTED_MAJORS`].
+/// the majors in [`SUPPORTED_MAJORS`]. A new entry field is a MAJOR bump
+/// with its own schema, never a minor one: datum bytes carry no schema, so
+/// changing them under an unchanged major leaves a reader nothing to go on.
 pub const FORMAT_VERSION: &str = "1.0";
 
 /// The format version stamped into a part in which at least one superfile
@@ -53,8 +55,8 @@ pub const FORMAT_VERSION: &str = "1.0";
 /// than `data/seg-<uuid>`.
 ///
 /// A MAJOR bump on purpose, though the only wire change is one nullable
-/// field with a default: a reader that predates the field would decode the
-/// part fine, ignore the stem, derive the unnamed key for every entry, and
+/// field with a default: a reader that predates the field would
+/// ignore the stem, derive the unnamed key for every entry, and
 /// its GC would then delete the live stem-named objects as orphans. Making
 /// such a reader refuse the part (`IncompatibleMajorVersion`) is the only
 /// thing that turns that data loss into a clean error. Parts without stems
@@ -279,6 +281,48 @@ fn schema() -> &'static AvroSchema {
     })
 }
 
+/// The same schema as it stood before `stem` was added.
+///
+/// Datum bytes carry no schema, so a part written without `stem` can only
+/// be read back with the schema that wrote it — reading it with the schema
+/// above takes the array's next byte for the stem union. Kept for as long
+/// as pre-stem parts exist.
+fn schema_pre_stem() -> &'static AvroSchema {
+    static SCHEMA: OnceLock<AvroSchema> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        let schema_str = r#"
+        {
+          "type": "record",
+          "name": "ManifestPart",
+          "fields": [
+            {"name": "format_version", "type": "string"},
+            {"name": "part_id", "type": "string"},
+            {"name": "superfiles", "type": {"type": "array", "items": {
+              "type": "record",
+              "name": "SuperfileEntry",
+              "fields": [
+                {"name": "superfile_id", "type": "string"},
+                {"name": "uri", "type": "string"},
+                {"name": "n_docs", "type": "long"},
+                {"name": "id_min", "type": {"type": "fixed", "name": "IdMin", "size": 16}},
+                {"name": "id_max", "type": {"type": "fixed", "name": "IdMax", "size": 16}},
+                {"name": "partition_key", "type": "bytes"},
+                {"name": "partition_hint", "type": ["null", "int"], "default": null},
+                {"name": "scalar_stats", "type": "bytes"},
+                {"name": "fts_summary", "type": "bytes"},
+                {"name": "vector_summary", "type": "bytes"},
+                {"name": "subsection_offsets", "type": ["null", "bytes"], "default": null},
+                {"name": "vector_layout", "type": ["null", "string"], "default": null},
+                {"name": "birth_version", "type": "long", "default": 0}
+              ]
+            }}}
+          ]
+        }
+        "#;
+        AvroSchema::parse_str(schema_str).expect("pre-stem ManifestPart Avro schema parses")
+    })
+}
+
 /// Encode a [`ManifestPart`] to raw Avro datum bytes.
 ///
 /// Deliberately uncompressed: part payloads are dominated by fp32
@@ -307,6 +351,12 @@ pub(crate) fn encode_with_mode(part: &ManifestPart, mode: SummaryWireMode) -> Ve
     // part twice would produce different bytes → different
     // blake3 → different URI. Iceberg manifest files take the
     // same approach for the same reason.
+    //
+    // Stamp and wire shape are picked by the same predicate, so a part's
+    // `format_version` always names the schema that wrote its bytes — which
+    // is all a schemaless datum decode has to go on.
+    let has_stem = part.superfiles.iter().any(|seg| seg.stem.is_some());
+
     let superfile_records: Vec<AvroValue> = part
         .superfiles
         .iter()
@@ -315,7 +365,7 @@ pub(crate) fn encode_with_mode(part: &ManifestPart, mode: SummaryWireMode) -> Ve
             let fts_bytes = encode_fts_summary_map(&seg.fts_summary);
             let vector_bytes = encode_vector_summary_map(&seg.vector_summary, mode);
 
-            AvroValue::Record(vec![
+            let mut fields = vec![
                 (
                     "superfile_id".into(),
                     AvroValue::String(seg.superfile_id.to_string()),
@@ -368,7 +418,11 @@ pub(crate) fn encode_with_mode(part: &ManifestPart, mode: SummaryWireMode) -> Ve
                     "birth_version".into(),
                     AvroValue::Long(seg.birth_version as i64),
                 ),
-                (
+            ];
+            // Left off the wire entirely when no superfile is named, so the
+            // part keeps the shape a reader from before stems can read.
+            if has_stem {
+                fields.push((
                     "stem".into(),
                     match &seg.stem {
                         Some(stem) => AvroValue::Union(
@@ -377,8 +431,9 @@ pub(crate) fn encode_with_mode(part: &ManifestPart, mode: SummaryWireMode) -> Ve
                         ),
                         None => AvroValue::Union(AVRO_UNION_NULL_INDEX, Box::new(AvroValue::Null)),
                     },
-                ),
-            ])
+                ));
+            }
+            AvroValue::Record(fields)
         })
         .collect();
 
@@ -387,7 +442,7 @@ pub(crate) fn encode_with_mode(part: &ManifestPart, mode: SummaryWireMode) -> Ve
     // refuse it rather than derive the unnamed key for every entry and let
     // its GC reclaim the live objects. Decided here, at the one wire exit,
     // so no construction site can forget.
-    let format_version = if part.superfiles.iter().any(|seg| seg.stem.is_some()) {
+    let format_version = if has_stem {
         FORMAT_VERSION_NAMED
     } else {
         part.format_version.as_str()
@@ -404,7 +459,12 @@ pub(crate) fn encode_with_mode(part: &ManifestPart, mode: SummaryWireMode) -> Ve
         ("superfiles".into(), AvroValue::Array(superfile_records)),
     ]);
 
-    to_avro_datum(schema(), record).expect("avro datum encode")
+    let writer_schema = if has_stem {
+        schema()
+    } else {
+        schema_pre_stem()
+    };
+    to_avro_datum(writer_schema, record).expect("avro datum encode")
 }
 
 /// Leading magic of a zstd frame (little-endian `0xFD2FB528`). Parts
@@ -432,9 +492,18 @@ pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
     };
     // Schemaless datum decode — mirrors `to_avro_datum` in
     // `encode`. The schema is in-source (compiled in), so the
-    // reader doesn't need a wire-side schema.
+    // reader doesn't need a wire-side schema — but it does have to
+    // pick the one that wrote these bytes, and `format_version`
+    // names it: `1.0` is the record as it stood before `stem`.
+    let format_version = peek_format_version(avro_bytes)?;
+    check_major(&format_version)?;
+    let writer_schema = if major_of(&format_version) == major_of(FORMAT_VERSION) {
+        schema_pre_stem()
+    } else {
+        schema()
+    };
     let mut cursor = Cursor::new(avro_bytes);
-    let value = from_avro_datum(schema(), &mut cursor, None)
+    let value = from_avro_datum(writer_schema, &mut cursor, None)
         .map_err(|e| PartParseError::Avro(e.to_string()))?;
 
     let fields = match value {
@@ -447,8 +516,8 @@ pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
     };
     let mut map: HashMap<String, AvroValue> = fields.into_iter().collect();
 
-    let format_version = take_string(&mut map, "format_version")?;
-    check_major(&format_version)?;
+    // Already read off the bytes above, to pick the schema.
+    take_string(&mut map, "format_version")?;
 
     let part_id_str = take_string(&mut map, "part_id")?;
     let part_id = PartId(
@@ -472,6 +541,21 @@ pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
         part_id,
         superfiles,
     })
+}
+
+/// Read `format_version` straight off the datum bytes. It is the record's
+/// first field in either shape, so a bare `string` schema reads it without
+/// the rest — which is what lets the reader pick a schema before decoding.
+fn peek_format_version(bytes: &[u8]) -> Result<String, PartParseError> {
+    let mut cursor = Cursor::new(bytes);
+    match from_avro_datum(&AvroSchema::String, &mut cursor, None)
+        .map_err(|e| PartParseError::Avro(e.to_string()))?
+    {
+        AvroValue::String(s) => Ok(s),
+        _ => Err(PartParseError::SchemaMismatch(
+            "format_version is not a string".into(),
+        )),
+    }
 }
 
 fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
@@ -552,8 +636,13 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
     })
 }
 
+/// The MAJOR of a `MAJOR.MINOR` format version.
+fn major_of(fv: &str) -> &str {
+    fv.split('.').next().unwrap_or("")
+}
+
 fn check_major(fv: &str) -> Result<(), PartParseError> {
-    let got_major = fv.split('.').next().unwrap_or("");
+    let got_major = major_of(fv);
     if !SUPPORTED_MAJORS.contains(&got_major) {
         return Err(PartParseError::IncompatibleMajorVersion {
             got: fv.to_string(),
@@ -1764,6 +1853,49 @@ mod tests {
         let unnamed = fresh_part(vec![fresh_superfile(3)]);
         let decoded = decode(&encode(&unnamed)).expect("decode");
         assert_eq!(decoded.format_version, FORMAT_VERSION);
+        assert_eq!(decoded.superfiles[0].stem, None);
+    }
+
+    /// A part with no stems goes on the wire in the pre-stem shape under a
+    /// `1.0` stamp, so the stamp names the schema that wrote the bytes and a
+    /// reader from before the field can still read a table that never named
+    /// a source. Decoding those bytes with the current schema is what broke:
+    /// it takes the array's next byte for the stem union.
+    #[test]
+    fn a_part_with_no_stems_uses_the_pre_stem_wire_shape() {
+        for n_superfiles in [1usize, 2, 5] {
+            let part = fresh_part(
+                (0..n_superfiles)
+                    .map(|i| fresh_superfile(i as u64 + 1))
+                    .collect(),
+            );
+            let bytes = encode(&part);
+
+            let mut cursor = Cursor::new(bytes.as_slice());
+            from_avro_datum(schema_pre_stem(), &mut cursor, None)
+                .unwrap_or_else(|e| panic!("pre-stem reader must parse {n_superfiles}: {e:?}"));
+            let mut cursor = Cursor::new(bytes.as_slice());
+            assert!(
+                from_avro_datum(schema(), &mut cursor, None).is_err(),
+                "{n_superfiles}: the stem field is not on the wire"
+            );
+
+            let decoded = decode(&bytes).expect("decode");
+            assert_eq!(decoded.format_version, FORMAT_VERSION);
+            assert_eq!(decoded.superfiles.len(), n_superfiles);
+            for (got, want) in decoded.superfiles.iter().zip(part.superfiles.iter()) {
+                assert_eq!(got.superfile_id, want.superfile_id);
+                assert_eq!(got.stem, None);
+                assert_eq!(got.storage_path(), want.storage_path());
+            }
+        }
+
+        // And through the legacy zstd frame, which is how the oldest parts
+        // of all are stored.
+        let part = fresh_part(vec![fresh_superfile(3)]);
+        let framed = stream::encode_all(encode(&part).as_slice(), 3).expect("zstd");
+        let decoded = decode(&framed).expect("zstd-framed pre-stem part decodes");
+        assert_eq!(decoded.superfiles.len(), 1);
         assert_eq!(decoded.superfiles[0].stem, None);
     }
 
