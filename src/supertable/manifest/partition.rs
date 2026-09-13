@@ -379,7 +379,6 @@ mod tests {
 
     fn empty_seg() -> SuperfileEntry {
         SuperfileEntry {
-            stem: None,
             birth_version: 0,
             superfile_id: uuid::Uuid::nil(),
             uri: SuperfileUri(uuid::Uuid::nil()),

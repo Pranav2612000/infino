@@ -858,7 +858,6 @@ mod tests {
             superfile::vector::layout::VectorLayout, supertable::manifest::SuperfileEntry,
         };
         let entry = SuperfileEntry {
-            stem: None,
             birth_version: 0,
             superfile_id: uuid::Uuid::new_v4(),
             uri: crate::supertable::manifest::SuperfileUri::new_v4(),

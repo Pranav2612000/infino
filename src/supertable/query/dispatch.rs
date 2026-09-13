@@ -86,7 +86,6 @@ pub(crate) async fn open_reader(
         disk_cache,
         storage,
         &entry.uri,
-        &entry.storage_path(),
         entry.subsection_offsets.as_ref(),
         allow_background_fill,
     )
@@ -177,11 +176,7 @@ pub(crate) async fn open_compaction_input(
     if let Some(storage) = storage {
         if let Some(cache) = disk_cache {
             let reader = cache
-                .reader_synchronous_with_storage(
-                    &entry.uri,
-                    &entry.storage_path(),
-                    Arc::clone(storage),
-                )
+                .reader_synchronous_with_storage(&entry.uri, Arc::clone(storage))
                 .await
                 .map_err(|e| QueryError::build(e.to_string(), &e));
             // Fully-resident only: a promoted hybrid reader exposes parquet
@@ -195,7 +190,7 @@ pub(crate) async fn open_compaction_input(
         }
         // Compaction needs synchronous Parquet/id-column access; if the hidden
         // table was opened without a disk cache, force an eager open here.
-        let path = entry.storage_path();
+        let path = entry.uri.storage_path();
         let (bytes, _) = storage
             .get(&path)
             .await
@@ -409,7 +404,7 @@ pub(crate) async fn apply_resolved_tombstone_filter(
             )
         })?;
         let (object_store, path) = storage
-            .object_store_handle(&entry.storage_path())
+            .object_store_handle(&entry.uri.storage_path())
             .ok_or_else(|| QueryError::Execute("no object_store handle for superfile".into()))?;
         let file_size = entry
             .subsection_offsets

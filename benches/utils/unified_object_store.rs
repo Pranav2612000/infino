@@ -1311,13 +1311,7 @@ pub(crate) mod diag {
             let off_ref = offsets.clone();
             let t0 = Instant::now();
             let _reader = rt
-                .block_on(cache.reader_with_hints(
-                    &uri,
-                    &uri.storage_path(),
-                    Some(&off_ref),
-                    None,
-                    true,
-                ))
+                .block_on(cache.reader_with_hints(&uri, Some(&off_ref), None, true))
                 .expect("cold reader");
             let wall = t0.elapsed();
             let snap = storage.snapshot().diff(&before);
@@ -1364,7 +1358,7 @@ pub(crate) mod diag {
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
-                    .reader_with_hints(&uri, &uri.storage_path(), Some(&off_ref), None, true)
+                    .reader_with_hints(&uri, Some(&off_ref), None, true)
                     .await
                     .expect("cold reader");
                 let vec = reader.vec().expect("vector reader present");
@@ -1420,7 +1414,7 @@ pub(crate) mod diag {
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
-                    .reader_with_hints(&uri, &uri.storage_path(), Some(&off_ref), None, true)
+                    .reader_with_hints(&uri, Some(&off_ref), None, true)
                     .await
                     .expect("cold reader");
                 reader
@@ -1447,7 +1441,7 @@ pub(crate) mod diag {
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
-                    .reader_with_hints(&uri, &uri.storage_path(), Some(&off_ref), None, true)
+                    .reader_with_hints(&uri, Some(&off_ref), None, true)
                     .await
                     .expect("cold reader");
                 reader
@@ -1567,13 +1561,7 @@ pub(crate) mod diag {
                 let off_ref = offsets.clone();
                 let t0 = Instant::now();
                 let _reader = rt
-                    .block_on(cache.reader_with_hints(
-                        &uri,
-                        &uri.storage_path(),
-                        Some(&off_ref),
-                        None,
-                        true,
-                    ))
+                    .block_on(cache.reader_with_hints(&uri, Some(&off_ref), None, true))
                     .expect("real S3 cold reader");
                 let wall = t0.elapsed();
                 let snap = storage.snapshot().diff(&before);
@@ -1594,7 +1582,7 @@ pub(crate) mod diag {
                 let t0 = Instant::now();
                 let _hits = rt.block_on(async {
                     let reader = cache
-                        .reader_with_hints(&uri, &uri.storage_path(), Some(&off_ref), None, true)
+                        .reader_with_hints(&uri, Some(&off_ref), None, true)
                         .await
                         .expect("real S3 cold reader");
                     let vec = reader.vec().expect("vector reader present");
@@ -1625,7 +1613,7 @@ pub(crate) mod diag {
                 let t0 = Instant::now();
                 let _hits = rt.block_on(async {
                     let reader = cache
-                        .reader_with_hints(&uri, &uri.storage_path(), Some(&off_ref), None, true)
+                        .reader_with_hints(&uri, Some(&off_ref), None, true)
                         .await
                         .expect("real S3 cold reader");
                     reader

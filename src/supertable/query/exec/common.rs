@@ -557,7 +557,6 @@ async fn resolve_columns(
             disk_cache,
             storage,
             &entry.uri,
-            &entry.storage_path(),
             entry.subsection_offsets.as_ref(),
             true,
         )
