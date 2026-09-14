@@ -44,6 +44,7 @@ use std::{
     sync::Arc,
 };
 
+use unicode_properties::{EmojiStatus, UnicodeEmoji};
 use unicode_segmentation::UnicodeSegmentation;
 use wide::u8x16;
 
@@ -60,9 +61,170 @@ const NON_ASCII_BYTE_MIN: u8 = 0x80;
 /// one bit per SIMD lane (the scan processes 16 bytes per chunk).
 const LANE_BITMASK: u32 = 0xFFFF;
 
-/// Initial capacity of the lowercase-token scratch buffer. Sized to
-/// the common case of short tokens so the hot path rarely reallocs.
-const TOKEN_SCRATCH_INITIAL_CAP: usize = 32;
+/// Longest token, in characters, that is emitted whole. A run longer
+/// than this is chopped into consecutive pieces of exactly this length
+/// (plus a shorter remainder), each emitted as its own token at its own
+/// position.
+///
+/// Chopped, not dropped: the text stays searchable, and its leading
+/// piece is a real term that an exact or prefix query can reach, where
+/// an uncapped run is one dictionary entry nothing short of the entire
+/// run retrieves.
+///
+/// The cap also keeps document length honest, which is what makes it a
+/// scoring concern rather than only a resource one. Length is a token
+/// count, so an unbroken 100 KB run would otherwise be a document of
+/// length 1 — the shortest document possible, taking the largest length
+/// boost BM25 can award, while being the longest document in the
+/// corpus.
+///
+/// Counted in characters rather than bytes so the limit does not shift
+/// with the script: 255 bytes is 255 Latin characters but around 85 CJK
+/// ones, which would tokenize the same sentence differently depending
+/// on the language it is written in.
+pub const MAX_TOKEN_CHARS: usize = 255;
+
+/// Whether `c` is an emoji this tokenizer emits as a token of its own.
+///
+/// The test is `Emoji_Presentation`, not the broader `Emoji`. `Emoji`
+/// is also true of `#`, `*` and the digits — which carry emoji meaning
+/// only inside a keycap sequence and are ordinary punctuation
+/// everywhere else — and of text-default symbols such as `™` and `©`.
+/// Emitting those would change how ordinary prose tokenizes, which is a
+/// far larger change than making emoji searchable, so the predicate is
+/// the narrower one: characters that render as emoji by default.
+///
+/// `EmojiStatus` is `#[non_exhaustive]`, so a future variant falls
+/// through to "not an emoji token" rather than silently joining the set.
+#[inline]
+fn is_emoji_token_char(c: char) -> bool {
+    matches!(
+        c.emoji_status(),
+        EmojiStatus::EmojiPresentation
+            | EmojiStatus::EmojiPresentationAndModifierBase
+            | EmojiStatus::EmojiPresentationAndEmojiComponent
+            | EmojiStatus::EmojiPresentationAndModifierAndEmojiComponent
+    )
+}
+
+/// Whether a UAX #29 word-boundary segment is a token this tokenizer
+/// emits, as opposed to whitespace or punctuation between tokens.
+///
+/// A segment carrying an alphanumeric is a word — the same rule the
+/// segmenter's own word iterator applies. A segment carrying an emoji
+/// is a token too, which that iterator does not accept: it filters on
+/// alphanumerics alone, so an emoji-only segment falls out as though it
+/// were punctuation.
+///
+/// Dropping emoji costs recall on corpora where they carry real signal,
+/// and it costs phrase precision everywhere. Positions here are
+/// emission ordinals, so a discarded emoji leaves no gap and the words
+/// on either side of it become adjacent — `"cat <emoji> dog"` would
+/// match the exact phrase `"cat dog"`. Dropping *punctuation* without a
+/// gap is right, because punctuation is not a token; dropping something
+/// that is one is not.
+#[inline]
+fn is_token_segment(segment: &str) -> bool {
+    segment
+        .chars()
+        .any(|c| c.is_alphanumeric() || is_emoji_token_char(c))
+}
+
+/// Emit `tok`, chopped to [`MAX_TOKEN_CHARS`] characters per piece, and
+/// return how many pieces were emitted — a positional caller advances
+/// its ordinal by that much so each piece occupies its own position.
+///
+/// The guard is on the byte length, which is the cheap check and is
+/// never wrong in the direction that matters: a string of at most
+/// `MAX_TOKEN_CHARS` bytes holds at most that many characters, so the
+/// single-token fast path (every realistic token) is one integer
+/// compare and no character walk. Only a run past the byte bound pays
+/// for `char_indices`, and only then can it split.
+#[inline]
+fn emit_capped<'a, F: FnMut(&'a str)>(tok: &'a str, f: &mut F) -> u64 {
+    if tok.len() <= MAX_TOKEN_CHARS {
+        f(tok);
+        return 1;
+    }
+    let mut pieces = 0;
+    let mut start = 0;
+    let mut chars_in_piece = 0;
+    for (i, _) in tok.char_indices() {
+        if chars_in_piece == MAX_TOKEN_CHARS {
+            f(&tok[start..i]);
+            pieces += 1;
+            start = i;
+            chars_in_piece = 0;
+        }
+        chars_in_piece += 1;
+    }
+    if start < tok.len() {
+        f(&tok[start..]);
+        pieces += 1;
+    }
+    pieces
+}
+
+/// Where the pieces of one ASCII segment go. Implemented by the index
+/// side (hand the piece to the builder) and the query side (wrap it as
+/// a borrowed or owned query term); [`emit_ascii_segment`] is the only
+/// producer, so the two sides cannot disagree on what a segment becomes.
+trait AsciiPieces<'a> {
+    /// A piece of the input itself — the segment needed no case fold.
+    fn borrowed(&mut self, piece: &'a str);
+    /// A piece of the lowercase copy; valid for this call only.
+    fn folded(&mut self, piece: &str);
+}
+
+/// One ASCII word segment, case-folded and chopped at
+/// [`MAX_TOKEN_CHARS`], for every index-side and query-side ASCII fast
+/// path of both tokenizers. A segment that is already lowercase is cut
+/// in place and borrowed; one carrying an upper-case byte is folded into
+/// `scratch` first, which the caller reuses across segments so the
+/// index build allocates nothing per token. Returns the piece count,
+/// which the positional paths turn into consecutive ordinals.
+///
+/// This is the one place a run past the cap is split. A path that cut
+/// or folded a segment on its own would index a token under one form
+/// and look it up under another, and that is silent recall loss.
+fn emit_ascii_segment<'a>(
+    seg: &'a str,
+    has_upper: bool,
+    scratch: &mut String,
+    sink: &mut impl AsciiPieces<'a>,
+) -> u64 {
+    if !has_upper {
+        return emit_capped(seg, &mut |piece| sink.borrowed(piece));
+    }
+    scratch.clear();
+    scratch.extend(seg.bytes().map(|b| b.to_ascii_lowercase() as char));
+    emit_capped(scratch.as_str(), &mut |piece| sink.folded(piece))
+}
+
+/// The index side: every piece goes to the builder's callback as-is.
+struct IndexPieces<'f, F: FnMut(&str)>(&'f mut F);
+
+impl<'a, F: FnMut(&str)> AsciiPieces<'a> for IndexPieces<'_, F> {
+    fn borrowed(&mut self, piece: &'a str) {
+        (self.0)(piece)
+    }
+    fn folded(&mut self, piece: &str) {
+        (self.0)(piece)
+    }
+}
+
+/// The query side: a piece of the query string is handed on without a
+/// copy; a piece of the folded copy has to be owned.
+struct QueryPieces<'f, F>(&'f mut F);
+
+impl<'q, F: FnMut(Cow<'q, str>)> AsciiPieces<'q> for QueryPieces<'_, F> {
+    fn borrowed(&mut self, piece: &'q str) {
+        (self.0)(Cow::Borrowed(piece))
+    }
+    fn folded(&mut self, piece: &str) {
+        (self.0)(Cow::Owned(piece.to_owned()))
+    }
+}
 
 /// Trait every tokenizer impl must satisfy.
 ///
@@ -373,7 +535,7 @@ impl AsciiLowerTokenizer {
     #[inline]
     pub fn tokenize_each_inline_positioned<F: FnMut(&str, u64)>(&self, text: &str, mut f: F) {
         let bytes = text.as_bytes();
-        let mut buf: Vec<u8> = Vec::new();
+        let mut scratch = String::new();
         let mut pos = 0;
         let mut position: u64 = 0;
         while pos < bytes.len() {
@@ -387,7 +549,10 @@ impl AsciiLowerTokenizer {
             if start == pos {
                 continue;
             }
-            // Every scanned run occupies one ordinal, dropped or not.
+            // Every scanned run occupies at least one ordinal, dropped
+            // or not; a run long enough to be chopped occupies one per
+            // piece, so the pieces are adjacent to each other and to
+            // their neighbours rather than stacked on one position.
             let this_position = position;
             position += 1;
             if had_non_ascii {
@@ -395,29 +560,18 @@ impl AsciiLowerTokenizer {
                 // just consumed is the phrase gap it leaves behind.
                 continue;
             }
-            if !had_upper {
-                // Fast path: borrow directly from `text`.
-                //
-                // SAFETY: `is_token_byte` only accepts ASCII
-                // alphanumerics, so every byte in `bytes[start..end]`
-                // is a single-byte ASCII codepoint. The slice is
-                // therefore valid UTF-8 and the original `text`
-                // outlives the callback call.
-                let s = unsafe { from_utf8_unchecked(&bytes[start..end]) };
-                f(s, this_position);
-            } else {
-                // Slow path: copy + lowercase into the reusable buf.
-                buf.clear();
-                buf.reserve(end - start);
-                for &b in &bytes[start..end] {
-                    buf.push(b.to_ascii_lowercase());
-                }
-                // SAFETY: same reasoning — every byte pushed is an
-                // ASCII alphanumeric (or its lowercased form, which
-                // is also ASCII).
-                let s = unsafe { from_utf8_unchecked(&buf) };
-                f(s, this_position);
-            }
+            // SAFETY: `is_token_byte` only accepts ASCII alphanumerics,
+            // so every byte in `bytes[start..end]` is a single-byte
+            // ASCII codepoint: the slice is valid UTF-8, and `text`
+            // outlives the callback call.
+            let s = unsafe { from_utf8_unchecked(&bytes[start..end]) };
+            let mut at = this_position;
+            let mut emit = |piece: &str| {
+                f(piece, at);
+                at += 1;
+            };
+            position +=
+                emit_ascii_segment(s, had_upper, &mut scratch, &mut IndexPieces(&mut emit)) - 1;
         }
     }
 }
@@ -721,8 +875,18 @@ impl Tokenizer for AsciiLowerTokenizer {
         ASCII_LOWER_TOKENIZER
     }
 
+    /// Collected rather than lazy, so this shares the one scan every
+    /// other entry point uses. It previously walked the input through a
+    /// second, independent iterator, which is a standing invitation for
+    /// the two to disagree about which tokens exist — and they did, the
+    /// moment a token-length cap landed in only one of them. A term
+    /// indexed one way and queried another is silent recall loss, so
+    /// the duplicate scan is not worth the laziness; the strings this
+    /// runs on are query-sized.
     fn tokenize<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = String> + 'a> {
-        Box::new(AsciiLowerIter::new(text.as_bytes()))
+        let mut out = Vec::new();
+        self.tokenize_each_inline(text, |t| out.push(t.to_owned()));
+        Box::new(out.into_iter())
     }
 
     /// Trait-object dispatch path: delegates to the inherent
@@ -773,6 +937,7 @@ impl Tokenizer for AsciiLowerTokenizer {
         f: &mut dyn FnMut(Cow<'q, str>, u64),
     ) {
         let bytes = text.as_bytes();
+        let mut scratch = String::new();
         let mut pos = 0;
         let mut position: u64 = 0;
         while pos < bytes.len() {
@@ -786,86 +951,23 @@ impl Tokenizer for AsciiLowerTokenizer {
             if start == pos {
                 continue;
             }
-            // Every scanned run occupies one ordinal, dropped or not —
-            // the same rule `tokenize_each_inline_positioned` follows,
-            // so query and index agree on the spacing.
+            // Every scanned run occupies one ordinal, dropped or not,
+            // and a chopped run one per piece — the same rule
+            // `tokenize_each_inline_positioned` follows, so query and
+            // index agree on the spacing.
             let this_position = position;
             position += 1;
             if had_non_ascii {
                 continue;
             }
-            let s = from_utf8(&bytes[start..end]).expect("ASCII-only by construction");
-            if had_upper {
-                f(Cow::Owned(s.to_ascii_lowercase()), this_position);
-            } else {
-                f(Cow::Borrowed(s), this_position);
-            }
-        }
-    }
-}
-
-/// Internal iterator that walks the input byte slice once, emitting
-/// lowercased tokens. Skips tokens containing non-ASCII bytes per the
-/// v1 ASCII-only rule.
-struct AsciiLowerIter<'a> {
-    src: &'a [u8],
-    pos: usize,
-    buf: Vec<u8>,
-}
-
-impl<'a> AsciiLowerIter<'a> {
-    fn new(src: &'a [u8]) -> Self {
-        Self {
-            src,
-            pos: 0,
-            buf: Vec::with_capacity(TOKEN_SCRATCH_INITIAL_CAP),
-        }
-    }
-}
-
-impl Iterator for AsciiLowerIter<'_> {
-    type Item = String;
-
-    fn next(&mut self) -> Option<String> {
-        loop {
-            // Skip non-token bytes.
-            while self.pos < self.src.len() && !is_token_byte(self.src[self.pos]) {
-                self.pos += 1;
-            }
-            if self.pos >= self.src.len() {
-                return None;
-            }
-
-            // Accumulate one token.
-            self.buf.clear();
-            let mut had_non_ascii = false;
-            while self.pos < self.src.len() {
-                let b = self.src[self.pos];
-                if is_token_byte(b) {
-                    self.buf.push(b.to_ascii_lowercase());
-                    self.pos += 1;
-                } else if b >= NON_ASCII_BYTE_MIN {
-                    // Non-ASCII byte inside a contiguous "word-ish" run —
-                    // mark this run as non-ASCII and consume until a true
-                    // separator. Drop the whole token.
-                    had_non_ascii = true;
-                    self.pos += 1;
-                } else {
-                    break;
-                }
-            }
-
-            if had_non_ascii || self.buf.is_empty() {
-                continue;
-            }
-
-            // SAFETY: we only push ASCII letters and digits via
-            // is_token_byte + to_ascii_lowercase, so the buffer is
-            // guaranteed valid UTF-8.
-            let s = from_utf8(&self.buf)
-                .expect("ASCII-only by construction")
-                .to_owned();
-            return Some(s);
+            let s: &'q str = from_utf8(&bytes[start..end]).expect("ASCII-only by construction");
+            let mut at = this_position;
+            let mut emit = |piece: Cow<'q, str>| {
+                f(piece, at);
+                at += 1;
+            };
+            position +=
+                emit_ascii_segment(s, had_upper, &mut scratch, &mut QueryPieces(&mut emit)) - 1;
         }
     }
 }
@@ -1232,28 +1334,35 @@ impl StandardTokenizer {
     /// word), so a chunk boundary could not be placed soundly.
     #[inline]
     pub fn tokenize_each_inline<F: FnMut(&str)>(&self, text: &str, mut f: F) {
+        let mut buf = String::new();
         if text.is_ascii() {
+            // Cased ASCII only, so the ASCII fold agrees with the
+            // Unicode fold the non-ASCII path applies.
             ascii_word_segments(text.as_bytes(), |start, end, has_upper| {
-                let seg = &text[start..end];
-                if has_upper {
-                    // Cased ASCII only, so `to_ascii_lowercase` agrees
-                    // with the Unicode fold the non-ASCII path applies.
-                    f(&seg.to_ascii_lowercase());
-                } else {
-                    f(seg);
-                }
+                emit_ascii_segment(
+                    &text[start..end],
+                    has_upper,
+                    &mut buf,
+                    &mut IndexPieces(&mut f),
+                );
             });
             return;
         }
-        let mut buf = String::new();
-        for word in text.unicode_words() {
+        // `split_word_bounds` rather than `unicode_words` because the
+        // latter's filter drops emoji; the segmentation itself is the
+        // same, and UAX #29 already holds a ZWJ emoji sequence together
+        // as one segment, so only which segments are kept differs.
+        for word in text.split_word_bounds() {
+            if !is_token_segment(word) {
+                continue;
+            }
             // Borrow directly when every cased character is already
             // lowercase (the common case for lowercased corpora); only
             // allocate to case-fold a word carrying an upper/title-case
             // letter. Non-alphabetic characters (digits, apostrophes)
             // are unaffected by lowercasing, so they never force a copy.
             if word.chars().all(|c| !c.is_alphabetic() || c.is_lowercase()) {
-                f(word);
+                emit_capped(word, &mut f);
             } else {
                 buf.clear();
                 // Context-aware full-string lowercasing. `str::to_lowercase`
@@ -1262,7 +1371,7 @@ impl StandardTokenizer {
                 // a char-by-char fold has no word context and would emit
                 // `σ` in both spots.
                 buf.push_str(&word.to_lowercase());
-                f(&buf);
+                emit_capped(&buf, &mut f);
             }
         }
     }
@@ -1302,15 +1411,13 @@ impl Tokenizer for StandardTokenizer {
     /// its owned folds.
     fn tokenize_each_query<'q>(&self, text: &'q str, f: &mut dyn FnMut(Cow<'q, str>)) {
         if text.is_ascii() {
+            let mut scratch = String::new();
+            let mut emit = |piece: Cow<'q, str>| f(piece);
             ascii_word_segments(text.as_bytes(), |start, end, has_upper| {
                 // `text` outlives the callback, so the reslice carries
                 // the caller's `'q` with no lifetime gymnastics.
                 let seg: &'q str = &text[start..end];
-                if has_upper {
-                    f(Cow::Owned(seg.to_ascii_lowercase()));
-                } else {
-                    f(Cow::Borrowed(seg));
-                }
+                emit_ascii_segment(seg, has_upper, &mut scratch, &mut QueryPieces(&mut emit));
             });
             return;
         }
@@ -1592,6 +1699,9 @@ mod tests {
         ] {
             let mut fast = Vec::new();
             StandardTokenizer.tokenize_each_inline(text, |t| fast.push(t.to_owned()));
+            // Equality holds because none of these fixtures carries an
+            // emoji; where one does, this tokenizer emits a token the
+            // segmenter's word filter drops. See the emoji tests.
             let expected: Vec<String> = text.unicode_words().map(|w| w.to_lowercase()).collect();
             assert_eq!(fast, expected, "tokens diverged on {text:?}");
         }
@@ -1719,6 +1829,9 @@ mod tests {
             let text: String = indices.iter().map(|&i| MIXED_ALPHABET[i]).collect();
             let mut got = Vec::new();
             StandardTokenizer.tokenize_each_inline(&text, |t| got.push(t.to_owned()));
+            // The alphabet is emoji-free, so the two agree exactly. On
+            // emoji input this tokenizer is a strict superset, which
+            // `standard_emits_emoji_the_word_filter_drops` pins.
             let expected: Vec<String> =
                 text.unicode_words().map(|w| w.to_lowercase()).collect();
             prop_assert_eq!(&got, &expected, "tokens diverged on {:?}", text);
@@ -1756,6 +1869,195 @@ mod tests {
         let mut out = Vec::new();
         StandardTokenizer.tokenize_each(text, &mut |t| out.push(t.to_owned()));
         out
+    }
+
+    // ---- emoji ----
+
+    #[test]
+    fn standard_emits_emoji_the_word_filter_drops() {
+        // The segmenter's word iterator keeps only segments carrying an
+        // alphanumeric, so an emoji-only segment falls out as though it
+        // were punctuation. It is a token here, and lowercasing leaves
+        // it alone.
+        assert_eq!(std_tokens("hello 🙂 world"), vec!["hello", "🙂", "world"]);
+        assert_eq!(std_tokens("🙂"), vec!["🙂"]);
+        assert_eq!(
+            std_tokens_each("hello 🙂 world"),
+            std_tokens("hello 🙂 world")
+        );
+        // A ZWJ sequence is one grapheme and one token: UAX #29 holds it
+        // together, so no extra rule is needed to avoid splitting it
+        // into its components.
+        assert_eq!(std_tokens("👩‍💻"), vec!["👩‍💻"]);
+    }
+
+    #[test]
+    fn emoji_token_breaks_phrase_adjacency() {
+        // The precision half of the same change. Positions are emission
+        // ordinals, so dropping the emoji would leave `cat` and `dog`
+        // adjacent and the exact phrase "cat dog" would match text that
+        // does not contain it.
+        let tokens = std_tokens("cat 🙂 dog");
+        let cat = tokens.iter().position(|t| t == "cat").expect("cat");
+        let dog = tokens.iter().position(|t| t == "dog").expect("dog");
+        assert_eq!(
+            dog - cat,
+            2,
+            "the emoji must occupy a position between them"
+        );
+    }
+
+    #[test]
+    fn text_default_symbols_and_keycap_bases_stay_punctuation() {
+        // `#`, `*` and the digits are `Emoji=YES` but carry that meaning
+        // only inside a keycap sequence, and `™`/`©` are emoji with a
+        // text presentation by default. Emitting any of them would
+        // change how ordinary prose tokenizes, so the predicate is
+        // `Emoji_Presentation` rather than `Emoji`.
+        assert_eq!(std_tokens("a # b"), vec!["a", "b"]);
+        assert_eq!(std_tokens("a * b"), vec!["a", "b"]);
+        assert_eq!(std_tokens("acme™ ©"), vec!["acme"]);
+        // And a digit is still a digit, not an emoji token.
+        assert_eq!(std_tokens("pick 3 now"), vec!["pick", "3", "now"]);
+    }
+
+    #[test]
+    fn emoji_only_adds_tokens_never_removes_them() {
+        // The relationship to the segmenter's own word iterator, stated
+        // as the invariant rather than as a fixture: every word it
+        // yields is still emitted, in order, and anything extra is an
+        // emoji it filtered out.
+        for text in [
+            "hello 🙂 world",
+            "café 🎉 42 ☕",
+            "🙂🙂 back to back",
+            "no emoji here at all",
+            "中文 🀄 text",
+        ] {
+            let got = std_tokens(text);
+            let words: Vec<String> = text.unicode_words().map(|w| w.to_lowercase()).collect();
+            let kept: Vec<String> = got
+                .iter()
+                .filter(|t| !t.chars().all(is_emoji_token_char))
+                .cloned()
+                .collect();
+            assert_eq!(kept, words, "non-emoji tokens changed on {text:?}");
+            assert!(got.len() >= words.len());
+        }
+    }
+
+    // ---- maximum token length ----
+
+    /// One character past the cap, so the run must split into exactly
+    /// two pieces: a full-length one and a one-character remainder.
+    const OVER_CAP: usize = MAX_TOKEN_CHARS + 1;
+    /// Two full pieces' worth minus one, exercising a chop that lands
+    /// on neither a piece boundary nor a one-character remainder.
+    const NEARLY_TWO_CAPS: usize = MAX_TOKEN_CHARS * 2 - 1;
+
+    #[test]
+    fn long_run_is_chopped_not_dropped() {
+        // Chopping keeps the text searchable and makes the leading
+        // piece a real term. Dropping the run would make it wholly
+        // unreachable and leave a hole where it stood.
+        for (len, want_pieces) in [
+            (MAX_TOKEN_CHARS, 1),
+            (OVER_CAP, 2),
+            (NEARLY_TWO_CAPS, 2),
+            (MAX_TOKEN_CHARS * 2, 2),
+            (MAX_TOKEN_CHARS * 2 + 1, 3),
+        ] {
+            let text = "a".repeat(len);
+            for got in [std_tokens(&text), std_tokens_each(&text), tokens(&text)] {
+                assert_eq!(got.len(), want_pieces, "len {len}");
+                assert!(got.iter().all(|p| p.chars().count() <= MAX_TOKEN_CHARS));
+                assert_eq!(got.concat(), text, "chopping must not lose text");
+            }
+        }
+    }
+
+    #[test]
+    fn query_paths_chop_like_the_index_paths() {
+        // A query is tokenized by its own fast paths, and a run past the
+        // cap must come out as the same pieces the index wrote — for
+        // both analyzers, lowercase and mixed case, with the pieces at
+        // consecutive positions. A query path that emitted the run
+        // whole would look up a term the index never wrote.
+        let text = format!(
+            "{}z {} tail",
+            "a".repeat(OVER_CAP),
+            "B".repeat(NEARLY_TWO_CAPS)
+        );
+        let want: Vec<String> = std_tokens(&text);
+        assert_eq!(want.len(), 5, "index side: 2 + 2 pieces + tail");
+        assert_eq!(want[3], "b".repeat(NEARLY_TWO_CAPS - MAX_TOKEN_CHARS));
+        assert_eq!(tokens(&text), want, "both analyzers index ASCII alike");
+
+        let mut ascii_query = Vec::new();
+        AsciiLowerTokenizer.tokenize_each_query(&text, &mut |t| ascii_query.push(t.into_owned()));
+        assert_eq!(ascii_query, want, "ascii_lower query path");
+        let mut std_query = Vec::new();
+        StandardTokenizer.tokenize_each_query(&text, &mut |t| std_query.push(t.into_owned()));
+        assert_eq!(std_query, want, "standard query path");
+
+        let expect: Vec<(String, u64)> = want.iter().cloned().zip(0u64..).collect();
+        let mut queried = Vec::new();
+        AsciiLowerTokenizer
+            .tokenize_each_query_positioned(&text, &mut |t, p| queried.push((t.into_owned(), p)));
+        assert_eq!(
+            queried, expect,
+            "pieces take consecutive positions on the query side"
+        );
+        assert_eq!(
+            positioned(&text),
+            expect,
+            "and the same positions the index recorded"
+        );
+    }
+
+    #[test]
+    fn chop_counts_characters_not_bytes() {
+        // A byte cap would split a multi-byte script far earlier than a
+        // Latin one, so the same sentence would tokenize differently
+        // depending on the language it is written in. Each of these is
+        // one character but several bytes, and exactly at the cap they
+        // must still emit a single token.
+        //
+        // Deliberately no CJK here: UAX #29 already gives each
+        // ideograph its own word, so a run of them never reaches the
+        // cap and would test the segmenter rather than the cap.
+        for c in ['é', 'ж', 'א'] {
+            let text: String = std::iter::repeat_n(c, MAX_TOKEN_CHARS).collect();
+            assert!(text.len() > MAX_TOKEN_CHARS, "multi-byte fixture");
+            let got = std_tokens(&text);
+            assert_eq!(got, vec![text.clone()], "char {c:?} at the cap");
+
+            let over: String = std::iter::repeat_n(c, OVER_CAP).collect();
+            let got = std_tokens(&over);
+            assert_eq!(got.len(), 2, "char {c:?} past the cap");
+            assert_eq!(got[0].chars().count(), MAX_TOKEN_CHARS);
+            assert_eq!(got[1].chars().count(), 1);
+            assert_eq!(got.concat(), over);
+        }
+    }
+
+    #[test]
+    fn chopped_pieces_take_consecutive_positions() {
+        // Each piece is its own token, so it needs its own position:
+        // stacking them would make a phrase spanning the chop match
+        // text that is not adjacent. The ordinal after a chopped run
+        // must also account for every piece, or the run's neighbour
+        // collides with its last piece.
+        let long = "a".repeat(OVER_CAP);
+        let text = format!("alpha {long} omega");
+        let mut got: Vec<(String, u64)> = Vec::new();
+        AsciiLowerTokenizer
+            .tokenize_each_inline_positioned(&text, |t, p| got.push((t.to_owned(), p)));
+        let positions: Vec<u64> = got.iter().map(|(_, p)| *p).collect();
+        assert_eq!(positions, vec![0, 1, 2, 3], "one ordinal per emitted piece");
+        assert_eq!(got[0].0, "alpha");
+        assert_eq!(got[3].0, "omega");
+        assert_eq!(got[1].0.len() + got[2].0.len(), OVER_CAP);
     }
 
     #[test]
