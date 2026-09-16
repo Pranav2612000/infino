@@ -2634,8 +2634,11 @@ pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffset
 /// `DiskCacheStore::cold_fetch_lazy_with_hints`: the parquet
 /// footer tail (matching the 64 KiB speculation length) plus each
 /// vector / FTS open range. Returns `(absolute_offset, bytes)`
-/// tuples; an empty `Vec` disables the inline-open fast path for
-/// this superfile.
+/// tuples. A range larger than `OPEN_BLOB_INLINE_MAX_RANGE_BYTES` is
+/// left out — a large superfile's term dictionary, tens of MiB that
+/// every manifest read would otherwise carry — and the reader fetches
+/// exactly the ranges the blob lacks in its open wave; an empty `Vec`
+/// means the whole open batch goes over the wire.
 fn build_open_blob(
     bytes: &Bytes,
     total_size: u64,
@@ -2645,6 +2648,17 @@ fn build_open_blob(
     // Must match `cold_fetch_lazy_with_hints`'s parquet tail
     // speculation length so the overlay covers `source.tail()`.
     const PARQUET_TAIL_SPEC: u64 = 64 * 1024;
+    // The blob is a second copy of the open ranges. For an FTS column
+    // those are the term dictionary and the per-doc lengths; on a
+    // superfile of a million or more documents the dictionary alone runs
+    // to tens of MiB and does not compress, and copying it into every
+    // manifest read costs more than the one round trip it saves the cold
+    // open. So each range is inlined only while it stays under this
+    // size; the reader fetches the ranges the blob lacks in its open
+    // wave. The parquet tail, a small superfile's whole dictionary and
+    // the doc lengths of all but the largest superfiles stay inline, so
+    // a table of many ordinary superfiles opens as it always did.
+    const OPEN_BLOB_INLINE_MAX_RANGE_BYTES: u64 = 4 * 1024 * 1024;
     let mut blob: Vec<(u64, Vec<u8>)> =
         Vec::with_capacity(1 + vec_open_ranges.len() + fts_open_ranges.len());
 
@@ -2661,7 +2675,11 @@ fn build_open_blob(
             None => return Vec::new(),
         }
     }
-    for &(off, len) in vec_open_ranges.iter().chain(fts_open_ranges.iter()) {
+    for &(off, len) in vec_open_ranges
+        .iter()
+        .chain(fts_open_ranges.iter())
+        .filter(|&&(_, len)| len <= OPEN_BLOB_INLINE_MAX_RANGE_BYTES)
+    {
         match slice(off, len) {
             Some(b) => blob.push((off, b)),
             // A range we can't satisfy means the capture is
@@ -9224,7 +9242,13 @@ pub(in crate::supertable) async fn stamp_term_stats(
             old
         };
         let entries = old.get_all_superfiles();
-        if entries.is_empty() {
+        // One superfile is its own global statistics: a query gathers df
+        // from that superfile's dictionary — the same numbers, one probe
+        // — so publishing an artifact would only duplicate the dictionary
+        // on disk. Nothing to drop either: a commit that removed the other
+        // superfiles already dropped the reference (the carry rule), and
+        // the next multi-superfile maintenance pass republishes.
+        if entries.len() <= 1 {
             return Ok(());
         }
         // Rebuilt per attempt: a competing commit may have changed the
@@ -10488,6 +10512,39 @@ pub(crate) fn read_vector_layout_from_bytes(bytes: &Bytes) -> VectorLayout {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn open_blob_inlines_each_open_range_only_while_it_is_small() {
+        // A 16 MiB "superfile": the parquet tail is the last 64 KiB; an
+        // FTS open range of 512 KiB inlines, one of 8 MiB does not (the
+        // reader fetches it in its open wave; copying it into every
+        // manifest read would cost more than the round trip it saves),
+        // and the other ranges beside it still inline.
+        let total: u64 = 16 * 1024 * 1024;
+        let bytes = Bytes::from(vec![7u8; total as usize]);
+        let small = build_open_blob(&bytes, total, &[], &[(1024, 512 * 1024)]);
+        assert_eq!(small.len(), 2, "parquet tail + one FTS range");
+        assert_eq!(small[1].0, 1024);
+        assert_eq!(small[1].1.len(), 512 * 1024);
+        let large = build_open_blob(&bytes, total, &[], &[(1024, 8 * 1024 * 1024)]);
+        assert_eq!(
+            large.len(),
+            1,
+            "the parquet tail alone; the dictionary is fetched"
+        );
+        let mixed = build_open_blob(
+            &bytes,
+            total,
+            &[(0, 700 * 1024)],
+            &[(1024, 8 * 1024 * 1024), (9 * 1024 * 1024, 300 * 1024)],
+        );
+        let offs: Vec<u64> = mixed.iter().map(|(o, _)| *o).collect();
+        assert_eq!(
+            offs,
+            vec![total - 64 * 1024, 0, 9 * 1024 * 1024],
+            "each range is judged on its own"
+        );
+    }
+
     use std::{
         sync::Arc,
         time::{Duration, Instant},
@@ -10776,8 +10833,8 @@ mod tests {
         Arc::new(SuperfileEntry {
             birth_version: 0,
             superfile_id: Uuid::from_u128(id),
-            stem: None,
             uri: SuperfileUri(Uuid::from_u128(id)),
+            stem: None,
             n_docs: 1,
             id_min: 0,
             id_max: 0,
