@@ -909,10 +909,115 @@ impl TermCursor {
             if self.decoded_block != self.current_block {
                 self.decode_current_block();
             }
+            // A bisection, measured against a scan from the last probe's
+            // position: the driver's docs land far apart in another term's
+            // block, so the scan's steps cost more than the halvings here
+            // (the opposite of the tf probe's dense completion pass).
             self.block_doc_ids[..self.block_n]
                 .binary_search(&doc)
                 .is_ok()
         }
+    }
+
+    /// Keep, in place, the docs of the ascending list `docs` that this term
+    /// contains. The block-at-a-time form of [`Self::contains`]: the block
+    /// cursor advances forward once per block, a bitset block is bit-tested
+    /// with its header parsed once, and a packed block is decoded once and
+    /// merged against the list. Like `contains` it moves `current_block`,
+    /// so a cursor filtered this way must not also be iterated; the
+    /// callers keep a separate cursor for the walk.
+    pub(super) fn retain_contained(&mut self, docs: &mut Vec<u32>) {
+        let n = docs.len();
+        let mut w = 0usize;
+        let mut r = 0usize;
+        if self.predecoded {
+            let ids = &self.block_doc_ids[..self.block_n];
+            let mut p = 0usize;
+            while r < n {
+                let d = docs[r];
+                while p < ids.len() && ids[p] < d {
+                    p += 1;
+                }
+                if p < ids.len() && ids[p] == d {
+                    docs[w] = d;
+                    w += 1;
+                }
+                r += 1;
+            }
+            docs.truncate(w);
+            return;
+        }
+        while r < n {
+            let doc = docs[r];
+            while self.current_block < self.blocks.len()
+                && self.blocks[self.current_block].last_doc_id < doc
+            {
+                self.current_block += 1;
+            }
+            if self.current_block >= self.blocks.len() {
+                break;
+            }
+            let block = self.blocks[self.current_block];
+            let block_last = block.last_doc_id;
+            let hdr = self.current_header();
+            if hdr.encoding == ENCODING_BITSET {
+                let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+                let words = &raw[hdr.payload()..raw.len() - hdr.tfs_size()];
+                while r < n && docs[r] <= block_last {
+                    let d = docs[r];
+                    r += 1;
+                    let Some(bit) = d.checked_sub(hdr.base) else {
+                        continue;
+                    };
+                    let wi = (bit as usize / 64) * 8;
+                    if wi + 8 > words.len() {
+                        continue;
+                    }
+                    let word = u64::from_le_bytes(words[wi..wi + 8].try_into().expect("8 bytes"));
+                    if (word >> (bit % 64)) & 1 == 1 {
+                        docs[w] = d;
+                        w += 1;
+                    }
+                }
+            } else {
+                if self.decoded_block != self.current_block {
+                    self.decode_current_block();
+                }
+                let ids = &self.block_doc_ids[..self.block_n];
+                let mut p = 0usize;
+                while r < n && docs[r] <= block_last {
+                    let d = docs[r];
+                    r += 1;
+                    while p < ids.len() && ids[p] < d {
+                        p += 1;
+                    }
+                    if p < ids.len() && ids[p] == d {
+                        docs[w] = d;
+                        w += 1;
+                    }
+                }
+                self.pos = p.min(ids.len().saturating_sub(1));
+            }
+        }
+        docs.truncate(w);
+    }
+
+    /// Move the block cursor to the block that holds `doc`, without a
+    /// decode or a presence test: for a doc a probe cursor over the same
+    /// postings has already confirmed, ahead of [`Self::materialize_at`]
+    /// or [`Self::tf_at_contained`]. Like the probes it moves
+    /// `current_block`, so the cursor must not also be iterated.
+    #[inline]
+    pub(super) fn seek_block(&mut self, doc: u32) {
+        while self.current_block < self.blocks.len()
+            && self.blocks[self.current_block].last_doc_id < doc
+        {
+            self.current_block += 1;
+        }
+        debug_assert!(
+            self.current_block < self.blocks.len(),
+            "doc confirmed present"
+        );
     }
 
     /// Materialize a `contains`-probed cursor at `doc`: ensure the current
@@ -1032,7 +1137,13 @@ impl TermCursor {
         let block = self.blocks[self.current_block];
         let hdr = self.current_header();
         if hdr.encoding != ENCODING_BITSET {
-            // PACKED: no rank shortcut — decode + locate like the old path.
+            // PACKED: no rank shortcut — decode + locate like a skip. The
+            // in-block step is a linear scan from the cursor's position on
+            // purpose: a completion pass probes a block a few docs apart,
+            // and every search that bisects (whole block, after a few
+            // linear steps, or galloping) measured a quarter slower on a
+            // long query — the predictable scan beats the mispredicted
+            // halving for gaps under a block.
             self.skip_to(doc);
             return if self.current_doc_id() == doc {
                 Some(self.current_tf())
@@ -1154,6 +1265,23 @@ impl TermCursor {
     /// a hint pointer so monotonically-advancing leader ranges amortize
     /// to O(1) amortized per call.
     pub(super) fn block_max_in_range(&mut self, range_start: u32, range_end: u32) -> f32 {
+        self.block_max_and_density_in_range(range_start, range_end)
+            .0
+    }
+
+    /// [`Self::block_max_in_range`] together with an estimate of this
+    /// term's docs in the range: the overlapping blocks hold
+    /// [`BLOCK_LEN`] docs each over their combined doc-id span, so the
+    /// range's share of that span is its share of those docs. `0` when the
+    /// cursor is exhausted.
+    pub(super) fn block_max_and_density_in_range(
+        &mut self,
+        range_start: u32,
+        range_end: u32,
+    ) -> (f32, f32) {
+        if self.is_exhausted() {
+            return (0.0, 0.0);
+        }
         // Advance inspect_block to the first block whose last_doc_id
         // could intersect the range. shallow_advance_block_to lands on
         // the first block with last_doc_id >= range_start, which is
@@ -1180,7 +1308,18 @@ impl TermCursor {
             }
             i += 1;
         }
-        max
+        let first = self.inspect_block;
+        if i == first {
+            return (max, 0.0);
+        }
+        let span_start = match first {
+            0 => 0u32,
+            _ => self.blocks[first - 1].last_doc_id.saturating_add(1),
+        };
+        let span = f64::from(self.blocks[i - 1].last_doc_id) - f64::from(span_start) + 1.0;
+        let range = f64::from(range_end.max(range_start)) - f64::from(range_start) + 1.0;
+        let docs = (i - first) as f64 * BLOCK_LEN as f64 * (range / span).clamp(0.0, 1.0);
+        (max, docs as f32)
     }
 
     /// Block-max-BM25 at the inspect-block pointer. Pair with
@@ -1439,10 +1578,14 @@ impl TermCursor {
                 rank as usize,
             )
         } else {
-            // PACKED: `contains` decoded this block's doc ids and tfs. Locate doc.
+            // PACKED: `contains` or a bare `seek_block` put the block cursor
+            // here; decode once if needed and locate the doc.
+            if self.decoded_block != self.current_block {
+                self.decode_current_block();
+            }
             let pos = self.block_doc_ids[..self.block_n]
                 .binary_search(&doc)
-                .expect("contains(doc) confirmed presence");
+                .expect("doc confirmed present");
             self.block_tfs[pos]
         }
     }
@@ -1607,6 +1750,48 @@ mod tests {
                 c.next();
             }
         }
+    }
+
+    /// The tf probe on a packed block steps the cursor to the doc. Every
+    /// doc across several blocks must answer exactly as the walk does for
+    /// ascending probes, and the cursor must stay on a valid in-block
+    /// position throughout.
+    #[tokio::test]
+    async fn packed_block_tf_probes_match_the_walk() {
+        use crate::superfile::fts::posting::{ENCODING_BITSET, block_encoding};
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("flat".into(), false).expect("register");
+        let tf_of = |doc: u32| doc.is_multiple_of(37).then(|| 1 + doc % 5);
+        for doc_id in 0..60_000u32 {
+            let text = match tf_of(doc_id) {
+                Some(tf) => vec!["sparse"; tf as usize].join(" "),
+                None => "filler".to_string(),
+            };
+            b.add_doc(0, doc_id, &text).expect("add");
+        }
+        let json = r#"[{"name":"flat","tokenizer":"ascii_lower"}]"#;
+        let view = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let cursors = view
+            .build_term_cursors(0, &["sparse"], None, false, None, None)
+            .await
+            .expect("cursors");
+        let mut c = cursors[0].clone();
+        assert!(c.blocks.len() >= 4, "several blocks");
+        for blk in c.blocks.iter() {
+            assert_ne!(
+                block_encoding(&c.bytes[blk.block_byte_offset..blk.block_byte_end]),
+                ENCODING_BITSET,
+                "the gap-37 list must pack, or the packed path is not under test"
+            );
+        }
+        for doc in 0..12_000u32 {
+            assert_eq!(c.bitset_probe_tf(doc), tf_of(doc), "probe {doc}");
+            assert!(c.pos < c.block_n, "probe {doc} left pos out of the block");
+            let _ = c.current_doc_id();
+        }
+        // Past the last block: absent, and the cursor reports exhaustion.
+        assert_eq!(c.bitset_probe_tf(100_000), None);
+        assert!(c.is_exhausted());
     }
 
     /// A lazily published block must expand on demand for the callers
