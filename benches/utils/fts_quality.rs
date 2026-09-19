@@ -43,6 +43,15 @@
 //! | recall (per-superfile stats) | the same under `PerSuperfile` — the opt-in mode's sharded-idf drift |
 //! | recall vs engine BM25 | engine top-k under `Global` graded against Q — must be 1.0; a drop is a kernel or pruning bug. **Gated.** |
 //! | max score Δ | largest relative gap between an engine score and Q for the same document (`Global`). **Gated** at f32 noise. |
+//! | count | the unranked count kernels' answer against the oracle's match count. **Gated** equal where the tier's count surface expresses the shape. |
+//! | order | hits must come back in descending engine score, and adjacent pairs must agree with Q's order beyond the tie tolerance. **Gated** at zero faults. |
+//!
+//! The textbook column also carries a loose floor at the larger `k`
+//! ([`MIN_TEXTBOOK_RECALL`]): a tripwire on the user-facing quality, not
+//! a bug detector. A coverage table accompanies each tier's results,
+//! listing the posting form every battery term took in every graded file
+//! ([`term_coverage`]), so the battery's claim to reach every encoding is
+//! verified on each run rather than inferred from Zipf ranks.
 //!
 //! Q is exact, so its gates are tight. Making it exact needs the row-to-
 //! superfile mapping and each superfile's declared average: [`Layout`]
@@ -66,7 +75,13 @@
 //! parse with the table's own tokenizer, so tokenization and clause
 //! semantics cannot diverge by construction.
 
-use std::{borrow::Cow, cmp::Ordering, collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Instant,
+};
 
 use arrow_array::{Array, Float32Array, LargeStringArray, RecordBatch, StringArray};
 use infino::{
@@ -80,7 +95,7 @@ use infino::{
             tokenize::Tokenizer,
         },
     },
-    supertable::{SupertableReader, manifest::SuperfileEntry},
+    supertable::SupertableReader,
     test_helpers::default_tokenizer,
 };
 use rayon::prelude::*;
@@ -89,12 +104,16 @@ use crate::{
     corpus::{self, TextFlavor, block_on_inmem, for_each_doc_in_chunk, generated_chunk_count},
     markdown::fmt_count,
     report::{Better, Block, Cell, Report, Section, context, metric, text},
+    supertable::collect_manifest_superfiles,
     tiers,
 };
 
-/// The `k` values graded. `10` is the speed cell's top-k, `1000` its
-/// large-k gate; `1000` is also where sharded-idf drift and ties show.
-pub const QUALITY_KS: &[usize] = &[10, 100, 1000];
+/// The `k` values graded. `1` is the sharpest ranking check (the single
+/// best document, no tie slack to hide in); `10` is the speed cell's
+/// top-k; `128` is the largest `k` at which a two-term union routes to
+/// WAND rather than MaxScore, so it and `1000` bracket that dispatch;
+/// `1000` is the speed cell's large-k gate and where ties show.
+pub const QUALITY_KS: &[usize] = &[1, 10, 100, 128, 1000];
 
 /// Standard BM25 parameters — the same constants the engine scores with.
 /// Restated here so the oracle is the formula by construction, sharing no
@@ -123,6 +142,16 @@ const MIN_ENGINE_MODEL_RECALL: f64 = 1.0;
 /// still fails on any mismatched input.
 const MAX_SCORE_DELTA: f64 = 1e-3;
 
+/// Floor on `recall vs BM25` (the textbook column) at
+/// `k >= TEXTBOOK_FLOOR_MIN_K`. This column measures a design cost, not a
+/// bug: the stored one-byte length and each file scoring at the average it
+/// declares reorder near-ties against textbook BM25. The floor is a
+/// regression tripwire on that cost, set below the values recorded on the
+/// realistic corpus with margin. At smaller `k` one boundary tie moves
+/// recall by a tenth or more, so those rows report only.
+const MIN_TEXTBOOK_RECALL: f64 = 0.80;
+const TEXTBOOK_FLOOR_MIN_K: usize = 100;
+
 /// Relative tolerance when checking a superfile's declared average against
 /// the value the commit rule predicts. Both sides round to the same fixed
 /// point from the same totals; this only absorbs the `f64` → `f32` step.
@@ -132,112 +161,197 @@ const DECLARED_AVGDL_TOLERANCE: f64 = 1e-6;
 const MIN_SCORE_FOR_RELATIVE_DELTA: f64 = 1e-9;
 
 /// One graded query shape. `query` is the literal string handed to both
-/// the engine and the oracle's parser; `mode` is the default operator.
+/// the engine and the oracle's parser; `mode` is the default operator;
+/// `bm25` is a query-time parameter pair, or the column's standard pair.
 #[derive(Clone, Copy, Debug)]
 pub struct QualityQuery {
     pub name: &'static str,
     pub query: &'static str,
     pub mode: BoolMode,
+    pub bm25: Option<Bm25Pair>,
+}
+
+/// A BM25 `(k1, b)` pair a shape is scored with on both sides.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bm25Pair {
+    pub k1: f64,
+    pub b: f64,
+}
+
+/// The non-standard pair one battery shape is graded at: the engine
+/// rescales its stored per-block bounds by the pair's ratio to the
+/// declared one, and a rescale that came out too small prunes a
+/// qualifying document — which only an oracle at the same pair can see.
+const OVERRIDE_PAIR: Bm25Pair = Bm25Pair { k1: 1.6, b: 0.4 };
+
+const fn or(name: &'static str, query: &'static str) -> QualityQuery {
+    QualityQuery {
+        name,
+        query,
+        mode: BoolMode::Or,
+        bm25: None,
+    }
+}
+
+const fn and(name: &'static str, query: &'static str) -> QualityQuery {
+    QualityQuery {
+        name,
+        query,
+        mode: BoolMode::And,
+        bm25: None,
+    }
 }
 
 /// Query shapes chosen by document-frequency tier rather than by fixed
 /// rank so they mean the same thing on every generated corpus. Terms are
-/// Zipf ranks: rank 1 is the stopword band (~84% of docs on the realistic
-/// corpus, every doc on the uniform one), rank 30 is common (~20%), rank
-/// 2000 is mid (~0.6%), rank 200 000 is rare (~1e-4; absent from the
-/// uniform corpus's 10K vocabulary, where both sides return nothing), and
-/// `doc0000001` is a singleton on every generated corpus.
+/// Zipf ranks of the generated vocabulary; the tiers below are chosen so
+/// that at the reference scales (10M docs in 16 commits on the supertable
+/// tier, one 1M-doc file on the superfile tier) the battery's terms land
+/// on every posting form and every routing branch, which
+/// [`term_coverage`] verifies on each run:
+///
+/// | tier | rank | at 10M / 16 files | what it reaches |
+/// |---|---|---|---|
+/// | stopword, stopword2 | 1, 2 | ~525K docs per file, bitset blocks | dense presence words, the seeded single-term walk, coarse spans |
+/// | common, common2 | 30, 31 | ~130K, ~1000 packed blocks | the seed floor, two comparable lists |
+/// | upper_mid | 100 | ~56K, ~440 blocks | forced packed above the patched-df ceiling |
+/// | mid_dense, mid_dense2 | 300, 200 | ~19K / ~28K, coarse spans below the seed floor | the membership walk's middle sparsity tier, with and without dense companions |
+/// | mid, mid2, mid3 | 2000..2002 | ~3.7K, ~29 blocks | patched blocks with bursty tf outliers |
+/// | low | 5000 | ~1.1K, ~9 blocks | short lists with a partial last block |
+/// | few_block | 20000 | ~280, ~3 blocks | long form just past the short-form edge |
+/// | edge | 40000 | ~2.9K over the table, ~40 per file | the short-form boundary from both sides: one 1M-doc file stores it long form (a few patched blocks), a fragmented table stores it short form in every file |
+/// | rare, rare2.. | 200000.. | ~40, short form | the short-form body and its inline positions group |
+/// | singleton | `doc0000001` | 1, inline | the df=1 inline form |
+/// | year | `1999` | a digit token | the analyzer's digit path |
+///
+/// On the uniform corpus (`corpus=synthetic`, a 10K vocabulary) ranks past
+/// 10 000 are absent and both sides return nothing for them.
 pub const QUALITY_BATTERY: &[QualityQuery] = &[
+    // ── single terms, one per tier ──
+    or("stopword", "term00001"),
+    or("stopword2", "term00002"),
+    or("common", "term00030"),
+    or("common2", "term00031"),
+    or("upper_mid", "term00100"),
+    or("mid_dense", "term00300"),
+    or("mid_dense2", "term00200"),
+    or("mid", "term02000"),
+    or("low", "term05000"),
+    or("few_block", "term20000"),
+    or("edge", "term40000"),
+    or("rare", "term200000"),
+    or("singleton", "doc0000001"),
+    or("year", "1999"),
+    // ── unions ──
+    // Two comparable lists: MaxScore with nothing to anchor on.
+    or("common_common2_or", "term00030 term00031"),
+    // A df ratio past the WAND anchor threshold: WAND at k <= 128,
+    // MaxScore at k = 1000.
+    or("common_mid_or", "term00030 term02000"),
+    or("stopword_common_or", "term00001 term00030"),
+    or("stopword_rare_or", "term00001 term200000"),
+    // One dominant essential in the windowed union; the anchored count.
+    or("stopword_two_mid_or", "term00001 term02000 term02001"),
+    // A union dense enough for the full-bitset count.
+    or("dense_three_or", "term00001 term00002 term00030"),
+    or("three_stopword_or", "term00001 term00002 term00003"),
+    or("three_mid_or", "term02000 term02001 term02002"),
+    // A union of short-form lists.
+    or(
+        "ten_rare_or",
+        "term200000 term200001 term200002 term200003 term200004 term200005 term200006 \
+         term200007 term200008 term200009",
+    ),
+    or(
+        "ten_common_or",
+        "term00030 term00031 term00032 term00033 term00034 term00035 term00036 term00037 \
+         term00038 term00039",
+    ),
+    or(
+        "five_tier_or",
+        "term00001 term00030 term02000 term200000 doc0000001",
+    ),
+    // ── intersections ──
+    // Dense ∧ dense: the bitset intersection.
+    and("two_stopword_and", "term00001 term00002"),
+    // The rarest term far below the always-walk sparsity tier.
+    and("stopword_rare_and", "term00001 term200000"),
+    // The rarest term in the middle sparsity tier with a much denser
+    // companion: routes to the membership walk.
+    and("stopword_mid_dense_and", "term00001 term00300"),
+    // The same tier without a dense enough companion: the flat merge.
+    and("two_mid_dense_and", "term00300 term00200"),
+    and("common_mid_and", "term00030 term02000"),
+    and("three_mid_and", "term02000 term02001 term02002"),
+    and(
+        "five_tier_and",
+        "term00001 term00030 term02000 term05000 term200000",
+    ),
+    // A term just past the short-form cap on one file and well inside it
+    // on a fragmented table, intersected with the densest list.
+    and("edge_stopword_and", "term40000 term00001"),
+    // The inline form intersected with a bitset list.
+    and("singleton_stopword_and", "doc0000001 term00001"),
+    // Two disjoint rare lists: the empty-result path.
+    and("disjoint_rare_and", "term200000 term200001"),
+    // ── must / should ──
+    or("must_rare_should_common", "+term200000 term00030"),
+    or(
+        "must_two_should_two",
+        "+term00030 +term00031 term00001 term02000",
+    ),
+    // A should never extends the match set.
+    or("must_common_should_rare", "+term00030 term200000"),
+    or(
+        "must_mid_should_two_rare",
+        "+term02000 term200000 term200001",
+    ),
+    or(
+        "must_phrase_should_common",
+        "+\"term00001 term00002\" term00030",
+    ),
+    // ── negation ──
+    or("common_not_stopword", "term00030 -term00001"),
+    // A dense survivor set: the filter skip-probes a packed list.
+    or("stopword_not_common", "term00001 -term00030"),
+    // A tiny survivor set.
+    or("rare_not_stopword", "term200000 -term00001"),
+    // A negated short-form list.
+    or("common_not_rare", "term00030 -term200000"),
+    // A negated phrase.
+    or("common_not_phrase", "term00030 -\"term00001 term00002\""),
+    and(
+        "and_two_negatives",
+        "term00001 term00030 -term02000 -term200000",
+    ),
+    or("must_should_negative", "+term00030 term02000 -term00002"),
+    // ── phrases ──
+    or("phrase_stopwords", "\"term00001 term00002\""),
+    or("phrase_common_mid", "\"term00030 term02000\""),
+    // A short-form member's inline positions group next to a bitset member.
+    or("phrase_rare_stopword", "\"term200000 term00001\""),
+    or(
+        "phrase_three_stopwords",
+        "\"term00001 term00002 term00001\"",
+    ),
+    // Overlapping starts, which burstiness produces.
+    or("phrase_repeated_stopword", "\"term00001 term00001\""),
+    // Matches nothing or nearly nothing: the empty-result path for phrases.
+    or("phrase_two_mids", "\"term02000 term02001\""),
+    and("phrase_and_term", "\"term00001 term00030\" term02000"),
+    or(
+        "two_phrases_or",
+        "\"term00001 term00002\" \"term00030 term02000\"",
+    ),
+    // ── analyzer: query-side folding must equal the bare term's row ──
+    or("common_cased", "Term00030."),
+    or("mid_comma", "term02000,"),
+    // ── a query-time parameter pair ──
     QualityQuery {
-        name: "stopword",
-        query: "term00001",
+        name: "three_tier_or_override",
+        query: "term00001 term00030 term02000",
         mode: BoolMode::Or,
-    },
-    QualityQuery {
-        name: "common",
-        query: "term00030",
-        mode: BoolMode::Or,
-    },
-    QualityQuery {
-        name: "mid",
-        query: "term02000",
-        mode: BoolMode::Or,
-    },
-    QualityQuery {
-        name: "rare",
-        query: "term200000",
-        mode: BoolMode::Or,
-    },
-    QualityQuery {
-        name: "singleton",
-        query: "doc0000001",
-        mode: BoolMode::Or,
-    },
-    QualityQuery {
-        name: "stopword_common_or",
-        query: "term00001 term00030",
-        mode: BoolMode::Or,
-    },
-    QualityQuery {
-        name: "stopword_rare_or",
-        query: "term00001 term200000",
-        mode: BoolMode::Or,
-    },
-    QualityQuery {
-        name: "three_stopword_or",
-        query: "term00001 term00002 term00003",
-        mode: BoolMode::Or,
-    },
-    QualityQuery {
-        name: "three_mid_or",
-        query: "term02000 term02001 term02002",
-        mode: BoolMode::Or,
-    },
-    QualityQuery {
-        name: "ten_common_or",
-        query: "term00030 term00031 term00032 term00033 term00034 term00035 term00036 term00037 \
-                term00038 term00039",
-        mode: BoolMode::Or,
-    },
-    QualityQuery {
-        name: "stopword_rare_and",
-        query: "term00001 term200000",
-        mode: BoolMode::And,
-    },
-    QualityQuery {
-        name: "common_mid_and",
-        query: "term00030 term02000",
-        mode: BoolMode::And,
-    },
-    QualityQuery {
-        name: "three_mid_and",
-        query: "term02000 term02001 term02002",
-        mode: BoolMode::And,
-    },
-    QualityQuery {
-        name: "must_rare_should_common",
-        query: "+term200000 term00030",
-        mode: BoolMode::Or,
-    },
-    QualityQuery {
-        name: "must_two_should_two",
-        query: "+term00030 +term00031 term00001 term02000",
-        mode: BoolMode::Or,
-    },
-    QualityQuery {
-        name: "common_not_stopword",
-        query: "term00030 -term00001",
-        mode: BoolMode::Or,
-    },
-    QualityQuery {
-        name: "phrase_stopwords",
-        query: "\"term00001 term00002\"",
-        mode: BoolMode::Or,
-    },
-    QualityQuery {
-        name: "phrase_common_mid",
-        query: "\"term00030 term02000\"",
-        mode: BoolMode::Or,
+        bm25: Some(OVERRIDE_PAIR),
     },
 ];
 
@@ -253,11 +367,13 @@ struct Entry {
     tf: u32,
 }
 
-/// A query's clauses resolved to atom indices.
+/// A query's clauses resolved to atom indices, with the pair it scores at.
 struct ResolvedQuery {
     musts: Vec<Atom>,
     shoulds: Vec<Atom>,
     negatives: Vec<Atom>,
+    k1: f64,
+    b: f64,
 }
 
 /// One superfile's slice of the corpus and the average length it scores at.
@@ -274,12 +390,16 @@ pub struct SuperfileSpan {
 /// The row-to-superfile mapping of the graded table, with each
 /// superfile's declared average length — the one input to Q that varies
 /// by superfile.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Layout {
     /// Ascending by `first_row`, covering `0..n_docs` without gaps.
     spans: Vec<SuperfileSpan>,
     /// How many commits the superfiles fell into (see [`Self::recover`]).
     n_commits: usize,
+    /// The graded files' readers, in span order — the coverage table reads
+    /// each battery term's posting form from them. Empty for a layout that
+    /// was not recovered from a table.
+    readers: Vec<Arc<SuperfileReader>>,
 }
 
 impl Layout {
@@ -293,6 +413,7 @@ impl Layout {
                 avgdl,
             }],
             n_commits: 1,
+            readers: Vec::new(),
         }
     }
 
@@ -321,15 +442,7 @@ impl Layout {
     /// matches only with the current commit's earlier files excluded
     /// continues it. Neither matching is an error.
     pub fn recover(reader: &SupertableReader, column: &str, dl: &[u32]) -> Self {
-        let manifest = reader.manifest();
-        let mut entries: Vec<Arc<SuperfileEntry>> = manifest.get_all_superfiles().to_vec();
-        if entries.is_empty() {
-            for part_entry in manifest.get_all_list_entries() {
-                let part = tiers::block_on(manifest.get_part_by_id(part_entry.part_id))
-                    .expect("load manifest part for the quality layout");
-                entries.extend(part.superfiles.iter().cloned());
-            }
-        }
+        let mut entries = collect_manifest_superfiles(reader.manifest());
         entries.sort_by_key(|e| e.id_min);
         let n_rows: u64 = entries.iter().map(|e| e.n_docs).sum();
         assert_eq!(
@@ -339,6 +452,7 @@ impl Layout {
         );
 
         let mut spans = Vec::with_capacity(entries.len());
+        let mut readers = Vec::with_capacity(entries.len());
         let mut committed = ColumnLengthStats::default();
         let mut commit = ColumnLengthStats::default();
         let mut n_commits = 0usize;
@@ -355,22 +469,20 @@ impl Layout {
             let fts = superfile.fts().unwrap_or_else(|| {
                 panic!("superfile {i} ({:?}) has no full-text index", entry.uri)
             });
-            let stored = fts
-                .column_doc_lengths(column)
-                .unwrap_or_else(|e| panic!("superfile {i}: read doc lengths of {column:?}: {e}"));
-            assert_eq!(
-                stored.len(),
-                n_docs,
-                "superfile {i}: doc-length array holds {} rows, manifest says {n_docs}",
-                stored.len()
-            );
             let label = format!("superfile {i} ({:?})", entry.uri);
-            verify_doc_lengths(&stored, dl, first_row, &label);
-            let declared = declared_avgdl(fts, column);
+            let (own, declared) = verify_file(fts, column, dl, first_row, &label);
+            assert_eq!(
+                own.n_scored_docs as usize
+                    + dl[first_row..first_row + n_docs]
+                        .iter()
+                        .filter(|&&l| l == 0)
+                        .count(),
+                n_docs,
+                "{label}: scored-doc count and empty rows do not add up to its {n_docs} rows"
+            );
 
             // The commit rule, under both hypotheses about where this
             // superfile's commit begins.
-            let own = ColumnLengthStats::from_lengths(stored.iter().copied());
             let mut all_earlier = committed;
             all_earlier.merge_with(&commit);
             let as_new_commit = declared_under(&all_earlier, &own);
@@ -395,9 +507,14 @@ impl Layout {
                 n_docs: u32::try_from(n_docs).expect("row count fits u32"),
                 avgdl: declared,
             });
+            readers.push(Arc::clone(&superfile));
             first_row += n_docs;
         }
-        Self { spans, n_commits }
+        Self {
+            spans,
+            n_commits,
+            readers,
+        }
     }
 
     pub fn n_superfiles(&self) -> usize {
@@ -406,6 +523,11 @@ impl Layout {
 
     pub fn n_commits(&self) -> usize {
         self.n_commits
+    }
+
+    /// The graded files' readers, in span order.
+    pub fn readers(&self) -> &[Arc<SuperfileReader>] {
+        &self.readers
     }
 
     /// The declared average of the superfile holding `row`.
@@ -455,6 +577,27 @@ fn verify_doc_lengths(stored: &[u32], dl: &[u32], first_row: usize, label: &str)
             expected[bad]
         );
     }
+}
+
+/// Check one file against the oracle and read what it scores at: its
+/// stored document lengths must be the oracle's for the rows starting at
+/// `first_row`, and the totals those lengths imply come back with the
+/// average the file declares. Both tiers verify a file exactly this way —
+/// the supertable tier once per file of the fan-out, the superfile tier
+/// once for the whole corpus.
+fn verify_file(
+    fts: &FtsReader,
+    column: &str,
+    dl: &[u32],
+    first_row: usize,
+    label: &str,
+) -> (ColumnLengthStats, f64) {
+    let stored = fts
+        .column_doc_lengths(column)
+        .unwrap_or_else(|e| panic!("{label}: read doc lengths of {column:?}: {e}"));
+    verify_doc_lengths(&stored, dl, first_row, label);
+    let own = ColumnLengthStats::from_lengths(stored.iter().copied());
+    (own, declared_avgdl(fts, column))
 }
 
 /// The average document length `column` is scored at in one file: what
@@ -659,6 +802,13 @@ impl Oracle {
         &self.dl
     }
 
+    /// The battery's term vocabulary, sorted.
+    pub fn terms(&self) -> Vec<String> {
+        let mut terms: Vec<String> = self.term_index.keys().cloned().collect();
+        terms.sort();
+        terms
+    }
+
     /// Install the graded table's layout, which decides the average
     /// length Q normalizes each row with.
     pub fn set_layout(&mut self, layout: Layout) {
@@ -680,10 +830,10 @@ impl Oracle {
         (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
     }
 
-    fn tf_factor(tf: u32, dl: u32, avgdl: f64) -> f64 {
+    fn tf_factor(tf: u32, dl: u32, avgdl: f64, k1: f64, b: f64) -> f64 {
         let tf = f64::from(tf);
-        let norm = 1.0 - B + B * f64::from(dl) / avgdl.max(f64::MIN_POSITIVE);
-        tf / (tf + K1 * norm)
+        let norm = 1.0 - b + b * f64::from(dl) / avgdl.max(f64::MIN_POSITIVE);
+        tf / (tf + k1 * norm)
     }
 
     /// A battery query's clauses as atom indices. Every term and phrase was
@@ -712,10 +862,13 @@ impl Oracle {
         shoulds.extend(clauses.should_phrases.iter().map(|p| phrase_atom(p)));
         let mut negatives: Vec<Atom> = clauses.negatives.iter().map(term_atom).collect();
         negatives.extend(clauses.negative_phrases.iter().map(|p| phrase_atom(p)));
+        let pair = q.bm25.unwrap_or(Bm25Pair { k1: K1, b: B });
         ResolvedQuery {
             musts,
             shoulds,
             negatives,
+            k1: pair.k1,
+            b: pair.b,
         }
     }
 
@@ -740,8 +893,8 @@ impl Oracle {
         let mut engine_model = 0.0f64;
         let mut add = |atom: Atom, tf: u32| {
             let idf = self.idf(atom);
-            textbook += idf * Self::tf_factor(tf, dl, self.avgdl);
-            engine_model += idf * Self::tf_factor(tf, dl_q, avgdl_q);
+            textbook += idf * Self::tf_factor(tf, dl, self.avgdl, q.k1, q.b);
+            engine_model += idf * Self::tf_factor(tf, dl_q, avgdl_q, q.k1, q.b);
         };
         for &a in &q.musts {
             add(a, tf_of(a)?);
@@ -867,11 +1020,22 @@ struct EngineHit {
     score: f64,
 }
 
-/// How a tier answers one battery query: its hits at `k`, scored under
-/// `stats`. The supertable tier maps each hit to its row through the doc
-/// token of the returned text; on the superfile tier the local doc id is
-/// the row and the statistics scope is moot.
-type HitSource<'a> = dyn Fn(&QualityQuery, usize, Bm25Stats) -> Vec<EngineHit> + 'a;
+/// One tier's answers to the battery. `hits` returns the ranked hits at
+/// `k` under `stats`, or `None` where the tier cannot express the shape
+/// (the superfile tier has no query-time parameter override); `count`
+/// returns the unranked match count, or `None` where the tier's count
+/// surface cannot express the shape. `per_superfile_stats` adds the
+/// opt-in statistics scope's column.
+struct TierSurface<'a> {
+    hits: &'a HitSource<'a>,
+    count: &'a CountSource<'a>,
+    per_superfile_stats: bool,
+}
+
+/// A tier's ranked hits for a shape at `k` under a statistics scope.
+type HitSource<'a> = dyn Fn(&QualityQuery, usize, Bm25Stats) -> Option<Vec<EngineHit>> + 'a;
+/// A tier's unranked match count for a shape.
+type CountSource<'a> = dyn Fn(&QualityQuery) -> Option<u64> + 'a;
 
 /// Run `query` through the supertable's public search path and map each
 /// hit to its corpus row via the per-doc unique `doc{id:07}` token the
@@ -884,14 +1048,12 @@ fn supertable_hits(
     k: usize,
     stats: Bm25Stats,
 ) -> Vec<EngineHit> {
+    let mut options = Bm25SearchOptions::new().with_mode(q.mode).with_stats(stats);
+    if let Some(pair) = q.bm25 {
+        options = options.with_bm25(pair.k1 as f32, pair.b as f32);
+    }
     let batches = reader
-        .bm25_search(
-            column,
-            q.query,
-            k,
-            Bm25SearchOptions::new().with_mode(q.mode).with_stats(stats),
-            Some(&[column, "score"]),
-        )
+        .bm25_search(column, q.query, k, options, Some(&[column, "score"]))
         .expect("quality bm25_search");
     let mut hits = Vec::with_capacity(k);
     for batch in &batches {
@@ -954,6 +1116,29 @@ fn superfile_hits(
         .collect()
 }
 
+/// The token list and mode the superfile's `token_match_count` needs for
+/// `q`, or `None` where that surface cannot express the shape: phrases,
+/// negatives, or musts mixed with scoring-only shoulds. Under `And` every
+/// bare term is a must, so the whole query is an intersection.
+fn superfile_count_tokens(
+    tokenizer: &dyn Tokenizer,
+    q: &QualityQuery,
+) -> Option<(Vec<String>, BoolMode)> {
+    let clauses = tokenizer.parse(q.query).into_clauses(q.mode);
+    let has_phrase = !clauses.must_phrases.is_empty()
+        || !clauses.should_phrases.is_empty()
+        || !clauses.negative_phrases.is_empty();
+    if has_phrase || !clauses.negatives.is_empty() {
+        return None;
+    }
+    let owned = |v: &[Cow<'_, str>]| -> Vec<String> { v.iter().map(|c| c.to_string()).collect() };
+    match (clauses.musts.is_empty(), clauses.shoulds.is_empty()) {
+        (false, true) => Some((owned(&clauses.musts), BoolMode::And)),
+        (true, false) => Some((owned(&clauses.shoulds), BoolMode::Or)),
+        _ => None,
+    }
+}
+
 /// Tie-aware recall: the fraction of the `expected` slots filled by a
 /// returned document whose oracle score reaches the k-th oracle score,
 /// less a relative `tolerance` for rounding. A query with no matches
@@ -975,6 +1160,25 @@ fn tie_aware_recall(
     ok.min(expected) as f64 / expected as f64
 }
 
+/// Adjacent hit pairs that are out of order: a later hit with a higher
+/// engine score, or a pair whose Q order contradicts the engine's beyond
+/// the tie tolerance. The delta gate bounds each score; this bounds the
+/// sequence the caller actually receives.
+fn order_faults(hits: &[EngineHit], engine_model_of: impl Fn(u32) -> Option<f64>) -> usize {
+    hits.windows(2)
+        .filter(|w| {
+            let (a, b) = (&w[0], &w[1]);
+            if a.score < b.score {
+                return true;
+            }
+            match (engine_model_of(a.row), engine_model_of(b.row)) {
+                (Some(qa), Some(qb)) => qa < qb * (1.0 - TIE_TOLERANCE),
+                _ => true,
+            }
+        })
+        .count()
+}
+
 /// One graded `(query, k)` cell of the report.
 pub struct GradedRow {
     pub name: &'static str,
@@ -985,45 +1189,90 @@ pub struct GradedRow {
     pub recall_per_superfile_stats: Option<f64>,
     pub recall_engine_model: f64,
     pub max_delta: f64,
+    /// The engine's unranked match count, where the tier's count surface
+    /// expresses the shape.
+    pub count: Option<u64>,
+    /// See [`order_faults`].
+    pub order_faults: usize,
 }
 
 impl GradedRow {
-    /// Whether this cell passes both gates.
+    /// Whether the cell is within every gate that grades the engine
+    /// against its own formula: full engine-model recall, scores within
+    /// f32 noise of Q, the count kernels agreeing with the oracle, and an
+    /// ordered result.
+    pub fn passes_exactness(&self) -> bool {
+        self.recall_engine_model >= MIN_ENGINE_MODEL_RECALL
+            && self.max_delta <= MAX_SCORE_DELTA
+            && self.count.is_none_or(|c| c == self.n_matches as u64)
+            && self.order_faults == 0
+    }
+
+    /// [`Self::passes_exactness`] plus the textbook floor at the larger `k`.
     pub fn passes(&self) -> bool {
-        self.recall_engine_model >= MIN_ENGINE_MODEL_RECALL && self.max_delta <= MAX_SCORE_DELTA
+        self.passes_exactness()
+            && (self.k < TEXTBOOK_FLOOR_MIN_K || self.recall_textbook >= MIN_TEXTBOOK_RECALL)
     }
 
     fn failure(&self) -> String {
-        format!(
-            "{} k={}: recall vs engine BM25 {:.4} (floor {MIN_ENGINE_MODEL_RECALL}), max score Δ {:.4}% (ceiling {:.4}%)",
-            self.name,
-            self.k,
-            self.recall_engine_model,
-            self.max_delta * 100.0,
-            MAX_SCORE_DELTA * 100.0
-        )
+        let mut why = Vec::new();
+        if self.recall_engine_model < MIN_ENGINE_MODEL_RECALL {
+            why.push(format!(
+                "recall vs engine BM25 {:.4} (floor {MIN_ENGINE_MODEL_RECALL:.1})",
+                self.recall_engine_model
+            ));
+        }
+        if self.max_delta > MAX_SCORE_DELTA {
+            why.push(format!(
+                "max score Δ {:.4}% (ceiling {:.2}%)",
+                self.max_delta * 100.0,
+                MAX_SCORE_DELTA * 100.0
+            ));
+        }
+        if let Some(c) = self.count
+            && c != self.n_matches as u64
+        {
+            why.push(format!("count {c} (oracle {})", self.n_matches));
+        }
+        if self.order_faults > 0 {
+            why.push(format!("{} order faults", self.order_faults));
+        }
+        if self.k >= TEXTBOOK_FLOOR_MIN_K && self.recall_textbook < MIN_TEXTBOOK_RECALL {
+            why.push(format!(
+                "recall vs BM25 {:.4} (floor {MIN_TEXTBOOK_RECALL:.2})",
+                self.recall_textbook
+            ));
+        }
+        format!("{} k={}: {}", self.name, self.k, why.join(", "))
     }
 }
 
 /// Grade every `battery` shape at every `k` against `oracle`, whose
-/// layout must already be the graded table's, taking hits from `hits`.
-/// `per_superfile_stats` adds the opt-in statistics scope's column.
+/// layout must already be the graded table's, through `tier`. A shape the
+/// tier cannot express is skipped and named on stderr.
 fn grade_with(
     oracle: &Oracle,
     tokenizer: &dyn Tokenizer,
     battery: &[QualityQuery],
-    hits: &HitSource<'_>,
-    per_superfile_stats: bool,
+    tier: &TierSurface<'_>,
+    log_prefix: &str,
 ) -> Vec<GradedRow> {
     let mut rows: Vec<GradedRow> = Vec::new();
     for q in battery {
         let rq = oracle.resolve(tokenizer, q);
         let top = oracle.top_k(&rq);
+        let count = (tier.count)(q);
+        let textbook_of = |row| oracle.score_row(row, &rq).map(|(t, _)| t);
+        let engine_model_of = |row| oracle.score_row(row, &rq).map(|(_, e)| e);
         for (ki, &k) in QUALITY_KS.iter().enumerate() {
             let expected = k.min(top.n_matches);
-            let global = hits(q, k, Bm25Stats::Global);
-            let textbook_of = |row| oracle.score_row(row, &rq).map(|(t, _)| t);
-            let engine_model_of = |row| oracle.score_row(row, &rq).map(|(_, e)| e);
+            let Some(global) = (tier.hits)(q, k, Bm25Stats::Global) else {
+                eprintln!(
+                    "[{log_prefix}] quality: shape {} is not expressible on this tier; skipped",
+                    q.name
+                );
+                break;
+            };
             let recall_textbook = tie_aware_recall(
                 &global,
                 expected,
@@ -1031,16 +1280,19 @@ fn grade_with(
                 TIE_TOLERANCE,
                 textbook_of,
             );
-            let recall_per_superfile_stats = per_superfile_stats.then(|| {
-                let per_superfile = hits(q, k, Bm25Stats::PerSuperfile);
-                tie_aware_recall(
-                    &per_superfile,
-                    expected,
-                    top.textbook_kth[ki],
-                    TIE_TOLERANCE,
-                    textbook_of,
-                )
-            });
+            let recall_per_superfile_stats = tier
+                .per_superfile_stats
+                .then(|| (tier.hits)(q, k, Bm25Stats::PerSuperfile))
+                .flatten()
+                .map(|per_superfile| {
+                    tie_aware_recall(
+                        &per_superfile,
+                        expected,
+                        top.textbook_kth[ki],
+                        TIE_TOLERANCE,
+                        textbook_of,
+                    )
+                });
             let recall_engine_model = tie_aware_recall(
                 &global,
                 expected,
@@ -1063,45 +1315,114 @@ fn grade_with(
                 recall_per_superfile_stats,
                 recall_engine_model,
                 max_delta,
+                count,
+                order_faults: order_faults(&global, engine_model_of),
             });
         }
     }
     rows
 }
 
-/// Grade through a supertable reader's public search path, under both
-/// statistics scopes.
+/// Grade through a supertable reader's public search and count paths,
+/// under both statistics scopes.
 pub fn grade(
     oracle: &Oracle,
     reader: &SupertableReader,
     column: &str,
     tokenizer: &dyn Tokenizer,
     battery: &[QualityQuery],
+    log_prefix: &str,
 ) -> Vec<GradedRow> {
-    grade_with(
-        oracle,
-        tokenizer,
-        battery,
-        &|q, k, stats| supertable_hits(reader, column, q, k, stats),
-        true,
-    )
+    let tier = TierSurface {
+        hits: &|q, k, stats| Some(supertable_hits(reader, column, q, k, stats)),
+        count: &|q| {
+            Some(
+                reader
+                    .count(column, q.query, q.mode)
+                    .expect("quality count"),
+            )
+        },
+        per_superfile_stats: true,
+    };
+    grade_with(oracle, tokenizer, battery, &tier, log_prefix)
 }
 
-/// Grade through one superfile's search path.
+/// Grade through one superfile's search and count paths.
 pub fn grade_superfile(
     oracle: &Oracle,
     reader: &SuperfileReader,
     column: &str,
     tokenizer: &dyn Tokenizer,
     battery: &[QualityQuery],
+    log_prefix: &str,
 ) -> Vec<GradedRow> {
-    grade_with(
-        oracle,
-        tokenizer,
-        battery,
-        &|q, k, _| superfile_hits(reader, column, q, k),
-        false,
-    )
+    let tier = TierSurface {
+        hits: &|q, k, _| {
+            q.bm25
+                .is_none()
+                .then(|| superfile_hits(reader, column, q, k))
+        },
+        count: &|q| {
+            let (tokens, mode) = superfile_count_tokens(tokenizer, q)?;
+            let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            let (count, _) = block_on_inmem(reader.token_match_count(column, &refs, mode))
+                .expect("quality token_match_count");
+            Some(count)
+        },
+        per_superfile_stats: false,
+    };
+    grade_with(oracle, tokenizer, battery, &tier, log_prefix)
+}
+
+/// Where one battery term's postings landed across the graded files.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TermCoverage {
+    pub term: String,
+    /// Files holding the term.
+    pub files: usize,
+    /// Its document frequency summed over those files.
+    pub df: u64,
+    /// Long-form blocks by encoding, summed; `short_files` and
+    /// `inline_files` count the files where the term took those forms.
+    pub packed_blocks: usize,
+    pub patched_blocks: usize,
+    pub bitset_blocks: usize,
+    pub short_files: usize,
+    pub inline_files: usize,
+    /// Files whose long-form list carries a coarse block-max table.
+    pub coarse_files: usize,
+}
+
+/// The posting form each of `terms` took in each of `readers`, summed per
+/// term. This is how the battery's claim to reach every encoding is
+/// checked on every run: a corpus, format or threshold change that moves
+/// a term off its intended form shows up here.
+pub fn term_coverage(readers: &[&FtsReader], column: &str, terms: &[String]) -> Vec<TermCoverage> {
+    terms
+        .iter()
+        .map(|term| {
+            let mut c = TermCoverage {
+                term: term.clone(),
+                ..TermCoverage::default()
+            };
+            for fts in readers {
+                let Some(layout) = tiers::block_on(fts.term_layout(column, term))
+                    .unwrap_or_else(|e| panic!("term layout of {term:?}: {e}"))
+                else {
+                    continue;
+                };
+                c.files += 1;
+                c.df += layout.df;
+                c.packed_blocks += layout.packed_blocks;
+                c.patched_blocks += layout.patched_blocks;
+                c.bitset_blocks += layout.bitset_blocks;
+                c.short_files += usize::from(layout.short);
+                c.inline_files += usize::from(layout.inline);
+                c.coarse_files += usize::from(layout.has_coarse);
+            }
+            c
+        })
+        .collect()
 }
 
 /// The oracle for this process's synthetic corpus at `n_docs`, with the
@@ -1148,15 +1469,15 @@ fn assert_gates(rows: &[GradedRow], log_prefix: &str) {
         "[{log_prefix}] quality gate failed:\n  {}",
         failures.join("\n  ")
     );
+    let shapes = rows.iter().map(|r| r.name).collect::<HashSet<_>>().len();
     eprintln!(
-        "[{log_prefix}] quality OK: {} shapes × {} k within gates",
-        QUALITY_BATTERY.len(),
+        "[{log_prefix}] quality OK: {shapes} shapes × {} k within gates",
         QUALITY_KS.len()
     );
 }
 
 /// Build the oracle for the configured corpus, recover the table's
-/// layout, grade every battery shape through `reader`, emit the section
+/// layout, grade every battery shape through `reader`, emit the sections
 /// under `bench/fts/supertable/quality` and fail loudly if a gate is
 /// missed.
 pub fn run(
@@ -1179,9 +1500,32 @@ pub fn run(
         layout.n_commits()
     );
     let n_superfiles = layout.n_superfiles();
+    let fts_readers: Vec<&FtsReader> = layout
+        .readers()
+        .iter()
+        .map(|r| r.fts().expect("graded superfile has a full-text index"))
+        .collect();
+    let coverage = term_coverage(&fts_readers, column, &oracle.terms());
+    emit_coverage(
+        report,
+        "bench/fts/supertable/quality-coverage",
+        format!(
+            "Supertable FTS — posting form of every quality-battery term ({} docs, {} corpus, {n_superfiles} superfiles)",
+            fmt_count(n_docs),
+            flavor.label()
+        ),
+        &coverage,
+    );
     oracle.set_layout(layout);
 
-    let rows = grade(&oracle, reader, column, tokenizer.as_ref(), QUALITY_BATTERY);
+    let rows = grade(
+        &oracle,
+        reader,
+        column,
+        tokenizer.as_ref(),
+        QUALITY_BATTERY,
+        log_prefix,
+    );
     emit(
         report,
         "bench/fts/supertable/quality",
@@ -1201,7 +1545,7 @@ pub fn run(
 /// The superfile tier's quality phase: one file holding every row of the
 /// configured corpus, built in corpus order. Verifies the file's stored
 /// document lengths and declared average against the oracle, grades the
-/// battery through the string search path, emits the section under
+/// battery through the string search path, emits the sections under
 /// `bench/fts/superfile/quality` and fails loudly if a gate is missed.
 /// With one file the declared average is the file's own, so Q is exact
 /// by construction; this is where a kernel change is graded first.
@@ -1218,12 +1562,7 @@ pub fn run_superfile(
     let fts = reader
         .fts()
         .expect("the graded superfile has a full-text index");
-    let stored = fts
-        .column_doc_lengths(column)
-        .unwrap_or_else(|e| panic!("read doc lengths of {column:?}: {e}"));
-    verify_doc_lengths(&stored, oracle.doc_lengths(), 0, "the superfile");
-    let declared = declared_avgdl(fts, column);
-    let own = ColumnLengthStats::from_lengths(stored.iter().copied());
+    let (own, declared) = verify_file(fts, column, oracle.doc_lengths(), 0, "the superfile");
     let predicted = declared_under(&ColumnLengthStats::default(), &own);
     assert!(
         close_enough(declared, predicted),
@@ -1234,9 +1573,27 @@ pub fn run_superfile(
          declared avgdl {declared:.3}",
         fmt_count(n_docs)
     );
+    let coverage = term_coverage(&[fts], column, &oracle.terms());
+    emit_coverage(
+        report,
+        "bench/fts/superfile/quality-coverage",
+        format!(
+            "Superfile FTS — posting form of every quality-battery term ({} docs, {} corpus)",
+            fmt_count(n_docs),
+            flavor.label()
+        ),
+        &coverage,
+    );
     oracle.set_layout(Layout::single(n_docs, declared));
 
-    let rows = grade_superfile(&oracle, reader, column, tokenizer.as_ref(), QUALITY_BATTERY);
+    let rows = grade_superfile(
+        &oracle,
+        reader,
+        column,
+        tokenizer.as_ref(),
+        QUALITY_BATTERY,
+        log_prefix,
+    );
     emit(
         report,
         "bench/fts/superfile/quality",
@@ -1274,6 +1631,8 @@ fn emit(
     }
     headers.push("recall vs engine BM25".to_string());
     headers.push("max score Δ".to_string());
+    headers.push("count".to_string());
+    headers.push("order".to_string());
     let blocks = QUALITY_KS
         .iter()
         .map(|&k| Block {
@@ -1286,10 +1645,13 @@ fn emit(
                     let mut cells = vec![
                         text(r.name),
                         text(fmt_count(r.n_matches)),
-                        recall_cell(r.recall_textbook, false),
+                        recall_cell(r.recall_textbook, r.k >= TEXTBOOK_FLOOR_MIN_K),
                     ];
-                    if let Some(per_superfile_stats) = r.recall_per_superfile_stats {
-                        cells.push(recall_cell(per_superfile_stats, false));
+                    if per_superfile {
+                        cells.push(match r.recall_per_superfile_stats {
+                            Some(recall) => recall_cell(recall, false),
+                            None => text("–"),
+                        });
                     }
                     cells.push(recall_cell(r.recall_engine_model, true));
                     cells.push(metric(
@@ -1297,6 +1659,15 @@ fn emit(
                         format!("{:.4}%", r.max_delta * 100.0),
                         Better::Lower,
                     ));
+                    cells.push(text(match r.count {
+                        None => "–".to_string(),
+                        Some(c) if c == r.n_matches as u64 => "=".to_string(),
+                        Some(c) => format!("{} ≠", fmt_count(c as usize)),
+                    }));
+                    cells.push(text(match r.order_faults {
+                        0 => "ok".to_string(),
+                        n => format!("{n} faults"),
+                    }));
                     cells
                 })
                 .collect(),
@@ -1316,16 +1687,68 @@ fn emit(
              tie-aware (a hit is any returned doc scoring at least the oracle's k-th score). \
              `recall vs BM25` = textbook BM25 with exact doc lengths and the corpus-wide average \
              length — the user-facing quality, which pays for the one-byte length quantization \
-             and for each file normalizing with the average it declares.{per_superfile_note} \
+             and for each file normalizing with the average it declares; a tripwire floor of \
+             {textbook_floor:.2} applies from k = {floor_k}.{per_superfile_note} \
              `recall vs engine BM25` = BM25 with the engine's stored (quantized) lengths and \
              {engine_avgdl} — gated at {floor:.1}: a miss is a document the kernels' own formula \
              would not have returned. `max score Δ` = largest relative gap between an engine \
              score and that reference for the same doc — gated at {ceiling:.2}%, f32 arithmetic \
-             noise.",
+             noise. `count` = the unranked count kernels against the oracle's match count (`=` \
+             agrees, `–` not expressible on this tier). `order` = descending engine scores whose \
+             adjacent pairs agree with the reference's order.",
+            textbook_floor = MIN_TEXTBOOK_RECALL,
+            floor_k = TEXTBOOK_FLOOR_MIN_K,
             floor = MIN_ENGINE_MODEL_RECALL,
             ceiling = MAX_SCORE_DELTA * 100.0
         ),
         blocks,
+    });
+}
+
+/// Emit one tier's coverage section: the posting form each battery term
+/// took, summed over the graded files.
+fn emit_coverage(report: &mut Report, anchor: &str, title: String, rows: &[TermCoverage]) {
+    report.emit(&Section {
+        anchor: anchor.into(),
+        title,
+        note: "Every term the quality battery names, with the posting form it took in the graded \
+               file(s): `files` holding it, its document frequency summed over them, long-form \
+               blocks by encoding (packed / patched / bitset, summed), and the files where it \
+               took the short form (`df <= 128`, one bodiless block), the inline df=1 form, or \
+               carries a coarse block-max table. The battery is built so every form appears here \
+               at the reference scale; a term that moved off its intended form is a corpus, \
+               format or threshold change to look at."
+            .into(),
+        blocks: vec![Block {
+            subtitle: "battery terms".into(),
+            headers: vec![
+                "Term".into(),
+                "files".into(),
+                "df".into(),
+                "packed".into(),
+                "patched".into(),
+                "bitset".into(),
+                "short".into(),
+                "inline".into(),
+                "coarse".into(),
+            ],
+            rows: rows
+                .iter()
+                .map(|c| {
+                    vec![
+                        text(&c.term),
+                        text(c.files.to_string()),
+                        text(fmt_count(c.df as usize)),
+                        text(c.packed_blocks.to_string()),
+                        text(c.patched_blocks.to_string()),
+                        text(c.bitset_blocks.to_string()),
+                        text(c.short_files.to_string()),
+                        text(c.inline_files.to_string()),
+                        text(c.coarse_files.to_string()),
+                    ]
+                })
+                .collect(),
+        }],
     });
 }
 
@@ -1344,7 +1767,7 @@ mod tests {
 
     use infino::{
         storage::{LocalFsStorageProvider, StorageProvider},
-        superfile::{builder::FtsConfig, fts::tokenize::Phrase},
+        superfile::builder::FtsConfig,
         supertable::{Supertable, SupertableOptions},
         test_helpers::{brute_force_bm25::BruteForceBm25, build_title_batch, schema_id_title},
     };
@@ -1400,22 +1823,13 @@ mod tests {
                 .collect();
             let mut any_matches = 0;
             for (q, rq) in QUALITY_BATTERY.iter().zip(&resolved) {
-                let clauses = tokenizer.parse(q.query).into_clauses(q.mode);
-                let owned = |v: &[Cow<'_, str>]| -> Vec<String> {
-                    v.iter().map(|c| c.to_string()).collect()
-                };
-                let owned_phrases = |v: &[Phrase<Cow<'_, str>>]| -> Vec<Phrase<String>> {
-                    v.iter().map(|p| p.map(|c| c.to_string())).collect()
-                };
-                let expected = reference.top_k_atoms(
-                    &owned(&clauses.musts),
-                    &owned_phrases(&clauses.must_phrases),
-                    &owned(&clauses.shoulds),
-                    &owned_phrases(&clauses.should_phrases),
-                    &owned(&clauses.negatives),
-                    &owned_phrases(&clauses.negative_phrases),
-                    usize::MAX,
-                );
+                // The reference scores at the standard pair; the override
+                // shape is graded end to end against the engine instead.
+                if q.bm25.is_some() {
+                    continue;
+                }
+                let expected =
+                    reference.top_k_query(q.query, q.mode, tokenizer.as_ref(), usize::MAX);
                 let mut got = oracle.matches(rq);
                 got.sort_by(|a, b| {
                     b.textbook
@@ -1550,6 +1964,7 @@ mod tests {
             "title",
             tokenizer.as_ref(),
             QUALITY_BATTERY,
+            "test",
         );
         let worst_single = single.iter().map(|r| r.max_delta).fold(0.0, f64::max);
         assert!(
@@ -1573,10 +1988,13 @@ mod tests {
             "title",
             tokenizer.as_ref(),
             QUALITY_BATTERY,
+            "test",
         );
+        // The exactness gates only: on 600 docs the textbook column's
+        // tripwire floor is not meaningful.
         let failures: Vec<String> = rows
             .iter()
-            .filter(|r| !r.passes())
+            .filter(|r| !r.passes_exactness())
             .map(GradedRow::failure)
             .collect();
         assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -1584,6 +2002,49 @@ mod tests {
             rows.iter().any(|r| r.n_matches > 0),
             "the battery matched nothing on the test table"
         );
+    }
+
+    /// The coverage table reads each battery term's posting form from the
+    /// recovered layout's readers: the stopword is in every file, the
+    /// singleton is inline in exactly one, and a term the corpus lacks
+    /// (the rare tail at 600 docs) is in none.
+    #[test]
+    fn term_coverage_reports_each_terms_posting_form() {
+        let tokenizer = default_tokenizer();
+        let (_dir, st) = fragmented_table();
+        let reader = st.reader().expect("reader");
+        let oracle = Oracle::build(
+            TEST_DOCS,
+            TEST_SEED,
+            TextFlavor::Realistic,
+            tokenizer.as_ref(),
+            QUALITY_BATTERY,
+        );
+        let layout = Layout::recover(&reader, "title", oracle.doc_lengths());
+        let fts: Vec<&FtsReader> = layout
+            .readers()
+            .iter()
+            .map(|r| r.fts().expect("fts"))
+            .collect();
+        let coverage = term_coverage(&fts, "title", &oracle.terms());
+        let by_term = |t: &str| {
+            coverage
+                .iter()
+                .find(|c| c.term == t)
+                .unwrap_or_else(|| panic!("{t} missing from the coverage table"))
+                .clone()
+        };
+        let stopword = by_term("term00001");
+        assert_eq!(stopword.files, layout.n_superfiles());
+        assert!(stopword.df > 0);
+        let singleton = by_term("doc0000001");
+        assert_eq!(
+            (singleton.files, singleton.inline_files, singleton.df),
+            (1, 1, 1)
+        );
+        let absent = by_term("term200009");
+        assert_eq!(absent.files, 0);
+        assert_eq!(coverage.len(), oracle.terms().len());
     }
 
     #[test]
@@ -1607,6 +2068,7 @@ mod tests {
                 },
             ],
             n_commits: 2,
+            readers: Vec::new(),
         };
         assert_eq!(layout.avgdl_of(0), 10.0);
         assert_eq!(layout.avgdl_of(2), 10.0);
