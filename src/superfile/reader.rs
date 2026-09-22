@@ -1291,6 +1291,7 @@ impl SuperfileReader {
                 global_idf: None,
                 prefetched: None,
                 live_floor: None,
+                allow: None,
             },
             k,
             f32::NEG_INFINITY,
