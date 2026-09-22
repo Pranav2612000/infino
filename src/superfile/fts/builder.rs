@@ -3162,11 +3162,19 @@ impl FtsBuilder {
                     // holds one partition's triples, capped by the path budget,
                     // so the memory budget divided by the largest is how many
                     // run together. Pool width is the other bound.
-                    let largest_on_disk = partition_paths
+                    let sizes: Vec<u64> = partition_paths
                         .iter()
                         .filter_map(|path| fs::metadata(path).ok().map(|m| m.len()))
-                        .max()
-                        .unwrap_or(0);
+                        .collect();
+                    let largest_on_disk = sizes.iter().copied().max().unwrap_or(0);
+                    // The largest partition says nothing about how many take the
+                    // slow path: a Zipfian vocabulary puts the dense terms in a
+                    // few partitions and leaves the rest small. The count and the
+                    // total are what size this phase — the sort reads every byte
+                    // and writes a sorted copy, so its floor is twice the total
+                    // however it sorts.
+                    let total_on_disk: u64 = sizes.iter().sum();
+                    let over_threshold = sizes.iter().filter(|b| **b > max_partition_bytes).count();
                     // A sort holds the partition's triples, or one
                     // `max_partition_bytes` chunk once it is over that bound —
                     // so the width math clamps, but the span reports the real
@@ -3183,7 +3191,8 @@ impl FtsBuilder {
                         width = width,
                         pool_threads = pool_threads,
                         largest_bytes = largest_on_disk,
-                        over_inram_threshold = largest_on_disk > max_partition_bytes
+                        total_bytes = total_on_disk,
+                        partitions_over_threshold = over_threshold
                     )
                     .entered();
                     for (batch_idx, batch) in partition_paths.chunks(width).enumerate() {
