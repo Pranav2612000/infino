@@ -112,7 +112,7 @@ use crate::superfile::{
     },
     varint::read_varint,
 };
-use crate::utils::trace::detail_span;
+use crate::utils::trace::{detail_span, record};
 
 /// Per-column term interner table.
 ///
@@ -204,7 +204,12 @@ struct FinishProfile {
 impl FinishProfile {
     fn from_config() -> Self {
         Self {
-            enabled: crate::config::global().diagnostics.fts_profile,
+            // Also on under `detailed-tracing`, which is what feeds the
+            // phase fields on the `fts_emit` span. The cost is a few clock
+            // reads per term and per posting block — under a second on a
+            // corpus whose finish runs for minutes.
+            enabled: crate::config::global().diagnostics.fts_profile
+                || cfg!(feature = "detailed-tracing"),
             ..Self::default()
         }
     }
@@ -284,19 +289,21 @@ pub const DEFAULT_SPILL_PARTITIONS: usize = 128;
 /// Overridable per-builder via `FtsBuilder::set_max_partition_bytes(b)`.
 pub const DEFAULT_MAX_PARTITION_BYTES: u64 = 256 * 1024 * 1024;
 
-/// How many spill partitions sort at once.
+/// RAM the partition-sort pass may hold across all of its concurrent sorts.
 ///
-/// Each concurrent sort holds up to `max_partition_bytes` — the partition's
-/// triples for the in-RAM path, one chunk for the external-merge path — so
-/// this is the factor by which parallel sorting multiplies the finish's peak
-/// resident bytes. Four keeps that near 1 GiB at the default budget.
+/// One sort holds one partition's triples (or one `max_partition_bytes` chunk
+/// on the external-merge path), so this budget divided by what a partition
+/// actually weighs is how many fit at once. Sizing the width from the real
+/// file lengths rather than a fixed count matters because partitions shrink as
+/// `spill_partitions` rises: a flat cap leaves most of the pool idle on a
+/// corpus whose partitions are a fraction of the budget.
 ///
-/// Note what must NOT be done instead: dividing `max_partition_bytes` among
-/// the workers. That value is the threshold `open_partition_sorted` switches
-/// paths on, so shrinking it pushes partitions that used to radix-sort in RAM
-/// onto the external merge — a full spill-and-heap-merge round trip over
-/// every partition, which is far slower than the serial sort it replaced.
-const PARALLEL_PARTITION_SORTS: usize = 4;
+/// Bound the width, never `max_partition_bytes`. That value is the threshold
+/// [`open_partition_sorted`] switches paths on, so dividing it among workers
+/// pushes partitions that used to radix-sort in RAM onto the external merge —
+/// a full spill-and-heap-merge round trip over every partition, far slower
+/// than the serial sort it replaced.
+const PARTITION_SORT_MEMORY_BUDGET: u64 = 1024 * 1024 * 1024;
 
 /// Per-partition write buffer. 64 KiB matches the vector builder's
 /// bucket writer budget and amortizes syscall cost without pinning
@@ -3099,12 +3106,26 @@ impl FtsBuilder {
                     // — and peak RAM is held down by running a bounded batch
                     // at a time instead.
                     let positional = matches!(partitions, SpillStore::Positional { .. });
-                    let width = PARALLEL_PARTITION_SORTS.min(rayon::current_num_threads().max(1));
+                    // Width from what the partitions actually weigh: a sort
+                    // holds one partition's triples, capped by the path budget,
+                    // so the memory budget divided by the largest is how many
+                    // run together. Pool width is the other bound.
+                    let largest = partition_paths
+                        .iter()
+                        .filter_map(|path| fs::metadata(path).ok().map(|m| m.len()))
+                        .max()
+                        .unwrap_or(0)
+                        .min(max_partition_bytes)
+                        .max(1);
+                    let width = (PARTITION_SORT_MEMORY_BUDGET / largest)
+                        .clamp(1, rayon::current_num_threads().max(1) as u64)
+                        as usize;
                     let mut sorted_files: Vec<PathBuf> = Vec::with_capacity(partition_paths.len());
                     let sort_span = detail_span!(
                         "fts_partition_sort",
                         partitions = partition_paths.len(),
-                        width = width
+                        width = width,
+                        largest_bytes = largest
                     )
                     .entered();
                     for (batch_idx, batch) in partition_paths.chunks(width).enumerate() {
@@ -3187,7 +3208,16 @@ impl FtsBuilder {
                     let encode_skip_write_before = finish_profile.encode_skip_write;
                     let encode_block_write_before = finish_profile.encode_block_write;
                     let fst_insert_before = finish_profile.fst_insert;
-                    let emit_span = detail_span!("fts_emit").entered();
+                    let emit_span = detail_span!(
+                        "fts_emit",
+                        terms = tracing::field::Empty,
+                        encode_ms = tracing::field::Empty,
+                        gather_ms = tracing::field::Empty,
+                        block_build_ms = tracing::field::Empty,
+                        block_write_ms = tracing::field::Empty,
+                        fst_insert_ms = tracing::field::Empty,
+                    )
+                    .entered();
                     let n_emitted = match &partitions {
                         SpillStore::Plain(_) => merge_sorted_spill::<PLAIN_RECORD_LANES, _>(
                             &sorted_files,
@@ -3249,12 +3279,33 @@ impl FtsBuilder {
                             )?
                         }
                     };
-                    drop(emit_span);
                     n_terms_total_usize += n_emitted;
                     if finish_profile.enabled {
                         let merge_total = merge_profile_start.elapsed();
                         let encode_total = finish_profile.encode_total - encode_total_before;
                         let non_encode = merge_total.saturating_sub(encode_total);
+                        // Onto `fts_emit`, so the trace carries the split that
+                        // decides whether parallelizing the encode is worth it:
+                        // `encode_ms` is the per-term CPU that could fan out,
+                        // `gather_ms` the partition walk that cannot, and
+                        // `fst_insert_ms` the strictly-ordered dictionary build.
+                        record("terms", n_emitted as u64);
+                        record("encode_ms", encode_total.as_millis() as u64);
+                        record("gather_ms", non_encode.as_millis() as u64);
+                        record(
+                            "block_build_ms",
+                            (finish_profile.encode_block_build - encode_block_build_before)
+                                .as_millis() as u64,
+                        );
+                        record(
+                            "block_write_ms",
+                            (finish_profile.encode_block_write - encode_block_write_before)
+                                .as_millis() as u64,
+                        );
+                        record(
+                            "fst_insert_ms",
+                            (finish_profile.fst_insert - fst_insert_before).as_millis() as u64,
+                        );
                         debug!(
                             "[fts-profile] col='{}' merge_total={:.3}s non_encode_merge={:.3}s encode_total={:.3}s calls={} df1={} pfor={} block_build={:.3}s meta_write={:.3}s skip_write={:.3}s block_write={:.3}s fst_insert={:.3}s",
                             col_name,
@@ -3275,6 +3326,7 @@ impl FtsBuilder {
                             (finish_profile.fst_insert - fst_insert_before).as_secs_f64(),
                         );
                     }
+                    drop(emit_span);
 
                     // Sorted-partition scratch files are scoped to
                     // this column and only consumed by the k-way

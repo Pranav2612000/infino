@@ -27,6 +27,8 @@
 
 use std::{collections::BTreeMap, str::from_utf8, sync::Arc};
 
+use futures::stream::{self, StreamExt, TryStreamExt};
+
 use bytes::Bytes;
 use fst::Map;
 use thiserror::Error;
@@ -145,36 +147,64 @@ fn encode(covered: &[Uuid], entries: &BTreeMap<Vec<u8>, u64>) -> Vec<u8> {
 /// performs (one dictionary parse + coalesced header fetches per batch)
 /// — no posting bodies are read, which is what makes this a *light*
 /// stats-only pass rather than a compaction.
+/// Superfile dictionary walks in flight at once during a term-stats build.
+/// Each holds that superfile's per-column df list, so this bounds the pass's
+/// resident vocabulary rather than letting the whole membership land at once.
+const BUILD_SUPERFILE_CONCURRENCY: usize = 8;
+
 pub(crate) async fn build(
     readers: &[(Uuid, Arc<SuperfileReader>)],
 ) -> Result<Vec<u8>, TermStatsError> {
+    let mut covered: Vec<Uuid> = readers.iter().map(|(id, _)| *id).collect();
+    // Each superfile's dictionary walk is independent — the per-superfile
+    // maps only meet in the sum below — so they run concurrently instead of
+    // one superfile at a time. `buffered` keeps the whole membership's
+    // vocabularies from being resident at once and preserves input order.
+    let per_superfile = stream::iter(readers.iter().map(|(_, reader)| {
+        let reader = Arc::clone(reader);
+        async move { column_dfs(&reader).await }
+    }))
+    .buffered(BUILD_SUPERFILE_CONCURRENCY)
+    .try_collect::<Vec<_>>()
+    .await?;
+
     let mut merged: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
-    let mut covered: Vec<Uuid> = Vec::with_capacity(readers.len());
-    for (id, reader) in readers {
-        covered.push(*id);
-        let Some(fts) = reader.fts() else { continue };
-        let columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
-        for column in &columns {
-            let term_bytes = fts
-                .iter_column_terms(column)
-                .map_err(|e| TermStatsError::Build(format!("term walk: {e}")))?;
-            let terms: Vec<&str> = term_bytes
-                .iter()
-                .map(|t| from_utf8(t).map_err(|_| TermStatsError::Build("non-utf8 term".into())))
-                .collect::<Result<_, _>>()?;
-            for chunk in terms.chunks(BUILD_DF_BATCH_TERMS) {
-                let (dfs, _work) = reader
-                    .term_dfs(column, chunk)
-                    .await
-                    .map_err(|e| TermStatsError::Build(format!("df batch: {e}")))?;
-                for (term, df) in chunk.iter().zip(dfs) {
-                    *merged.entry(make_key(column, term)).or_insert(0) += df;
-                }
-            }
+    for counts in per_superfile {
+        for (key, df) in counts {
+            *merged.entry(key).or_insert(0) += df;
         }
     }
     covered.sort_unstable();
     Ok(encode(&covered, &merged))
+}
+
+/// Gross df per `(column, term)` key for one superfile.
+async fn column_dfs(reader: &SuperfileReader) -> Result<Vec<(Vec<u8>, u64)>, TermStatsError> {
+    let Some(fts) = reader.fts() else {
+        return Ok(Vec::new());
+    };
+    let columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
+    let mut out: Vec<(Vec<u8>, u64)> = Vec::new();
+    for column in &columns {
+        let term_bytes = fts
+            .iter_column_terms(column)
+            .map_err(|e| TermStatsError::Build(format!("term walk: {e}")))?;
+        let terms: Vec<&str> = term_bytes
+            .iter()
+            .map(|t| from_utf8(t).map_err(|_| TermStatsError::Build("non-utf8 term".into())))
+            .collect::<Result<_, _>>()?;
+        out.reserve(terms.len());
+        for chunk in terms.chunks(BUILD_DF_BATCH_TERMS) {
+            let (dfs, _work) = reader
+                .term_dfs(column, chunk)
+                .await
+                .map_err(|e| TermStatsError::Build(format!("df batch: {e}")))?;
+            for (term, df) in chunk.iter().zip(dfs) {
+                out.push((make_key(column, term), df));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Content-address and persist artifact bytes; returns the manifest
