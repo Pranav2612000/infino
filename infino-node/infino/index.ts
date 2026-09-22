@@ -111,6 +111,11 @@ export interface OptimizeOptions {
   /** How old a sealed tombstone sidecar has to be, in milliseconds,
    * before compaction treats its owner as dead and takes over. */
   staleSealTimeoutMs?: number;
+  /** When to recalibrate the vector probe laws (the O(N) query-serving
+   * calibration): `"auto"` (default — only when membership changed or the
+   * rerank pool lags), `"force"` (always), or `"skip"` (never; storage
+   * compaction still runs). Omit for `"auto"`. */
+  recalibrate?: "auto" | "force" | "skip";
 }
 
 export interface Bm25SearchOptions {
