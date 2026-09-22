@@ -301,6 +301,15 @@ pub const DEFAULT_SPILL_PARTITIONS: usize = 512;
 /// Overridable per-builder via `FtsBuilder::set_max_partition_bytes(b)`.
 pub const DEFAULT_MAX_PARTITION_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Terms whose postings are gathered before the emit drains them.
+///
+/// The gather runs one task per partition and the emit that follows is
+/// strictly serial, so this bounds what the parallel half holds: one
+/// window's posting runs, not the column's. Large enough that per-window
+/// bucketing is amortised over many terms, small enough that a window of
+/// dense terms stays well inside a few hundred MiB.
+const EMIT_WINDOW_TERMS: usize = 8192;
+
 /// RAM the partition-sort pass may hold across all of its concurrent sorts.
 ///
 /// One sort holds one partition's triples (or one `max_partition_bytes` chunk
@@ -3860,6 +3869,18 @@ struct TermScratch {
 /// posting's `tf` — and hands the term's assembled runs to the
 /// encoder. Returns the number of terms emitted.
 #[allow(clippy::too_many_arguments)]
+/// One term's postings as the parallel gather produced them, waiting for
+/// the serial emit. `slot` is its index in the window, which is lex order.
+struct GatheredTerm {
+    slot: usize,
+    term_id: u32,
+    /// `(doc_id, tf)` in ascending doc order.
+    group: Vec<(u32, u32)>,
+    /// The term's position runs concatenated in the same order, empty for
+    /// a positionless column.
+    run: Vec<u8>,
+}
+
 fn merge_sorted_spill<const N: usize, W: Write>(
     sorted_files: &[PathBuf],
     blob_mmaps: Option<&[Option<Mmap>]>,
@@ -3915,85 +3936,135 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     // only — each posting is read exactly once.
     let mut cursors: Vec<usize> = vec![0usize; sorted_slices.len()];
 
-    // Per-term buffers, reused across all terms in this column so we
-    // pay one growth schedule instead of one per term.
-    let mut group: Vec<(u32, u32)> = Vec::new();
-    let mut group_pos: Vec<u64> = Vec::new();
-    let mut term_run: Vec<u8> = Vec::new();
+    let positional = blob_mmaps.is_some();
     let mut n_emitted = 0usize;
-    for &term_id in term_id_in_lex_order {
-        let p = (term_id & mask) as usize;
-        let slice = sorted_slices[p];
-        let mut pos = cursors[p];
-        group.clear();
-        group_pos.clear();
-        // Drain the contiguous run for this term. Termination: either
-        // the partition runs out, or the next record's term_id differs
-        // (next term in this partition's lex-rank order, which can
-        // only be a strictly higher `lex_rank` and so a different
-        // `term_id`).
-        while pos < slice.len() {
-            let t = &slice[pos];
-            if triple_term_id(t) != term_id {
-                break;
-            }
-            group.push((triple_doc_id(t), triple_tf(t)));
-            if blob_mmaps.is_some() {
-                // The generic walk serves both widths; the offset
-                // lanes exist only on the positional record, which is
-                // the only case with `blob_mmaps` present.
-                debug_assert_eq!(N, POSITIONAL_RECORD_LANES);
-                let rec: &[u32; POSITIONAL_RECORD_LANES] =
-                    t[..].try_into().expect("positional record width");
-                group_pos.push(record_pos_off(rec));
-            }
-            pos += 1;
+    // A window of terms is gathered in parallel, then emitted in lex order.
+    //
+    // The gather is the expensive half and carries no ordering constraint,
+    // so it runs one task per partition: each walks its OWN sorted slice
+    // and positions blob forward. That is also the sequential access the
+    // single global walk could not have — consecutive terms in lex order
+    // land in different partitions (`term_id & mask`), so it hopped across
+    // every partition's mapping once per term.
+    //
+    // The emit stays strictly serial and in lex order: a term's encoded
+    // bytes embed the running postings-region offset, and the term
+    // dictionary accepts ascending keys only.
+    for window in term_id_in_lex_order.chunks(EMIT_WINDOW_TERMS) {
+        // Bucket the window by partition, keeping each partition's terms in
+        // window (lex) order — the order their records sit in that
+        // partition's slice, so one forward walk drains them all.
+        let mut by_partition: Vec<Vec<(usize, u32)>> = vec![Vec::new(); sorted_slices.len()];
+        for (slot, &term_id) in window.iter().enumerate() {
+            by_partition[(term_id & mask) as usize].push((slot, term_id));
         }
-        cursors[p] = pos;
-        if group.is_empty() {
-            // Term registered in `id_to_term` but no postings landed
-            // for it — only possible if the in-RAM flush ran with an
-            // empty postings vec. Defensive: skip without emitting.
-            continue;
-        }
-        let term_positions = match blob_mmaps.is_some() {
-            true => {
-                // Assemble the term's position runs in merged (doc)
-                // order: slice each posting's run out of the blob,
-                // its end found by skipping `tf` varints.
-                term_run.clear();
-                let blob = blob_slices[p];
-                for (i, &(_, tf)) in group.iter().enumerate() {
-                    let start = group_pos[i] as usize;
-                    let mut at = start;
-                    skip_run(blob, &mut at, tf).expect("builder-encoded blob runs are well-formed");
-                    term_run.extend_from_slice(&blob[start..at]);
+
+        // `cursors` is only read here; the advanced positions come back in
+        // the result and are applied below, so no partition state is shared
+        // mutably across tasks.
+        let drained: Vec<(usize, usize, Vec<GatheredTerm>)> = by_partition
+            .par_iter()
+            .enumerate()
+            .filter(|(_, terms)| !terms.is_empty())
+            .map(|(p, terms)| {
+                let slice = sorted_slices[p];
+                let blob: &[u8] = blob_slices.get(p).copied().unwrap_or(&[]);
+                let mut pos = cursors[p];
+                let mut out: Vec<GatheredTerm> = Vec::with_capacity(terms.len());
+                let mut group_pos: Vec<u64> = Vec::new();
+                for &(slot, term_id) in terms {
+                    let mut group: Vec<(u32, u32)> = Vec::new();
+                    group_pos.clear();
+                    // Drain the contiguous run for this term. Termination:
+                    // either the partition runs out, or the next record's
+                    // term_id differs (the next term in this partition's
+                    // lex-rank order, which can only be a strictly higher
+                    // `lex_rank` and so a different `term_id`).
+                    while pos < slice.len() {
+                        let t = &slice[pos];
+                        if triple_term_id(t) != term_id {
+                            break;
+                        }
+                        group.push((triple_doc_id(t), triple_tf(t)));
+                        if positional {
+                            // The generic walk serves both widths; the
+                            // offset lanes exist only on the positional
+                            // record, the only case with `blob_mmaps`.
+                            debug_assert_eq!(N, POSITIONAL_RECORD_LANES);
+                            let rec: &[u32; POSITIONAL_RECORD_LANES] =
+                                t[..].try_into().expect("positional record width");
+                            group_pos.push(record_pos_off(rec));
+                        }
+                        pos += 1;
+                    }
+                    if group.is_empty() {
+                        // Term registered in `id_to_term` but no postings
+                        // landed for it — only possible if the in-RAM flush
+                        // ran with an empty postings vec. Defensive: skip
+                        // without emitting.
+                        continue;
+                    }
+                    // Assemble the term's position runs in merged (doc)
+                    // order: slice each posting's run out of the blob, its
+                    // end found by skipping `tf` varints.
+                    let mut run: Vec<u8> = Vec::new();
+                    if positional {
+                        for (i, &(_, tf)) in group.iter().enumerate() {
+                            let start = group_pos[i] as usize;
+                            let mut at = start;
+                            skip_run(blob, &mut at, tf)
+                                .expect("builder-encoded blob runs are well-formed");
+                            run.extend_from_slice(&blob[start..at]);
+                        }
+                    }
+                    out.push(GatheredTerm {
+                        slot,
+                        term_id,
+                        group,
+                        run,
+                    });
                 }
-                Some((&mut *positions_sink, term_run.as_slice()))
+                (p, pos, out)
+            })
+            .collect();
+
+        // Scatter back into window order, which is lex order.
+        let mut in_lex_order: Vec<Option<GatheredTerm>> = (0..window.len()).map(|_| None).collect();
+        for (p, pos, terms) in drained {
+            cursors[p] = pos;
+            for term in terms {
+                let slot = term.slot;
+                in_lex_order[slot] = Some(term);
             }
-            false => None,
-        };
-        let term_bytes: &str = id_to_term[term_id as usize];
-        encode_and_emit_term(
-            term_bytes,
-            &group,
-            col_name_bytes,
-            col_doc_lengths,
-            avgdl,
-            params,
-            n_scored_docs,
-            key_buf,
-            postings_writer,
-            postings_crc_acc,
-            postings_len,
-            None,
-            Some(fst_streaming),
-            term_positions,
-            finish_profile,
-            term_scratch,
-            era,
-        )?;
-        n_emitted += 1;
+        }
+
+        for term in in_lex_order.into_iter().flatten() {
+            let term_positions = match positional {
+                true => Some((&mut *positions_sink, term.run.as_slice())),
+                false => None,
+            };
+            let term_bytes: &str = id_to_term[term.term_id as usize];
+            encode_and_emit_term(
+                term_bytes,
+                &term.group,
+                col_name_bytes,
+                col_doc_lengths,
+                avgdl,
+                params,
+                n_scored_docs,
+                key_buf,
+                postings_writer,
+                postings_crc_acc,
+                postings_len,
+                None,
+                Some(fst_streaming),
+                term_positions,
+                finish_profile,
+                term_scratch,
+                era,
+            )?;
+            n_emitted += 1;
+        }
     }
     // Sanity: every partition should now be fully drained. If not, we
     // lost or mis-ordered records somewhere upstream.
