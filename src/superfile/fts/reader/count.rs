@@ -317,6 +317,102 @@ impl FtsReader {
     /// ranges into a minimal set of parallel GETs). This matters on the
     /// global-statistics path, where a superfile is probed for every
     /// scored term of a query at once.
+    /// PFOR headers fetched per wave in [`Self::column_term_dfs`]. Bounds
+    /// both the coalesced range list and the fetched bytes held at once, so
+    /// the pass does not scale its resident memory with the vocabulary.
+    const DF_HEADER_WAVE_TERMS: usize = 8_192;
+
+    /// Every term of `column` with its gross df, in lex order.
+    ///
+    /// The df of every term is what the global term-stats artifact sums, and
+    /// asking for it term by term is what made that pass expensive: the
+    /// dictionary walk already yields each term's [`FstValue`], so looking the
+    /// term back up to recover it costs a key rebuild and a full FST traversal
+    /// per term, over the whole vocabulary. This keeps the walk's values and
+    /// only fetches what a value cannot answer — a PFOR term's df, which lives
+    /// in its header — in coalesced waves.
+    pub(crate) async fn column_term_dfs(
+        &self,
+        column: &str,
+    ) -> Result<Vec<(Vec<u8>, u64)>, FtsError> {
+        if !self.has_column(column) {
+            return Ok(Vec::new());
+        }
+        let fst_bytes = self.dict_bytes_async().await?;
+        let entries = collect_term_values(&fst_bytes, self.dict_layout, column)?;
+
+        let mut out: Vec<(Vec<u8>, u64)> = Vec::with_capacity(entries.len());
+        let mut header_ranges: Vec<(usize, Option<usize>)> = Vec::new();
+        let mut pfor_slots: Vec<(usize, bool)> = Vec::new();
+        for (term, value) in entries {
+            let slot = out.len();
+            match value {
+                FstValue::Inline { .. } => out.push((term, 1)),
+                FstValue::Pfor {
+                    metadata_offset,
+                    postings_length_hint,
+                    short,
+                } => {
+                    let len = match short {
+                        true => postings_length_hint.map(|l| l as usize),
+                        false => Some(TERM_META_SIZE),
+                    };
+                    header_ranges.push((metadata_offset as usize, len));
+                    pfor_slots.push((slot, short));
+                    out.push((term, 0));
+                }
+            }
+            // Drain in waves so neither the range list nor the fetched
+            // headers scale with the whole vocabulary.
+            if header_ranges.len() >= Self::DF_HEADER_WAVE_TERMS {
+                self.scatter_header_dfs(&header_ranges, &pfor_slots, &mut out)
+                    .await?;
+                header_ranges.clear();
+                pfor_slots.clear();
+            }
+        }
+        self.scatter_header_dfs(&header_ranges, &pfor_slots, &mut out)
+            .await?;
+        Ok(out)
+    }
+
+    /// Fetch one wave of PFOR headers and write each one's df into its slot.
+    async fn scatter_header_dfs(
+        &self,
+        header_ranges: &[(usize, Option<usize>)],
+        pfor_slots: &[(usize, bool)],
+        out: &mut [(Vec<u8>, u64)],
+    ) -> Result<(), FtsError> {
+        if header_ranges.is_empty() {
+            return Ok(());
+        }
+        let fetched = self.fetch_term_postings(header_ranges).await?;
+        for (fetched_idx, &(slot, short)) in pfor_slots.iter().enumerate() {
+            let header = fetched.get(fetched_idx).ok_or_else(|| {
+                FtsError::Read(ReadError::MalformedVersion(
+                    "column_term_dfs: fetched fewer headers than requested".into(),
+                ))
+            })?;
+            let header_bytes = header.as_ref();
+            out[slot].1 = match short {
+                true => u64::from(short_df(header_bytes).ok_or_else(|| {
+                    FtsError::Read(ReadError::MalformedVersion(
+                        "column_term_dfs: malformed short-form term body".into(),
+                    ))
+                })?),
+                false => {
+                    if header_bytes.len() < U32_BYTES {
+                        return Err(FtsError::Read(ReadError::MalformedVersion(
+                            "column_term_dfs: short postings header".into(),
+                        )));
+                    }
+                    read_u32_le(&header_bytes[0..U32_BYTES]) as u64
+                }
+            };
+        }
+        Ok(())
+    }
+
     pub async fn term_dfs(
         &self,
         column: &str,
@@ -544,6 +640,39 @@ mod tests {
         posting::{self, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
         tokenize::AsciiLowerTokenizer,
     };
+
+    /// The value-preserving walk must agree with the per-term lookup it
+    /// replaced, term for term. df feeds BM25 idf, so a divergence here is a
+    /// silent scoring change, not a performance one.
+    #[tokio::test]
+    async fn column_term_dfs_matches_the_per_term_lookup() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+
+        let walked = r.column_term_dfs("body").await.expect("walk dfs");
+        assert!(!walked.is_empty(), "fixture must plant terms");
+
+        let terms: Vec<String> = walked
+            .iter()
+            .map(|(t, _)| String::from_utf8(t.clone()).expect("utf8 term"))
+            .collect();
+        let as_str: Vec<&str> = terms.iter().map(String::as_str).collect();
+        let (looked_up, _work) = r.term_dfs("body", &as_str).await.expect("lookup dfs");
+
+        let walked_dfs: Vec<u64> = walked.iter().map(|(_, df)| *df).collect();
+        assert_eq!(
+            walked_dfs, looked_up,
+            "walk-preserved dfs must equal the lookup path's"
+        );
+        assert!(
+            walked_dfs.iter().all(|df| *df > 0),
+            "every planted term has at least one posting"
+        );
+        // Lex order is the artifact's contract: the merge sums by key.
+        let mut sorted = terms.clone();
+        sorted.sort();
+        assert_eq!(terms, sorted, "walk must yield terms in lex order");
+    }
 
     #[tokio::test]
     async fn token_match_or_unions_and_intersects_unranked() {

@@ -1674,6 +1674,28 @@ impl FtsReader {
     }
 }
 
+/// Every term of `column`'s dictionary in lex order, each with the
+/// [`FstValue`] the walk yielded alongside it.
+///
+/// [`collect_terms_with_prefix`] drops that value; a caller that needs it
+/// would otherwise have to rebuild the key and look the term back up, which
+/// is a full FST traversal per term over the whole vocabulary.
+pub(super) fn collect_term_values(
+    fst_bytes: &[u8],
+    layout: DictLayout,
+    column: &str,
+) -> Result<Vec<(Vec<u8>, FstValue)>, FtsError> {
+    let mut full_prefix = column.as_bytes().to_vec();
+    full_prefix.push(FST_SEPARATOR);
+    let column_prefix_len = full_prefix.len();
+    let dict = FtsReader::open_dict_with(fst_bytes, layout)?;
+    Ok(dict
+        .iter_prefix(&full_prefix)
+        .into_iter()
+        .map(|(key, value)| (key[column_prefix_len..].to_vec(), value))
+        .collect())
+}
+
 /// Every key of `column`'s dictionary that begins with `term_prefix`, in
 /// lex order, with the column key prefix stripped. The CPU half shared by
 /// the sync commit-time walk ([`FtsReader::iter_terms_with_prefix`]) and

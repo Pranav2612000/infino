@@ -53,9 +53,6 @@ const MAGIC: &[u8; 8] = b"INFTSTA1";
 const FORMAT_VERSION: u32 = 1;
 /// Header size before the covered-id array: magic + version + count.
 const HEADER_FIXED_LEN: usize = 8 + 4 + 4;
-/// Terms per `term_dfs` batch while building — bounds the coalesced
-/// header-fetch wave and the per-batch scratch.
-const BUILD_DF_BATCH_TERMS: usize = 8_192;
 /// Multipart threshold for the artifact PUT (same figure the
 /// slow-vector-state blob uses; a term-stats FST is far smaller).
 const STATS_MULTIPART_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
@@ -186,22 +183,19 @@ async fn column_dfs(reader: &SuperfileReader) -> Result<Vec<(Vec<u8>, u64)>, Ter
     let columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
     let mut out: Vec<(Vec<u8>, u64)> = Vec::new();
     for column in &columns {
-        let term_bytes = fts
-            .iter_column_terms(column)
+        // One walk that keeps the dictionary's own values. The earlier shape
+        // enumerated the terms, dropped each one's value, then looked every
+        // term back up to recover it — a key rebuild and a full FST traversal
+        // per term across the whole vocabulary.
+        let dfs = fts
+            .column_term_dfs(column)
+            .await
             .map_err(|e| TermStatsError::Build(format!("term walk: {e}")))?;
-        let terms: Vec<&str> = term_bytes
-            .iter()
-            .map(|t| from_utf8(t).map_err(|_| TermStatsError::Build("non-utf8 term".into())))
-            .collect::<Result<_, _>>()?;
-        out.reserve(terms.len());
-        for chunk in terms.chunks(BUILD_DF_BATCH_TERMS) {
-            let (dfs, _work) = reader
-                .term_dfs(column, chunk)
-                .await
-                .map_err(|e| TermStatsError::Build(format!("df batch: {e}")))?;
-            for (term, df) in chunk.iter().zip(dfs) {
-                out.push((make_key(column, term), df));
-            }
+        out.reserve(dfs.len());
+        for (term, df) in dfs {
+            let term =
+                from_utf8(&term).map_err(|_| TermStatsError::Build("non-utf8 term".into()))?;
+            out.push((make_key(column, term), df));
         }
     }
     Ok(out)
