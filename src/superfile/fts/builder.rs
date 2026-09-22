@@ -302,8 +302,23 @@ pub const DEFAULT_SPILL_PARTITIONS: usize = 512;
 /// sorted via external merge (chunked sort + k-way merge over
 /// sorted spill files) rather than being fully materialised in RAM.
 ///
+/// Set this above the largest partition a real corpus produces, because the
+/// external merge costs a full extra write and read of the partition and a
+/// heap merge on top. Raising [`DEFAULT_SPILL_PARTITIONS`] is NOT an
+/// alternative: a term's postings all hash to one partition and can never be
+/// split, so the largest partition is bounded below by the largest single
+/// term, however many partitions there are. A 10M-row corpus whose densest
+/// terms carry millions of postings each was measured at 331 MiB in its
+/// largest partition with 512 partitions — over the previous 256 MiB
+/// default, so every one of those sorts took the slow path.
+///
+/// This is a path threshold, not a memory ceiling: the sort pass's peak is
+/// bounded by [`PARTITION_SORT_MEMORY_BUDGET`], which divides by whatever a
+/// partition actually weighs to pick its width. Raising this value lowers
+/// that width rather than raising the peak.
+///
 /// Overridable per-builder via `FtsBuilder::set_max_partition_bytes(b)`.
-pub const DEFAULT_MAX_PARTITION_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_MAX_PARTITION_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Terms whose postings are gathered before the emit drains them.
 ///
