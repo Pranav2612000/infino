@@ -493,6 +493,7 @@ impl Supertable {
                 inputs = superfiles.len(),
                 input_bytes = tracing::field::Empty,
                 build_path = tracing::field::Empty,
+                reader_pool_threads = tracing::field::Empty,
             )
         )
     )]
@@ -626,6 +627,13 @@ impl Supertable {
         // storage. Run it on the reader pool and await a oneshot instead of
         // holding a tokio worker for the length of the merge.
         let reader_pool = Arc::clone(&manifest.options.reader_pool);
+        // The pool's own width, read here rather than inside the closure: paired
+        // with the `pool_threads` the sort reports, it separates "the pool is
+        // one thread" from "the work never reached the pool".
+        record(
+            "reader_pool_threads",
+            reader_pool.current_num_threads() as u64,
+        );
         let (merged_bytes, superfile_stats): (Bytes, MergedStats) = run_on_pool(
             Some(reader_pool.as_ref()),
             "compaction merge",

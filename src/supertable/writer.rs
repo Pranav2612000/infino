@@ -10477,10 +10477,14 @@ pub(in crate::supertable) async fn finalize_compaction_commit(
     pending_cache_inserts: Vec<(SuperfileUri, Bytes)>,
 ) {
     schedule_background_storage_reclaim(Arc::clone(&inner));
+    // Already async — await the fill directly rather than going through
+    // `warm_cache_after_commit`, whose sync bridge blocks the worker driving
+    // this future (see the drain's commit path for the deadlock it caused
+    // there). Same wall time, but the runtime keeps making progress.
     if !pending_cache_inserts.is_empty()
         && let Some(cache) = inner.options.disk_cache.as_ref().cloned()
     {
-        warm_cache_after_commit(&inner, &cache, pending_cache_inserts);
+        warm_cache_inserts(&cache, pending_cache_inserts).await;
     }
     if let (Some(cache), Some(budget)) = (
         inner.options.disk_cache.as_ref(),

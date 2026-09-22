@@ -279,6 +279,11 @@ pub const DEFAULT_SPILL_THRESHOLD_BYTES: usize = 256 * 1024 * 1024;
 /// per-partition size at the cost of more file handles.
 ///
 /// Overridable per-builder via `FtsBuilder::set_spill_partitions(n)`.
+///
+/// Raising this to widen the partition sort is a trap: the lex-order emit
+/// walk hops partitions per term (`partition = term_id & (n_part - 1)`), so
+/// more partitions means more interleaved read streams over the sorted files
+/// — and the emit's gather is the larger cost of the two phases.
 pub const DEFAULT_SPILL_PARTITIONS: usize = 128;
 
 /// Default in-memory budget per partition during the finish-time
@@ -303,7 +308,14 @@ pub const DEFAULT_MAX_PARTITION_BYTES: u64 = 256 * 1024 * 1024;
 /// pushes partitions that used to radix-sort in RAM onto the external merge —
 /// a full spill-and-heap-merge round trip over every partition, far slower
 /// than the serial sort it replaced.
-const PARTITION_SORT_MEMORY_BUDGET: u64 = 1024 * 1024 * 1024;
+///
+/// Peak is this value by construction — a sort holds at most
+/// `max_partition_bytes`, and the width is the budget divided by that — so
+/// the number is the bound, not an estimate. Set so the pool width is what
+/// limits the sort on a realistic corpus; at 1 GiB a corpus whose partitions
+/// approach `max_partition_bytes` is held to single-digit width however many
+/// cores are free, which is the regime this pass was slow in.
+const PARTITION_SORT_MEMORY_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Per-partition write buffer. 64 KiB matches the vector builder's
 /// bucket writer budget and amortizes syscall cost without pinning
@@ -3117,14 +3129,15 @@ impl FtsBuilder {
                         .unwrap_or(0)
                         .min(max_partition_bytes)
                         .max(1);
+                    let pool_threads = rayon::current_num_threads().max(1);
                     let width = (PARTITION_SORT_MEMORY_BUDGET / largest)
-                        .clamp(1, rayon::current_num_threads().max(1) as u64)
-                        as usize;
+                        .clamp(1, pool_threads as u64) as usize;
                     let mut sorted_files: Vec<PathBuf> = Vec::with_capacity(partition_paths.len());
                     let sort_span = detail_span!(
                         "fts_partition_sort",
                         partitions = partition_paths.len(),
                         width = width,
+                        pool_threads = pool_threads,
                         largest_bytes = largest
                     )
                     .entered();
