@@ -87,6 +87,7 @@ use std::{
 use bumpalo::Bump;
 use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
 use memmap2::Mmap;
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use tracing::debug;
 
@@ -281,6 +282,14 @@ pub const DEFAULT_SPILL_PARTITIONS: usize = 128;
 ///
 /// Overridable per-builder via `FtsBuilder::set_max_partition_bytes(b)`.
 pub const DEFAULT_MAX_PARTITION_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Floor for one worker's share of `max_partition_bytes` when partitions
+/// are sorted in parallel. The budget is split across the workers so
+/// parallel sorting holds no more RAM than the serial pass did; this stops
+/// a wide pool shrinking each share to the point where every partition
+/// takes the external-merge path. Never raises a share above the budget
+/// the caller configured — a deliberately tiny budget still means tiny.
+const MIN_PARTITION_SORT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Per-partition write buffer. 64 KiB matches the vector builder's
 /// bucket writer budget and amortizes syscall cost without pinning
@@ -1052,33 +1061,47 @@ fn spill_sorted_chunk<const N: usize>(
 #[cfg(test)]
 mod finish_debug {
     use std::{
-        cell::RefCell,
         path::{Path, PathBuf},
+        sync::{Mutex, MutexGuard},
     };
 
-    thread_local! {
-        // Thread-local so concurrent `cargo test` workers do not
-        // cross-pollute each other's observed chunk lists. Tests
-        // that drive the external-merge path build + finish on
-        // their own worker thread, so this stays isolated.
-        static OBSERVED_CHUNKS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    // Process-global rather than thread-local: partitions sort on the
+    // pool, so the chunk writes land on worker threads and not on the
+    // thread that started the finish. [`inspecting`] is what keeps
+    // concurrent `cargo test` workers from cross-polluting instead.
+    static OBSERVED_CHUNKS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static INSPECTING: Mutex<()> = Mutex::new(());
+
+    /// Held by a test across its whole reset → observe window, so two
+    /// tests reading the log can never interleave.
+    pub fn inspecting() -> MutexGuard<'static, ()> {
+        INSPECTING.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Clear the observed-chunks log. Tests call this before the
     /// build whose external-merge activity they want to inspect.
     pub fn reset() {
-        OBSERVED_CHUNKS.with(|c| c.borrow_mut().clear());
+        OBSERVED_CHUNKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Called by `spill_sorted_chunk` for every sorted-chunk file
     /// written during external-merge.
     pub fn record_chunk_path(path: &Path) {
-        OBSERVED_CHUNKS.with(|c| c.borrow_mut().push(path.to_path_buf()));
+        OBSERVED_CHUNKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(path.to_path_buf());
     }
 
     /// Snapshot of the observed-chunk-path list.
     pub fn observed() -> Vec<PathBuf> {
-        OBSERVED_CHUNKS.with(|c| c.borrow().clone())
+        OBSERVED_CHUNKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -3044,40 +3067,52 @@ impl FtsBuilder {
                     // O(n_partitions) cursors each holding one
                     // triple + a small read buffer.
                     let sort_start = finish_profile.enabled.then(Instant::now);
-                    let mut sorted_files: Vec<PathBuf> =
-                        Vec::with_capacity(partitions.n_partitions());
                     let partition_paths: Vec<PathBuf> = match &partitions {
                         SpillStore::Plain(parts) => parts.iter().map(|p| p.path.clone()).collect(),
                         SpillStore::Positional {
                             partitions: parts, ..
                         } => parts.iter().map(|p| p.path.clone()).collect(),
                     };
-                    for (partition_idx, partition_path) in partition_paths.iter().enumerate() {
-                        let sorted_path = scratch_path.join(format!(
-                            "fts_col{orig_col_idx}_part{partition_idx}.sorted.bin"
-                        ));
-                        match &partitions {
-                            SpillStore::Plain(_) => sort_partition_to_file::<PLAIN_RECORD_LANES>(
-                                partition_path,
-                                &sorted_path,
-                                max_partition_bytes,
-                                &scratch_path,
-                                &format!("c{orig_col_idx}_p{partition_idx}"),
-                                &lex_rank,
-                            )?,
-                            SpillStore::Positional { .. } => {
+                    // Each partition sorts from its own file into its own
+                    // output, sharing only immutable inputs, so the pass runs
+                    // on the ambient pool. Rayon caps the live sorts at the
+                    // pool width; the RAM budget is split the same way, so the
+                    // parallel pass holds no more than the serial one did.
+                    let positional = matches!(partitions, SpillStore::Positional { .. });
+                    let sort_budget = (max_partition_bytes
+                        / rayon::current_num_threads().max(1) as u64)
+                        .max(MIN_PARTITION_SORT_BYTES)
+                        .min(max_partition_bytes);
+                    let sorted_files: Vec<PathBuf> = partition_paths
+                        .par_iter()
+                        .enumerate()
+                        .map(|(partition_idx, partition_path)| {
+                            let sorted_path = scratch_path.join(format!(
+                                "fts_col{orig_col_idx}_part{partition_idx}.sorted.bin"
+                            ));
+                            let label = format!("c{orig_col_idx}_p{partition_idx}");
+                            if positional {
                                 sort_partition_to_file::<POSITIONAL_RECORD_LANES>(
                                     partition_path,
                                     &sorted_path,
-                                    max_partition_bytes,
+                                    sort_budget,
                                     &scratch_path,
-                                    &format!("c{orig_col_idx}_p{partition_idx}"),
+                                    &label,
                                     &lex_rank,
-                                )?
+                                )?;
+                            } else {
+                                sort_partition_to_file::<PLAIN_RECORD_LANES>(
+                                    partition_path,
+                                    &sorted_path,
+                                    sort_budget,
+                                    &scratch_path,
+                                    &label,
+                                    &lex_rank,
+                                )?;
                             }
-                        }
-                        sorted_files.push(sorted_path);
-                    }
+                            Ok(sorted_path)
+                        })
+                        .collect::<Result<Vec<_>, BuildError>>()?;
                     if let Some(t) = sort_start {
                         finish_profile.partition_sort += t.elapsed();
                     }
@@ -4927,6 +4962,7 @@ mod tests {
         // finish path is even taken; then 1 KiB per partition is
         // well below the dominant partition's on-disk size, so the
         // merge path is exercised on at least one partition.
+        let _inspecting = finish_debug::inspecting();
         finish_debug::reset();
         let mut tight = FtsBuilder::new(tokenizer());
         tight.set_spill_threshold_bytes(1);

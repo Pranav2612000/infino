@@ -74,7 +74,8 @@ use std::{
     fmt,
     io::{BufReader, BufWriter, Cursor, Error, Seek, SeekFrom, Write},
     str::from_utf8,
-    sync::Arc,
+    sync::{Arc, mpsc::sync_channel},
+    thread,
 };
 
 use arrow::compute::{concat_batches, take};
@@ -84,6 +85,7 @@ use parquet::basic::{Compression, ZstdLevel};
 use roaring::RoaringBitmap;
 use tempfile::{NamedTempFile, tempfile};
 
+use crate::runtime_bridge::carry_span;
 pub use crate::superfile::vector::builder::VectorConfig;
 use crate::superfile::{
     BuildError, FtsError, ReadError, SuperfileReader,
@@ -121,6 +123,7 @@ use crate::superfile::{
         rerank_codec::RerankCodec,
     },
 };
+use crate::utils::trace::detail_span;
 
 /// Per-column FTS configuration. The `column` must exist in
 /// `BuilderOptions.schema` and be `LargeUtf8` (an unstored column may
@@ -350,6 +353,13 @@ pub struct BuilderOptions {
 /// cost scales with page COUNT (selection planning / offset-index
 /// walks), not page decode volume.
 pub const DEFAULT_ID_PAGE_SIZE_LIMIT: usize = 8 * 1024;
+
+/// Buffered decoded inputs between the merge's decode and its encode. One
+/// is enough to keep the two overlapped, and it bounds what the handoff
+/// costs: the decoder holds one input, the buffer one, the encoder one, so
+/// three inputs' surviving rows are resident at the peak. Raising it buys
+/// no more overlap and scales that peak.
+const MERGE_DECODE_LOOKAHEAD: usize = 1;
 
 /// Append one batch's `_id` values to a stable-id sidecar buffer: each id as
 /// a little-endian `i128`, in the batch's row order. Returns `false` (leaving
@@ -1839,55 +1849,105 @@ impl SuperfileBuilder {
         let mut ids_ok = true;
         let id_column = superfile_builder.opts.id_column.clone();
 
-        for (idx, (reader, deleted)) in readers.iter().enumerate() {
-            superfile_builder.opts.check_mergeability(
-                reader.id_column(),
-                reader.schema(),
-                reader
-                    .fts()
-                    .map(|f| f.fts_columns_config().collect::<Vec<_>>()),
-                reader
-                    .vec()
-                    .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
-            )?;
+        // Decode runs one input ahead of the encode, so the next input's
+        // Parquet decode overlaps this one's posting carry and body write.
+        // A plain thread rather than the pool: the handoff is bounded, and a
+        // bounded send from a pool task deadlocks whenever the pool is busy
+        // enough that nobody steals the consumer.
+        let (decoded_tx, decoded_rx) =
+            sync_channel::<Result<(usize, Vec<RecordBatch>), BuildError>>(MERGE_DECODE_LOOKAHEAD);
+        thread::scope(|scope| -> Result<(), BuildError> {
+            scope.spawn(carry_span(move || {
+                for (idx, (reader, deleted)) in readers.iter().enumerate() {
+                    let _span = detail_span!("merge_read_batch", input = idx).entered();
+                    let decoded = reader
+                        .get_record_batches(deleted.clone())
+                        .map(|(_, batches)| (idx, batches))
+                        .map_err(|e| {
+                            BuildError::Io(Error::other(format!(
+                                "fts merge input {idx}: read RecordBatch failed: {e}"
+                            )))
+                        });
+                    let failed = decoded.is_err();
+                    // A closed receiver means the encode side already failed.
+                    if decoded_tx.send(decoded).is_err() || failed {
+                        return;
+                    }
+                }
+            }));
 
-            let record_batch = reader.get_record_batch(deleted.clone()).map_err(|e| {
-                BuildError::Io(Error::other(format!(
-                    "fts merge input {idx}: read RecordBatch failed: {e}"
-                )))
-            })?;
-            stats_collector.push(SuperfileStats::try_compute_from_record_batch(
-                &record_batch,
-            )?);
+            for message in decoded_rx {
+                let (idx, batches) = message?;
+                let (reader, deleted) = &readers[idx];
+                superfile_builder.opts.check_mergeability(
+                    reader.id_column(),
+                    reader.schema(),
+                    reader
+                        .fts()
+                        .map(|f| f.fts_columns_config().collect::<Vec<_>>()),
+                    reader
+                        .vec()
+                        .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
+                )?;
+                for batch in &batches {
+                    stats_collector.push(SuperfileStats::try_compute_from_record_batch(batch)?);
+                }
+                let n_rows: u32 = batches.iter().map(|b| b.num_rows() as u32).sum();
 
-            // Carry the input's prebuilt postings + doc-lengths across,
-            // remapped densely onto the output rows this batch is about to
-            // append (so it must run before `next_local_doc_id` advances).
-            superfile_builder.carry_fts_from_reader(reader, deleted.as_deref())?;
-
-            // Stream this input's surviving rows straight into the Parquet body
-            // and drop the batch — the corpus is never accumulated in RAM. The
-            // FTS index for these rows was already fed above from the input's
-            // prebuilt postings.
-            let n_rows = record_batch.num_rows() as u32;
-            body_encoder.write_batch(&record_batch)?;
-            // Sidecar from the same rows, same order, before the batch is
-            // dropped. Read from `record_batch` (not the FTS remap) so it
-            // aligns with the body exactly.
-            if ids_ok && !append_stable_id_sidecar(&mut id_sidecar_bytes, &record_batch, &id_column)
-            {
-                ids_ok = false;
-                id_sidecar_bytes = Vec::new();
+                // The posting carry and the body write touch disjoint state, so
+                // they run as two halves. Both read `next_local_doc_id` as the
+                // base for this input, so the increment stays after the join.
+                let (carried, written) = rayon::join(
+                    carry_span(|| {
+                        let _span =
+                            detail_span!("merge_carry_fts", input = idx, rows = n_rows).entered();
+                        // Carry the input's prebuilt postings + doc-lengths
+                        // across, remapped densely onto the output rows this
+                        // input is about to append.
+                        superfile_builder.carry_fts_from_reader(reader, deleted.as_deref())
+                    }),
+                    carry_span(|| -> Result<(), BuildError> {
+                        let _span =
+                            detail_span!("merge_write_body", input = idx, rows = n_rows).entered();
+                        // Stream the surviving rows straight into the Parquet
+                        // body; the corpus is never accumulated in RAM. The
+                        // sidecar is taken from the same batches in the same
+                        // order, so it aligns with the body exactly.
+                        for batch in &batches {
+                            body_encoder.write_batch(batch)?;
+                            if ids_ok
+                                && !append_stable_id_sidecar(
+                                    &mut id_sidecar_bytes,
+                                    batch,
+                                    &id_column,
+                                )
+                            {
+                                ids_ok = false;
+                                id_sidecar_bytes = Vec::new();
+                            }
+                        }
+                        Ok(())
+                    }),
+                );
+                carried?;
+                written?;
+                drop(batches);
+                superfile_builder.next_local_doc_id += n_rows;
             }
-            drop(record_batch);
-            superfile_builder.next_local_doc_id += n_rows;
-        }
+            Ok(())
+        })?;
 
         // Every input fully tombstoned → no rows: match `finish_to`'s
         // empty-superfile contract (write nothing, return the merged stats).
         if superfile_builder.next_local_doc_id == 0 {
             return Ok(SuperfileStats::from_children(stats_collector.as_slice()));
         }
+        let _finish_span = detail_span!(
+            "merge_finish",
+            rows = superfile_builder.next_local_doc_id,
+            inputs = readers.len()
+        )
+        .entered();
         let body = body_encoder.finish()?;
         let ids_bytes: &[u8] = if ids_ok { &id_sidecar_bytes } else { &[] };
         superfile_builder.finish_to_with_body(body, ids_bytes, output)?;

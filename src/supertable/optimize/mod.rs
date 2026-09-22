@@ -10,6 +10,7 @@ use crate::{
         error::{GcError, OptimizeError},
         wal::gc::GcError as WalGcError,
     },
+    utils::trace::detail_span,
 };
 
 impl Supertable {
@@ -30,26 +31,41 @@ impl Supertable {
         )
     )]
     pub fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError> {
-        self.drain_hidden_vector_cells_sync()
-            .map_err(|e| OptimizeError::Build(e.to_string()))?;
+        {
+            let _span = detail_span!("optimize_drain").entered();
+            self.drain_hidden_vector_cells_sync()
+                .map_err(|e| OptimizeError::Build(e.to_string()))?;
+        }
         self.compact(&opts.compaction)?;
         // Centroids have settled at the final generation (drain + compaction);
         // pre-build the centroid-router graph so the next centroid-graph query
         // loads it instead of building on the hot path. Best-effort.
-        self.refresh_centroid_router_cache();
+        {
+            let _span = detail_span!("optimize_centroid_router").entered();
+            self.refresh_centroid_router_cache();
+        }
         // Refresh the global term-stats sidecar over the post-merge
         // membership (compaction's removals dropped any prior reference —
         // see the manifest carry rule). Runs before gc so the sweep's live
         // set names the fresh artifact.
-        self.refresh_term_stats_sync()
-            .map_err(|e| OptimizeError::Build(e.to_string()))?;
-        match self.gc(opts.gc.safety_gap) {
-            Ok(_) | Err(GcError::NoStorage) => {}
-            Err(e) => return Err(OptimizeError::Gc(e)),
+        {
+            let _span = detail_span!("optimize_term_stats").entered();
+            self.refresh_term_stats_sync()
+                .map_err(|e| OptimizeError::Build(e.to_string()))?;
         }
-        match self.run_gc_sweep_once_blocking() {
-            Ok(_) | Err(WalGcError::NoStorageAttached) => {}
-            Err(e) => return Err(OptimizeError::WalGc(e)),
+        {
+            let _span = detail_span!("optimize_gc").entered();
+            match self.gc(opts.gc.safety_gap) {
+                Ok(_) | Err(GcError::NoStorage) => {}
+                Err(e) => return Err(OptimizeError::Gc(e)),
+            }
+        }
+        {
+            let _span = detail_span!("optimize_wal_gc").entered();
+            match self.run_gc_sweep_once_blocking() {
+                Ok(_) | Err(WalGcError::NoStorageAttached) => {}
+                Err(e) => return Err(OptimizeError::WalGc(e)),
+            }
         }
         Ok(())
     }

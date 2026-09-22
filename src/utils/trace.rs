@@ -141,6 +141,24 @@ pub(crate) fn detached(span: Span) -> Span {
 /// enclosing span never declared — or with no span entered — is a
 /// silent no-op, which is what makes the call sites safe to leave
 /// unconditional.
+/// A span at one phase of an operation, compiled away unless
+/// `detailed-tracing` is on — the gate every per-operation span uses.
+/// Expands to [`Span::none`] otherwise, so a call site reads the same either
+/// way and costs nothing in a normal build.
+macro_rules! detail_span {
+    ($name:literal $(, $field:ident = $value:expr)* $(,)?) => {{
+        #[cfg(feature = "detailed-tracing")]
+        {
+            tracing::info_span!($name $(, $field = $value)*)
+        }
+        #[cfg(not(feature = "detailed-tracing"))]
+        {
+            tracing::Span::none()
+        }
+    }};
+}
+pub(crate) use detail_span;
+
 pub(crate) fn record<V: Value>(field: &'static str, value: V) {
     if cfg!(feature = "detailed-tracing") {
         Span::current().record(field, value);

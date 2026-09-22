@@ -791,6 +791,24 @@ impl SuperfileReader {
         &self,
         deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
     ) -> Result<RecordBatch, ReadError> {
+        let (read_schema, batches) = self.get_record_batches(deleted_docs_bitmap)?;
+        concat_batches(&read_schema, &batches).map_err(|e| ReadError::Columnar(e.to_string()))
+    }
+
+    /// The same rows as [`get_record_batch`](Self::get_record_batch), left as
+    /// the decoder produced them instead of concatenated into one batch.
+    ///
+    /// The concat is a second full copy of the decoded rows, so a consumer
+    /// that only streams them forward — the FTS merge writing each input
+    /// into the Parquet body — takes this form and halves the decode's peak
+    /// RSS. Row-group and page boundaries in the re-encoded output are
+    /// unaffected: the Parquet writer cuts pages on accumulated size at its
+    /// own `write_batch_size` granularity, not on the caller's batch
+    /// boundaries.
+    pub(crate) fn get_record_batches(
+        &self,
+        deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+    ) -> Result<(Arc<Schema>, Vec<RecordBatch>), ReadError> {
         let bytes = self
             .bytes
             .as_ref()
@@ -827,10 +845,8 @@ impl SuperfileReader {
         let batches = reader
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ReadError::Columnar(e.to_string()))?;
-        let record_batch = concat_batches(&read_schema, &batches)
-            .map_err(|e| ReadError::Columnar(e.to_string()))?;
 
-        Ok(record_batch)
+        Ok((read_schema, batches))
     }
 
     /// A [`LazyByteSource`] over the **entire** superfile, regardless of

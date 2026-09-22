@@ -21,13 +21,10 @@ use std::{
 
 use bytes::Bytes;
 use chrono::Utc;
-use futures::{
-    future::join_all,
-    stream::{self, StreamExt},
-};
+use futures::stream::{self, StreamExt};
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
-use tokio::time;
+use tokio::{task, time};
 #[cfg(not(feature = "detailed-tracing"))]
 use tracing::Span;
 #[cfg(feature = "detailed-tracing")]
@@ -37,9 +34,10 @@ use uuid::Uuid;
 
 use crate::{
     config::CompactionSettings,
-    runtime_bridge::bridge_on_runtime,
+    runtime_bridge::{bridge_on_runtime, carry_span, run_on_pool},
     superfile::{
         builder::SuperfileBuilder,
+        stats::SuperfileStats as MergedStats,
         vector::{cell_posting::transcode_clamped_components, layout::VectorLayout},
     },
     supertable::{
@@ -60,6 +58,7 @@ use crate::{
             refresh_slow_vector_state, split_overflow_cells, try_commit_attempt,
         },
     },
+    utils::trace::{detail_span, record},
 };
 
 struct CompactionSlot<'a>(&'a AtomicBool);
@@ -487,7 +486,15 @@ impl Supertable {
     /// Merges the given superfiles into one
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(name = "merge_superfiles", skip_all, fields(inputs = superfiles.len()))
+        tracing::instrument(
+            name = "merge_superfiles",
+            skip_all,
+            fields(
+                inputs = superfiles.len(),
+                input_bytes = tracing::field::Empty,
+                build_path = tracing::field::Empty,
+            )
+        )
     )]
     pub(crate) async fn merge_superfiles(
         &self,
@@ -514,21 +521,41 @@ impl Supertable {
             .try_reserve(estimated_bytes)
             .map_err(|e| BuildError::MemoryBudgetExceeded(e.to_string()))?;
 
-        let mut superfile_readers_fut = Vec::with_capacity(superfiles.len());
+        // One task per input rather than one future per input polled from a
+        // single task: the GETs overlap either way, but only a task per input
+        // lets the footer parse that follows each one run on its own worker.
+        // Same shape as the query fan-out in `query::dispatch`.
+        let mut open_tasks = Vec::with_capacity(superfiles.len());
         for entry in superfiles {
             #[cfg(feature = "detailed-tracing")]
             let span = info_span!("compaction_input", superfile_id = %entry.superfile_id);
             #[cfg(not(feature = "detailed-tracing"))]
             let span = Span::none();
-            let open_fut = async {
-                let r = open_compaction_input(&store, disk_cache.as_ref(), storage.as_ref(), entry)
+            let store = Arc::clone(&store);
+            let disk_cache = disk_cache.clone();
+            let storage = storage.clone();
+            let entry = Arc::clone(entry);
+            open_tasks.push(task::spawn(
+                async move {
+                    let r = open_compaction_input(
+                        &store,
+                        disk_cache.as_ref(),
+                        storage.as_ref(),
+                        &entry,
+                    )
                     .await;
-                (entry.superfile_id, r)
-            }
-            .instrument(span);
-            superfile_readers_fut.push(open_fut);
+                    (entry.superfile_id, r)
+                }
+                .instrument(span),
+            ));
         }
-        let readers = join_all(superfile_readers_fut).await;
+        let mut readers = Vec::with_capacity(open_tasks.len());
+        for open in open_tasks {
+            readers.push(
+                open.await
+                    .map_err(|e| BuildError::Store(format!("compaction input open: {e}")))?,
+            );
+        }
 
         let now = Instant::now();
         if let Some(tombstone_cache) = &tombstone_cache {
@@ -565,67 +592,97 @@ impl Supertable {
         // what lets a compacted table score like an unfragmented one.
         let replaced: HashSet<Uuid> = superfiles.iter().map(|e| e.superfile_id).collect();
         let fts_corpus = manifest.fts_corpus_stats(&replaced);
-        let (merged_bytes, superfile_stats): (Bytes, _) = {
+        // Which merge kind runs is decided here, off the readers, and named on
+        // the span: an index-carrying merge and a full re-index cost wildly
+        // different amounts, and the trace could not tell them apart.
+        let (multi_cell, sq8_merge, has_vector) = {
             let first_vec = readers_with_tombstones
                 .first()
                 .and_then(|(reader, _)| reader.vec());
-            let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
-            let sq8_merge = first_vec.and_then(|v| {
-                v.vector_columns_config()
-                    .next()
-                    .map(|c| c.rerank_codec.is_ivf_mergeable())
-            });
-            // Every merge kind streams its output to a temp file and mmaps it
-            // back, so the corpus-sized merge output is never held as an anon
-            // Vec — the allocation that OOMs compaction on a memory-tight host.
-            // Mapped pages are file-backed and reclaimable; downstream publish
-            // takes `Bytes` unchanged (large superfiles already stream via
-            // put_multipart).
-            let mut output = NamedTempFile::new()
-                .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
-            let stats = {
-                let mut writer = BufWriter::new(output.as_file_mut());
-                let stats = if multi_cell && sq8_merge == Some(true) {
-                    SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers_to(
-                        &readers_with_tombstones,
-                        &superseded_per_reader,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                } else if sq8_merge == Some(true) {
-                    SuperfileBuilder::build_from_sq8_ivf_readers_to(
-                        &readers_with_tombstones,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                } else if first_vec.is_none() {
-                    // FTS/scalar inputs (no vector index): carry each input's
-                    // already-built posting lists across instead of
-                    // re-tokenizing the whole corpus.
-                    SuperfileBuilder::build_from_readers_fts_merge_to(
-                        &readers_with_tombstones,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                } else {
-                    // A vector index is present but not IVF-mergeable (e.g. an
-                    // fp32 rerank codec); the re-index path re-encodes both the
-                    // FTS and the vectors from the decoded rows.
-                    SuperfileBuilder::build_from_readers_to(
-                        &readers_with_tombstones,
-                        &fts_corpus,
-                        &mut writer,
-                    )?
-                };
-                writer
-                    .flush()
-                    .map_err(|e| BuildError::Store(format!("merge temp flush: {e}")))?;
-                stats
-            };
-            let bytes = mmap_readonly_bytes(output.path())
-                .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
-            (bytes, stats)
+            (
+                first_vec.is_some_and(|v| v.is_multi_cell()),
+                first_vec.and_then(|v| {
+                    v.vector_columns_config()
+                        .next()
+                        .map(|c| c.rerank_codec.is_ivf_mergeable())
+                }),
+                first_vec.is_some(),
+            )
         };
+        let build_path = if multi_cell && sq8_merge == Some(true) {
+            "multi_cell_sq8_ivf"
+        } else if sq8_merge == Some(true) {
+            "sq8_ivf"
+        } else if !has_vector {
+            "fts_carry"
+        } else {
+            "reindex"
+        };
+        record("input_bytes", input_bytes);
+        record("build_path", build_path);
+
+        // The build is pure CPU plus local scratch I/O — every input was
+        // fetched whole by `open_compaction_input`, so nothing here reaches
+        // storage. Run it on the reader pool and await a oneshot instead of
+        // holding a tokio worker for the length of the merge.
+        let reader_pool = Arc::clone(&manifest.options.reader_pool);
+        let (merged_bytes, superfile_stats): (Bytes, MergedStats) = run_on_pool(
+            Some(reader_pool.as_ref()),
+            "compaction merge",
+            carry_span(move || -> Result<(Bytes, MergedStats), BuildError> {
+                // Every merge kind streams its output to a temp file and mmaps
+                // it back, so the corpus-sized merge output is never held as an
+                // anon Vec — the allocation that OOMs compaction on a
+                // memory-tight host. Mapped pages are file-backed and
+                // reclaimable; downstream publish takes `Bytes` unchanged
+                // (large superfiles already stream via put_multipart).
+                let mut output = NamedTempFile::new()
+                    .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
+                let stats = {
+                    let mut writer = BufWriter::new(output.as_file_mut());
+                    let stats = match build_path {
+                        "multi_cell_sq8_ivf" => {
+                            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers_to(
+                                &readers_with_tombstones,
+                                &superseded_per_reader,
+                                &fts_corpus,
+                                &mut writer,
+                            )?
+                        }
+                        "sq8_ivf" => SuperfileBuilder::build_from_sq8_ivf_readers_to(
+                            &readers_with_tombstones,
+                            &fts_corpus,
+                            &mut writer,
+                        )?,
+                        // FTS/scalar inputs (no vector index): carry each
+                        // input's already-built posting lists across instead of
+                        // re-tokenizing the whole corpus.
+                        "fts_carry" => SuperfileBuilder::build_from_readers_fts_merge_to(
+                            &readers_with_tombstones,
+                            &fts_corpus,
+                            &mut writer,
+                        )?,
+                        // A vector index is present but not IVF-mergeable (e.g.
+                        // an fp32 rerank codec); the re-index path re-encodes
+                        // both the FTS and the vectors from the decoded rows.
+                        _ => SuperfileBuilder::build_from_readers_to(
+                            &readers_with_tombstones,
+                            &fts_corpus,
+                            &mut writer,
+                        )?,
+                    };
+                    writer
+                        .flush()
+                        .map_err(|e| BuildError::Store(format!("merge temp flush: {e}")))?;
+                    stats
+                };
+                let bytes = mmap_readonly_bytes(output.path())
+                    .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
+                Ok((bytes, stats))
+            }),
+        )
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))??;
 
         let shard = ShardOutput::new_with_params(
             merged_bytes,
@@ -802,6 +859,7 @@ impl Supertable {
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
             )
+            .instrument(detail_span!("compaction_commit", attempt = attempt))
             .await
             {
                 Ok(new_manifest) => {
@@ -810,14 +868,17 @@ impl Supertable {
                     // cache, same as a normal writer commit does. Without
                     // this every query against it misses and re-fetches +
                     // re-opens from storage every single time.
-                    if let Some((uri, bytes)) = bytes_for_store
-                        && let Err(e) = opts.store.insert(uri, bytes)
                     {
-                        warn!(
-                            superfile_id = %merged_superfile_id,
-                            error = %e,
-                            "compact: failed to warm reader cache for merged superfile"
-                        );
+                        let _span = detail_span!("compaction_cache_warm").entered();
+                        if let Some((uri, bytes)) = bytes_for_store
+                            && let Err(e) = opts.store.insert(uri, bytes)
+                        {
+                            warn!(
+                                superfile_id = %merged_superfile_id,
+                                error = %e,
+                                "compact: failed to warm reader cache for merged superfile"
+                            );
+                        }
                     }
                     // Drop the merged-away inputs so the in-memory cache
                     // doesn't grow forever across repeated compactions.
@@ -837,6 +898,7 @@ impl Supertable {
                         &entries_to_remove,
                         pending_cache_inserts,
                     )
+                    .instrument(detail_span!("compaction_finalize"))
                     .await;
                     return Ok(());
                 }
@@ -3022,6 +3084,70 @@ mod tests {
     /// old pre-compact files leaking back into results.
     fn latency_bench_count_hits(st: &Supertable, query: &str) -> u64 {
         st.count("title", query, BoolMode::Or).expect("count")
+    }
+
+    /// Wall time of one compaction pass over many small FTS superfiles —
+    /// the shape `optimize()` runs on a fragmented table. Scale via
+    /// `INFINO_COMPACT_BENCH_TOTAL_MB` (default 500) and
+    /// `INFINO_COMPACT_BENCH_N_SUPERFILES` (default 40).
+    #[ignore = "perf diagnostic; run with --ignored --nocapture"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_merge_throughput() {
+        const APPROX_BYTES_PER_DOC: u64 = 90;
+        const BROAD_TERM: &str = "broadterm";
+
+        let total_mb = env_usize("INFINO_COMPACT_BENCH_TOTAL_MB", 500);
+        let n_superfiles = env_usize("INFINO_COMPACT_BENCH_N_SUPERFILES", 40);
+        let total_docs = (total_mb as u64 * 1_000_000) / APPROX_BYTES_PER_DOC;
+        let docs_per_superfile = (total_docs as usize / n_superfiles).max(1);
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs provider"));
+        let st =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create supertable");
+
+        for i in 0..n_superfiles {
+            let shard_tag = format!("shard{i}");
+            let mut w = st.writer().expect("writer");
+            w.append(&latency_bench_shard_batch(
+                &shard_tag,
+                BROAD_TERM,
+                i * docs_per_superfile,
+                docs_per_superfile,
+            ))
+            .expect("append");
+            w.commit().expect("commit");
+        }
+
+        let n_before = st.reader().expect("reader").n_superfiles();
+        let docs_before = st.reader().expect("reader").n_docs_total();
+        let broad_hits_before = latency_bench_count_hits(&st, BROAD_TERM);
+
+        let started = Instant::now();
+        st.compact_async(&CompactionSettings {
+            target_superfile_size_mb: total_mb.max(1) as u64,
+            min_fill_percent: 1,
+            ..CompactionSettings::default()
+        })
+        .await
+        .expect("compact");
+        let elapsed = started.elapsed();
+
+        let n_after = st.reader().expect("reader").n_superfiles();
+        assert!(n_after < n_before, "compact should reduce superfile count");
+        assert_eq!(st.reader().expect("reader").n_docs_total(), docs_before);
+        assert_eq!(latency_bench_count_hits(&st, BROAD_TERM), broad_hits_before);
+
+        eprintln!(
+            "compact {n_before} -> {n_after} superfiles, {docs_before} docs, {total_mb}MB \
+             in {:.2}s ({:.1} MB/s)",
+            elapsed.as_secs_f64(),
+            total_mb as f64 / elapsed.as_secs_f64()
+        );
+
+        mem::forget(dir);
     }
 
     /// Warm `bm25_search` latency after merging many small superfiles
