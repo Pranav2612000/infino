@@ -278,13 +278,20 @@ pub const DEFAULT_SPILL_THRESHOLD_BYTES: usize = 256 * 1024 * 1024;
 /// partitions in global lex order. Higher values shrink the expected
 /// per-partition size at the cost of more file handles.
 ///
-/// Overridable per-builder via `FtsBuilder::set_spill_partitions(n)`.
+/// Sized so a partition lands under `max_partition_bytes` at corpus scale.
+/// That threshold is what [`open_partition_sorted`] switches sort paths on:
+/// a partition within it is read whole and radix-sorted in RAM, one above it
+/// takes the external merge — chunked sort, every chunk written back to disk,
+/// then a k-way heap merge. At 128 a multi-billion-posting column puts every
+/// partition over the threshold and the whole finish sorts the slow way;
+/// quartering the partition size puts them back under it.
 ///
-/// Raising this to widen the partition sort is a trap: the lex-order emit
-/// walk hops partitions per term (`partition = term_id & (n_part - 1)`), so
-/// more partitions means more interleaved read streams over the sorted files
-/// — and the emit's gather is the larger cost of the two phases.
-pub const DEFAULT_SPILL_PARTITIONS: usize = 128;
+/// The cost is more interleaved read streams in the emit walk, which hops
+/// partitions per term (`partition = term_id & (n_part - 1)`), plus one open
+/// file and one merge cursor per partition per column.
+///
+/// Overridable per-builder via `FtsBuilder::set_spill_partitions(n)`.
+pub const DEFAULT_SPILL_PARTITIONS: usize = 512;
 
 /// Default in-memory budget per partition during the finish-time
 /// sort pass. Partitions whose on-disk size exceeds this value are
@@ -3122,13 +3129,17 @@ impl FtsBuilder {
                     // holds one partition's triples, capped by the path budget,
                     // so the memory budget divided by the largest is how many
                     // run together. Pool width is the other bound.
-                    let largest = partition_paths
+                    let largest_on_disk = partition_paths
                         .iter()
                         .filter_map(|path| fs::metadata(path).ok().map(|m| m.len()))
                         .max()
-                        .unwrap_or(0)
-                        .min(max_partition_bytes)
-                        .max(1);
+                        .unwrap_or(0);
+                    // A sort holds the partition's triples, or one
+                    // `max_partition_bytes` chunk once it is over that bound —
+                    // so the width math clamps, but the span reports the real
+                    // size. The clamped figure saturates and cannot show
+                    // whether a partition is over the in-RAM threshold at all.
+                    let largest = largest_on_disk.min(max_partition_bytes).max(1);
                     let pool_threads = rayon::current_num_threads().max(1);
                     let width = (PARTITION_SORT_MEMORY_BUDGET / largest)
                         .clamp(1, pool_threads as u64) as usize;
@@ -3138,7 +3149,8 @@ impl FtsBuilder {
                         partitions = partition_paths.len(),
                         width = width,
                         pool_threads = pool_threads,
-                        largest_bytes = largest
+                        largest_bytes = largest_on_disk,
+                        over_inram_threshold = largest_on_disk > max_partition_bytes
                     )
                     .entered();
                     for (batch_idx, batch) in partition_paths.chunks(width).enumerate() {
