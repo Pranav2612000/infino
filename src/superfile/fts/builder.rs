@@ -187,6 +187,10 @@ struct FinishProfile {
     encode_skip_write: Duration,
     encode_block_write: Duration,
     fst_insert: Duration,
+    /// Gather halves, summed across the emit's workers — so both can
+    /// exceed the wall time of the phase that contains them.
+    gather_drain: Duration,
+    gather_positions: Duration,
     // Per-column phase totals (summed across columns; printed in the
     // [fts-finish] summary line at the end of finish_to).
     partition_flush: Duration,
@@ -3247,6 +3251,8 @@ impl FtsBuilder {
                     let encode_skip_write_before = finish_profile.encode_skip_write;
                     let encode_block_write_before = finish_profile.encode_block_write;
                     let fst_insert_before = finish_profile.fst_insert;
+                    let gather_drain_before = finish_profile.gather_drain;
+                    let gather_positions_before = finish_profile.gather_positions;
                     let emit_span = detail_span!(
                         "fts_emit",
                         terms = tracing::field::Empty,
@@ -3331,6 +3337,15 @@ impl FtsBuilder {
                         record("terms", n_emitted as u64);
                         record("encode_ms", encode_total.as_millis() as u64);
                         record("gather_ms", non_encode.as_millis() as u64);
+                        record(
+                            "drain_cpu_ms",
+                            (finish_profile.gather_drain - gather_drain_before).as_millis() as u64,
+                        );
+                        record(
+                            "positions_cpu_ms",
+                            (finish_profile.gather_positions - gather_positions_before).as_millis()
+                                as u64,
+                        );
                         record(
                             "block_build_ms",
                             (finish_profile.encode_block_build - encode_block_build_before)
@@ -3791,7 +3806,7 @@ fn assemble_and_write_blob<W: Write>(
 
     if finish_profile.enabled {
         debug!(
-            "[fts-finish] partition_flush={:.3}s lex_rank={:.3}s partition_sort={:.3}s mmap_open={:.3}s scratch_cleanup={:.3}s postings_close={:.3}s fst_close={:.3}s doc_lengths_emit={:.3}s blob_copy={:.3}s",
+            "[fts-finish] partition_flush={:.3}s lex_rank={:.3}s partition_sort={:.3}s mmap_open={:.3}s scratch_cleanup={:.3}s postings_close={:.3}s fst_close={:.3}s doc_lengths_emit={:.3}s blob_copy={:.3}s gather_drain={:.3}s gather_positions={:.3}s",
             finish_profile.partition_flush.as_secs_f64(),
             finish_profile.lex_rank_build.as_secs_f64(),
             finish_profile.partition_sort.as_secs_f64(),
@@ -3801,6 +3816,8 @@ fn assemble_and_write_blob<W: Write>(
             finish_profile.fst_close.as_secs_f64(),
             finish_profile.doc_lengths_emit.as_secs_f64(),
             finish_profile.blob_copy.as_secs_f64(),
+            finish_profile.gather_drain.as_secs_f64(),
+            finish_profile.gather_positions.as_secs_f64(),
         );
     }
 
@@ -3897,6 +3914,15 @@ struct PartitionGather {
     pairs: Vec<(u32, u32)>,
     runs: Vec<u8>,
     terms: Vec<GatheredTerm>,
+    /// Nanos this task spent walking its sorted slice — a sequential read
+    /// that should fall with worker count.
+    drain_ns: u64,
+    /// Nanos this task spent slicing position runs out of its blob. The
+    /// blob is written in `add_doc` order while the triples are read in
+    /// `(lex_rank, doc_id)` order, so these are scattered reads and are
+    /// the half that would not scale. Summed across workers, so it can
+    /// exceed the span's own duration.
+    positions_ns: u64,
 }
 
 fn merge_sorted_spill<const N: usize, W: Write>(
@@ -3956,6 +3982,11 @@ fn merge_sorted_spill<const N: usize, W: Write>(
 
     let positional = blob_mmaps.is_some();
     let mut n_emitted = 0usize;
+    // Summed across the gather's workers, so both can exceed the span's
+    // own duration; their ratio is what says whether the gather is bound
+    // by the sequential slice walk or by the scattered blob reads.
+    let mut drain_ns_total: u64 = 0;
+    let mut positions_ns_total: u64 = 0;
     // A window of terms is gathered in parallel, then emitted in lex order.
     //
     // The gather is the expensive half and carries no ordering constraint,
@@ -3995,9 +4026,12 @@ fn merge_sorted_spill<const N: usize, W: Write>(
                 let mut pairs: Vec<(u32, u32)> = Vec::new();
                 let mut runs: Vec<u8> = Vec::new();
                 let mut group_pos: Vec<u64> = Vec::new();
+                let mut drain_ns: u64 = 0;
+                let mut positions_ns: u64 = 0;
                 for &(slot, term_id) in terms {
                     let pairs_start = pairs.len();
                     group_pos.clear();
+                    let drain_start = Instant::now();
                     // Drain the contiguous run for this term. Termination:
                     // either the partition runs out, or the next record's
                     // term_id differs (the next term in this partition's
@@ -4020,6 +4054,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
                         }
                         pos += 1;
                     }
+                    drain_ns += drain_start.elapsed().as_nanos() as u64;
                     if pairs.len() == pairs_start {
                         // Term registered in `id_to_term` but no postings
                         // landed for it — only possible if the in-RAM flush
@@ -4032,6 +4067,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
                     // end found by skipping `tf` varints.
                     let runs_start = runs.len();
                     if positional {
+                        let positions_start = Instant::now();
                         for (i, &(_, tf)) in pairs[pairs_start..].iter().enumerate() {
                             let start = group_pos[i] as usize;
                             let mut at = start;
@@ -4039,6 +4075,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
                                 .expect("builder-encoded blob runs are well-formed");
                             runs.extend_from_slice(&blob[start..at]);
                         }
+                        positions_ns += positions_start.elapsed().as_nanos() as u64;
                     }
                     out.push(GatheredTerm {
                         slot,
@@ -4053,6 +4090,8 @@ fn merge_sorted_spill<const N: usize, W: Write>(
                     pairs,
                     runs,
                     terms: out,
+                    drain_ns,
+                    positions_ns,
                 }
             })
             .collect();
@@ -4064,6 +4103,8 @@ fn merge_sorted_spill<const N: usize, W: Write>(
             (0..window.len()).map(|_| None).collect();
         for (idx, gather) in drained.iter().enumerate() {
             cursors[gather.partition] = gather.cursor;
+            drain_ns_total += gather.drain_ns;
+            positions_ns_total += gather.positions_ns;
             for term in &gather.terms {
                 in_lex_order[term.slot] = Some((idx, term));
             }
@@ -4100,6 +4141,9 @@ fn merge_sorted_spill<const N: usize, W: Write>(
             n_emitted += 1;
         }
     }
+    finish_profile.gather_drain += Duration::from_nanos(drain_ns_total);
+    finish_profile.gather_positions += Duration::from_nanos(positions_ns_total);
+
     // Sanity: every partition should now be fully drained. If not, we
     // lost or mis-ordered records somewhere upstream.
     debug_assert!(
