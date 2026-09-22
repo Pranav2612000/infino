@@ -87,7 +87,7 @@ use tokio::{
     sync::mpsc::{Receiver, Sender, channel},
     time::sleep,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{
@@ -9257,25 +9257,44 @@ pub(in crate::supertable) async fn stamp_term_stats(
         let store = Arc::clone(&old.options.store);
         let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
         let opt_storage = old.options.storage.as_ref().map(Arc::clone);
-        let mut readers: Vec<(Uuid, Arc<SuperfileReader>)> = Vec::with_capacity(entries.len());
+        // One task per superfile: the opens are latency-bound, and awaiting
+        // them one at a time made this pass scale with superfile count.
+        //
+        // No background fills: this pass reads dictionaries and df headers
+        // only, and a fill here copies EVERY superfile — including
+        // compaction's fresh multi-GiB outputs — into the disk cache. On
+        // real object storage those fills outlive the optimize call and
+        // their reads bleed into whatever runs next (they surfaced as
+        // phantom user-data GETs in cold measurements that began while a
+        // fill was still draining).
+        let mut open_tasks = Vec::with_capacity(entries.len());
         for entry in entries {
-            // No background fills: this pass reads dictionaries and df
-            // headers only, and a fill here copies EVERY superfile —
-            // including compaction's fresh multi-GiB outputs — into the
-            // disk cache. On real object storage those fills outlive the
-            // optimize call and their reads bleed into whatever runs
-            // next (they surfaced as phantom user-data GETs in cold
-            // measurements that began while a fill was still draining).
-            let reader = open_reader(
-                &store,
-                disk_cache.as_ref(),
-                opt_storage.as_ref(),
-                entry,
-                false,
-            )
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
-            readers.push((entry.superfile_id, reader));
+            let store = Arc::clone(&store);
+            let disk_cache = disk_cache.as_ref().map(Arc::clone);
+            let opt_storage = opt_storage.as_ref().map(Arc::clone);
+            let entry = Arc::clone(entry);
+            open_tasks.push(tokio::spawn(
+                async move {
+                    let reader = open_reader(
+                        &store,
+                        disk_cache.as_ref(),
+                        opt_storage.as_ref(),
+                        &entry,
+                        false,
+                    )
+                    .await;
+                    reader.map(|r| (entry.superfile_id, r))
+                }
+                .in_current_span(),
+            ));
+        }
+        let mut readers: Vec<(Uuid, Arc<SuperfileReader>)> = Vec::with_capacity(open_tasks.len());
+        for open in open_tasks {
+            readers.push(
+                open.await
+                    .map_err(|e| BuildError::Store(e.to_string()))?
+                    .map_err(|e| BuildError::Store(e.to_string()))?,
+            );
         }
         let bytes = term_stats::build(&readers)
             .await

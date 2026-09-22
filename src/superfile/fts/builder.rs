@@ -112,6 +112,7 @@ use crate::superfile::{
     },
     varint::read_varint,
 };
+use crate::utils::trace::detail_span;
 
 /// Per-column term interner table.
 ///
@@ -283,13 +284,19 @@ pub const DEFAULT_SPILL_PARTITIONS: usize = 128;
 /// Overridable per-builder via `FtsBuilder::set_max_partition_bytes(b)`.
 pub const DEFAULT_MAX_PARTITION_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Floor for one worker's share of `max_partition_bytes` when partitions
-/// are sorted in parallel. The budget is split across the workers so
-/// parallel sorting holds no more RAM than the serial pass did; this stops
-/// a wide pool shrinking each share to the point where every partition
-/// takes the external-merge path. Never raises a share above the budget
-/// the caller configured — a deliberately tiny budget still means tiny.
-const MIN_PARTITION_SORT_BYTES: u64 = 16 * 1024 * 1024;
+/// How many spill partitions sort at once.
+///
+/// Each concurrent sort holds up to `max_partition_bytes` — the partition's
+/// triples for the in-RAM path, one chunk for the external-merge path — so
+/// this is the factor by which parallel sorting multiplies the finish's peak
+/// resident bytes. Four keeps that near 1 GiB at the default budget.
+///
+/// Note what must NOT be done instead: dividing `max_partition_bytes` among
+/// the workers. That value is the threshold `open_partition_sorted` switches
+/// paths on, so shrinking it pushes partitions that used to radix-sort in RAM
+/// onto the external merge — a full spill-and-heap-merge round trip over
+/// every partition, which is far slower than the serial sort it replaced.
+const PARALLEL_PARTITION_SORTS: usize = 4;
 
 /// Per-partition write buffer. 64 KiB matches the vector builder's
 /// bucket writer budget and amortizes syscall cost without pinning
@@ -2642,7 +2649,16 @@ impl FtsBuilder {
         // builds that *could* be served by either (regression-
         // gated by `build_above_threshold_spills_and_matches_in_
         // ram_byte_for_byte`).
-        if self.postings.iter().any(|c| c.is_spilled()) {
+        // Which path ran is named on the span: the two have completely
+        // different cost shapes, and a trace that cannot tell them apart
+        // cannot say which phases are even on the critical path.
+        let spilled = self.postings.iter().any(|c| c.is_spilled());
+        let _span = detail_span!(
+            "fts_finish",
+            path = if spilled { "spilled" } else { "inram" }
+        )
+        .entered();
+        if spilled {
             self.finish_to_spilled(w)
         } else {
             self.finish_to_inram(w)
@@ -3053,7 +3069,10 @@ impl FtsBuilder {
                     // observe that.
                     drop(term_to_id);
                     let lex_rank_start = finish_profile.enabled.then(Instant::now);
-                    let (lex_rank, term_id_in_lex_order) = build_lex_rank(&id_to_term);
+                    let (lex_rank, term_id_in_lex_order) = {
+                        let _span = detail_span!("fts_lex_rank").entered();
+                        build_lex_rank(&id_to_term)
+                    };
                     if let Some(t) = lex_rank_start {
                         finish_profile.lex_rank_build += t.elapsed();
                     }
@@ -3074,45 +3093,56 @@ impl FtsBuilder {
                         } => parts.iter().map(|p| p.path.clone()).collect(),
                     };
                     // Each partition sorts from its own file into its own
-                    // output, sharing only immutable inputs, so the pass runs
-                    // on the ambient pool. Rayon caps the live sorts at the
-                    // pool width; the RAM budget is split the same way, so the
-                    // parallel pass holds no more than the serial one did.
+                    // output, sharing only immutable inputs, so partitions run
+                    // concurrently. `max_partition_bytes` is passed through
+                    // untouched — it selects the sort path, not just a ceiling
+                    // — and peak RAM is held down by running a bounded batch
+                    // at a time instead.
                     let positional = matches!(partitions, SpillStore::Positional { .. });
-                    let sort_budget = (max_partition_bytes
-                        / rayon::current_num_threads().max(1) as u64)
-                        .max(MIN_PARTITION_SORT_BYTES)
-                        .min(max_partition_bytes);
-                    let sorted_files: Vec<PathBuf> = partition_paths
-                        .par_iter()
-                        .enumerate()
-                        .map(|(partition_idx, partition_path)| {
-                            let sorted_path = scratch_path.join(format!(
-                                "fts_col{orig_col_idx}_part{partition_idx}.sorted.bin"
-                            ));
-                            let label = format!("c{orig_col_idx}_p{partition_idx}");
-                            if positional {
-                                sort_partition_to_file::<POSITIONAL_RECORD_LANES>(
-                                    partition_path,
-                                    &sorted_path,
-                                    sort_budget,
-                                    &scratch_path,
-                                    &label,
-                                    &lex_rank,
-                                )?;
-                            } else {
-                                sort_partition_to_file::<PLAIN_RECORD_LANES>(
-                                    partition_path,
-                                    &sorted_path,
-                                    sort_budget,
-                                    &scratch_path,
-                                    &label,
-                                    &lex_rank,
-                                )?;
-                            }
-                            Ok(sorted_path)
-                        })
-                        .collect::<Result<Vec<_>, BuildError>>()?;
+                    let width = PARALLEL_PARTITION_SORTS.min(rayon::current_num_threads().max(1));
+                    let mut sorted_files: Vec<PathBuf> = Vec::with_capacity(partition_paths.len());
+                    let sort_span = detail_span!(
+                        "fts_partition_sort",
+                        partitions = partition_paths.len(),
+                        width = width
+                    )
+                    .entered();
+                    for (batch_idx, batch) in partition_paths.chunks(width).enumerate() {
+                        let base = batch_idx * width;
+                        let mut done: Vec<PathBuf> = batch
+                            .par_iter()
+                            .enumerate()
+                            .map(|(offset, partition_path)| {
+                                let partition_idx = base + offset;
+                                let sorted_path = scratch_path.join(format!(
+                                    "fts_col{orig_col_idx}_part{partition_idx}.sorted.bin"
+                                ));
+                                let label = format!("c{orig_col_idx}_p{partition_idx}");
+                                if positional {
+                                    sort_partition_to_file::<POSITIONAL_RECORD_LANES>(
+                                        partition_path,
+                                        &sorted_path,
+                                        max_partition_bytes,
+                                        &scratch_path,
+                                        &label,
+                                        &lex_rank,
+                                    )?;
+                                } else {
+                                    sort_partition_to_file::<PLAIN_RECORD_LANES>(
+                                        partition_path,
+                                        &sorted_path,
+                                        max_partition_bytes,
+                                        &scratch_path,
+                                        &label,
+                                        &lex_rank,
+                                    )?;
+                                }
+                                Ok(sorted_path)
+                            })
+                            .collect::<Result<Vec<_>, BuildError>>()?;
+                        sorted_files.append(&mut done);
+                    }
+                    drop(sort_span);
                     if let Some(t) = sort_start {
                         finish_profile.partition_sort += t.elapsed();
                     }
@@ -3157,6 +3187,7 @@ impl FtsBuilder {
                     let encode_skip_write_before = finish_profile.encode_skip_write;
                     let encode_block_write_before = finish_profile.encode_block_write;
                     let fst_insert_before = finish_profile.fst_insert;
+                    let emit_span = detail_span!("fts_emit").entered();
                     let n_emitted = match &partitions {
                         SpillStore::Plain(_) => merge_sorted_spill::<PLAIN_RECORD_LANES, _>(
                             &sorted_files,
@@ -3218,6 +3249,7 @@ impl FtsBuilder {
                             )?
                         }
                     };
+                    drop(emit_span);
                     n_terms_total_usize += n_emitted;
                     if finish_profile.enabled {
                         let merge_total = merge_profile_start.elapsed();
@@ -3471,6 +3503,7 @@ fn assemble_and_write_blob<W: Write>(
         InRam(Vec<u8>),
         Streamed { path: PathBuf, len: u64, crc: u32 },
     }
+    let fst_close_span = detail_span!("fts_dict_close").entered();
     let fst_close_start = finish_profile.enabled.then(Instant::now);
     let fst_source = match fst_sink {
         FstSinkFinish::InRam(db) => {
@@ -3519,6 +3552,7 @@ fn assemble_and_write_blob<W: Write>(
             }
         }
     };
+    drop(fst_close_span);
     if let Some(t) = fst_close_start {
         finish_profile.fst_close += t.elapsed();
     }
