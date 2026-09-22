@@ -305,10 +305,15 @@ pub const DEFAULT_MAX_PARTITION_BYTES: u64 = 256 * 1024 * 1024;
 ///
 /// The gather runs one task per partition and the emit that follows is
 /// strictly serial, so this bounds what the parallel half holds: one
-/// window's posting runs, not the column's. Large enough that per-window
-/// bucketing is amortised over many terms, small enough that a window of
-/// dense terms stays well inside a few hundred MiB.
-const EMIT_WINDOW_TERMS: usize = 8192;
+/// window's posting runs, not the column's.
+///
+/// Size it against [`DEFAULT_SPILL_PARTITIONS`], not in absolute terms: a
+/// window gives each partition only `window / n_partitions` terms, and a
+/// task that drains a handful of terms before stopping neither amortises
+/// its scheduling nor gets the sequential run through its mapping that is
+/// the point of gathering per partition. This keeps that quotient in the
+/// hundreds.
+const EMIT_WINDOW_TERMS: usize = 256 * 1024;
 
 /// RAM the partition-sort pass may hold across all of its concurrent sorts.
 ///
@@ -3869,16 +3874,29 @@ struct TermScratch {
 /// posting's `tf` — and hands the term's assembled runs to the
 /// encoder. Returns the number of terms emitted.
 #[allow(clippy::too_many_arguments)]
-/// One term's postings as the parallel gather produced them, waiting for
-/// the serial emit. `slot` is its index in the window, which is lex order.
+/// One term's postings within its partition's gather buffers. Ranges
+/// rather than owned `Vec`s: a window holds hundreds of thousands of
+/// terms, and two allocations apiece dominated the walk they were meant
+/// to speed up. `slot` is the term's index in the window, which is lex
+/// order.
 struct GatheredTerm {
     slot: usize,
     term_id: u32,
-    /// `(doc_id, tf)` in ascending doc order.
-    group: Vec<(u32, u32)>,
-    /// The term's position runs concatenated in the same order, empty for
-    /// a positionless column.
-    run: Vec<u8>,
+    /// Range into the partition's `pairs`, in ascending doc order.
+    pairs: (usize, usize),
+    /// Range into the partition's `runs`; empty for a positionless column.
+    run: (usize, usize),
+}
+
+/// One partition's gathered terms for a window, with their postings and
+/// position runs packed end to end.
+struct PartitionGather {
+    partition: usize,
+    /// The partition's slice cursor after draining this window.
+    cursor: usize,
+    pairs: Vec<(u32, u32)>,
+    runs: Vec<u8>,
+    terms: Vec<GatheredTerm>,
 }
 
 fn merge_sorted_spill<const N: usize, W: Write>(
@@ -3962,7 +3980,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
         // `cursors` is only read here; the advanced positions come back in
         // the result and are applied below, so no partition state is shared
         // mutably across tasks.
-        let drained: Vec<(usize, usize, Vec<GatheredTerm>)> = by_partition
+        let drained: Vec<PartitionGather> = by_partition
             .par_iter()
             .enumerate()
             .filter(|(_, terms)| !terms.is_empty())
@@ -3971,9 +3989,14 @@ fn merge_sorted_spill<const N: usize, W: Write>(
                 let blob: &[u8] = blob_slices.get(p).copied().unwrap_or(&[]);
                 let mut pos = cursors[p];
                 let mut out: Vec<GatheredTerm> = Vec::with_capacity(terms.len());
+                // Packed per partition: every term's postings end to end in
+                // one buffer, so a window costs two allocations per
+                // partition rather than two per term.
+                let mut pairs: Vec<(u32, u32)> = Vec::new();
+                let mut runs: Vec<u8> = Vec::new();
                 let mut group_pos: Vec<u64> = Vec::new();
                 for &(slot, term_id) in terms {
-                    let mut group: Vec<(u32, u32)> = Vec::new();
+                    let pairs_start = pairs.len();
                     group_pos.clear();
                     // Drain the contiguous run for this term. Termination:
                     // either the partition runs out, or the next record's
@@ -3985,7 +4008,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
                         if triple_term_id(t) != term_id {
                             break;
                         }
-                        group.push((triple_doc_id(t), triple_tf(t)));
+                        pairs.push((triple_doc_id(t), triple_tf(t)));
                         if positional {
                             // The generic walk serves both widths; the
                             // offset lanes exist only on the positional
@@ -3997,7 +4020,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
                         }
                         pos += 1;
                     }
-                    if group.is_empty() {
+                    if pairs.len() == pairs_start {
                         // Term registered in `id_to_term` but no postings
                         // landed for it — only possible if the in-RAM flush
                         // ran with an empty postings vec. Defensive: skip
@@ -4007,46 +4030,57 @@ fn merge_sorted_spill<const N: usize, W: Write>(
                     // Assemble the term's position runs in merged (doc)
                     // order: slice each posting's run out of the blob, its
                     // end found by skipping `tf` varints.
-                    let mut run: Vec<u8> = Vec::new();
+                    let runs_start = runs.len();
                     if positional {
-                        for (i, &(_, tf)) in group.iter().enumerate() {
+                        for (i, &(_, tf)) in pairs[pairs_start..].iter().enumerate() {
                             let start = group_pos[i] as usize;
                             let mut at = start;
                             skip_run(blob, &mut at, tf)
                                 .expect("builder-encoded blob runs are well-formed");
-                            run.extend_from_slice(&blob[start..at]);
+                            runs.extend_from_slice(&blob[start..at]);
                         }
                     }
                     out.push(GatheredTerm {
                         slot,
                         term_id,
-                        group,
-                        run,
+                        pairs: (pairs_start, pairs.len()),
+                        run: (runs_start, runs.len()),
                     });
                 }
-                (p, pos, out)
+                PartitionGather {
+                    partition: p,
+                    cursor: pos,
+                    pairs,
+                    runs,
+                    terms: out,
+                }
             })
             .collect();
 
-        // Scatter back into window order, which is lex order.
-        let mut in_lex_order: Vec<Option<GatheredTerm>> = (0..window.len()).map(|_| None).collect();
-        for (p, pos, terms) in drained {
-            cursors[p] = pos;
-            for term in terms {
-                let slot = term.slot;
-                in_lex_order[slot] = Some(term);
+        // Scatter back into window order, which is lex order. Each entry
+        // points at the partition that gathered it, so the emit reads the
+        // postings straight out of that partition's packed buffers.
+        let mut in_lex_order: Vec<Option<(usize, &GatheredTerm)>> =
+            (0..window.len()).map(|_| None).collect();
+        for (idx, gather) in drained.iter().enumerate() {
+            cursors[gather.partition] = gather.cursor;
+            for term in &gather.terms {
+                in_lex_order[term.slot] = Some((idx, term));
             }
         }
 
-        for term in in_lex_order.into_iter().flatten() {
+        for (idx, term) in in_lex_order.into_iter().flatten() {
+            let gather = &drained[idx];
+            let (run_start, run_end) = term.run;
             let term_positions = match positional {
-                true => Some((&mut *positions_sink, term.run.as_slice())),
+                true => Some((&mut *positions_sink, &gather.runs[run_start..run_end])),
                 false => None,
             };
+            let (pairs_start, pairs_end) = term.pairs;
             let term_bytes: &str = id_to_term[term.term_id as usize];
             encode_and_emit_term(
                 term_bytes,
-                &term.group,
+                &gather.pairs[pairs_start..pairs_end],
                 col_name_bytes,
                 col_doc_lengths,
                 avgdl,
