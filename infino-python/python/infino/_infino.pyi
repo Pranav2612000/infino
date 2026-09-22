@@ -218,4 +218,5 @@ class OptimizeOptions:
         min_fill_percent: int | None = ...,
         target_superfile_size_mb: int | None = ...,
         stale_seal_timeout_ms: int | None = ...,
+        recalibrate: Literal["auto", "force", "skip"] | None = ...,
     ) -> None: ...
