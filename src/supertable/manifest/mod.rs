@@ -33,6 +33,9 @@ pub mod list_prune;
 pub mod options_hash;
 pub mod part;
 pub mod partition;
+pub(crate) mod term_index;
+use term_index::TermIndex;
+
 pub mod term_range;
 pub mod term_stats;
 
@@ -275,6 +278,44 @@ impl SuperfileList {
             })
             .collect()
     }
+}
+
+/// Parts that hold at least one superfile the term index routes the
+/// query's term and prefix leaves to — intersected across leaves, as the
+/// summary-based part prune is. A leaf the index cannot answer imposes no
+/// constraint; `None` when no leaf was answered or a routed superfile has
+/// no recorded smallest id, so the caller keeps its summary-based choice.
+async fn parts_holding_routed_superfiles(
+    index: &TermIndex,
+    list: &Manifest,
+    leaves: &[PruneLeaf],
+) -> Option<HashSet<PartId>> {
+    let mut kept: Option<HashSet<PartId>> = None;
+    for leaf in leaves {
+        let Some(routed) = index.route_leaf(leaf).await else {
+            continue;
+        };
+        let mut id_mins: Vec<i128> = routed
+            .iter()
+            .map(|id| index.id_min_of(id))
+            .collect::<Option<_>>()?;
+        id_mins.sort_unstable();
+        let parts: HashSet<PartId> = list
+            .parts
+            .iter()
+            .filter(|p| {
+                let (lo, hi) = p.id_range;
+                let i = id_mins.partition_point(|m| *m < lo);
+                id_mins.get(i).is_some_and(|m| *m <= hi)
+            })
+            .map(|p| p.part_id)
+            .collect();
+        kept = Some(match kept {
+            None => parts,
+            Some(existing) => existing.intersection(&parts).copied().collect(),
+        });
+    }
+    kept
 }
 
 /// The hierarchical manifest. Outer wrapper around the
@@ -520,6 +561,8 @@ impl ManifestSnapshot {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts,
             tombstone_seqs,
             superseded_cells,
@@ -1102,6 +1145,17 @@ impl ManifestSnapshot {
         &self.superfile_list.superfiles
     }
 
+    /// Whether the table has no superfiles at all. Counted from the
+    /// list's parts when there is a list: a lazily loaded manifest's flat
+    /// view holds only what has been loaded, so its emptiness proves
+    /// nothing.
+    pub(crate) fn holds_no_superfiles(&self) -> bool {
+        match &self.list {
+            Some(list) => list.parts.iter().all(|p| p.n_superfiles == 0),
+            None => self.superfile_list.superfiles.is_empty(),
+        }
+    }
+
     pub(crate) async fn get_pruned_superfiles(
         &self,
         leaves: &[PruneLeaf],
@@ -1136,6 +1190,21 @@ impl ManifestSnapshot {
                         });
                     }
                 }
+                // With a term index that lists every live superfile, term and
+                // prefix leaves choose the parts to load exactly: route to
+                // superfiles, then keep the parts whose recorded id range
+                // holds a routed superfile's smallest id. Anything the index
+                // cannot answer leaves the summary-based choice in place.
+                if list.term_index_complete
+                    && let Some(index) = self.term_index().await
+                    && let Some(routed) =
+                        parts_holding_routed_superfiles(&index, list, leaves).await
+                {
+                    kept = Some(match kept {
+                        None => routed,
+                        Some(existing) => existing.intersection(&routed).copied().collect(),
+                    });
+                }
                 // Preserve manifest (time) order of the surviving parts.
                 let ordered: Vec<PartId> = match kept {
                     Some(set) => list
@@ -1150,6 +1219,12 @@ impl ManifestSnapshot {
             }
             None => Ok(hierarchical_iter::fallback_to_flat_superfiles(self)),
         }
+    }
+
+    /// Whether the term index lists every live superfile — the condition
+    /// under which part selection may trust it.
+    pub(crate) fn term_index_complete(&self) -> bool {
+        self.list.as_ref().is_some_and(|l| l.term_index_complete)
     }
 
     /// All superfile entries, loaded through the hierarchical part loader in
@@ -1294,28 +1369,75 @@ impl ManifestSnapshot {
         self.list.as_ref().and_then(|l| l.term_stats.as_ref())
     }
 
-    /// Successor manifest (bumped id) with the term-stats sidecar
-    /// reference stamped — the maintenance publish, mirroring
-    /// [`Self::with_slow_vector_state`].
-    pub(crate) fn with_term_stats(&self, reference: RoutingRef) -> Self {
+    /// This snapshot with `edit` applied to a copy of its list — a
+    /// successor on the next manifest id when `bump_id` (a maintenance
+    /// publish), otherwise an overlay on the same id for a commit to
+    /// publish. Everything else is shared with `self`.
+    fn with_list_edited(&self, bump_id: bool, edit: impl FnOnce(&mut Manifest)) -> Self {
         let next_id = self.get_next_manifest_id();
-        let new_list = self.list.as_ref().map(|list| {
+        let list = self.list.as_ref().map(|list| {
             let mut list = list.clone();
-            list.manifest_id = next_id;
-            list.term_stats = Some(reference.clone());
+            if bump_id {
+                list.manifest_id = next_id;
+            }
+            edit(&mut list);
             list
         });
         let mut superfile_list = self.superfile_list.clone();
-        superfile_list.manifest_id = next_id;
+        if bump_id {
+            superfile_list.manifest_id = next_id;
+        }
         Self {
             superfile_list,
-            list: new_list,
+            list,
             parts: self.parts.clone(),
             loader: self.loader.clone(),
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
         }
+    }
+
+    /// Successor manifest (bumped id) with the term-stats sidecar
+    /// reference stamped — the maintenance publish, mirroring
+    /// [`Self::with_slow_vector_state`].
+    pub(crate) fn with_term_stats(&self, reference: RoutingRef) -> Self {
+        self.with_list_edited(true, |list| list.term_stats = Some(reference))
+    }
+
+    /// The manifest's term-index root reference, when one has been built.
+    /// See `manifest::term_index`.
+    pub(crate) fn term_index_ref(&self) -> Option<&RoutingRef> {
+        self.list.as_ref().and_then(|l| l.term_index.as_ref())
+    }
+
+    /// The loaded term index for this snapshot, or `None` when the list
+    /// carries no reference, no storage is attached, or the load failed.
+    pub(crate) async fn term_index(&self) -> Option<Arc<TermIndex>> {
+        let reference = self.term_index_ref()?;
+        self.loader.as_ref()?.term_index(reference).await
+    }
+
+    /// This manifest with the term-index root reference replaced, id
+    /// unchanged — for a membership commit that publishes its delta in the
+    /// same CAS as the entries it covers, mirroring
+    /// [`Self::with_slow_vector_state_ref`]. `complete` records whether the
+    /// index lists every live superfile.
+    pub(crate) fn with_term_index_ref(&self, reference: RoutingRef, complete: bool) -> Self {
+        self.with_list_edited(false, |list| {
+            list.term_index = Some(reference);
+            list.term_index_complete = complete;
+        })
+    }
+
+    /// Successor manifest (bumped id) with the term-index root reference
+    /// stamped — the maintenance publish, mirroring [`Self::with_term_stats`].
+    /// A maintenance build covers the whole membership.
+    pub(crate) fn with_term_index(&self, reference: RoutingRef) -> Self {
+        self.with_list_edited(true, |list| {
+            list.term_index = Some(reference);
+            list.term_index_complete = true;
+        })
     }
 
     pub(crate) fn slow_vector_state_centroids_blob(&self) -> Option<&RoutingRef> {
@@ -1426,8 +1548,7 @@ impl ManifestSnapshot {
         hash: part::ContentHash,
         centroids: RoutingRef,
     ) -> Self {
-        let new_list = self.list.as_ref().map(|list| {
-            let mut list = list.clone();
+        self.with_list_edited(false, |list| {
             list.slow_vector_state_uri = Some(uri);
             list.slow_vector_state_content_hash = Some(hash);
             list.slow_vector_state_centroids = Some(centroids);
@@ -1436,17 +1557,7 @@ impl ManifestSnapshot {
             // separately via `with_slow_vector_state_graphs` — routed through
             // `CommitListMetadata` so it lands in the SAME membership commit as
             // `drained_ranges`, not a later settle.
-            list
-        });
-        Self {
-            superfile_list: self.superfile_list.clone(),
-            list: new_list,
-            parts: self.parts.clone(),
-            loader: self.loader.clone(),
-            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
-            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
-            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
-        }
+        })
     }
 
     /// Stamp ONLY the `hnsw` graph ref on an already-built successor, leaving
@@ -1456,20 +1567,7 @@ impl ManifestSnapshot {
     /// bump `manifest_id` (an overlay, like the other `CommitListMetadata`
     /// stamps); the successor id is set by the surrounding commit.
     pub(crate) fn with_slow_vector_state_graphs(&self, graphs: Option<RoutingRef>) -> Self {
-        let new_list = self.list.as_ref().map(|list| {
-            let mut list = list.clone();
-            list.slow_vector_state_graphs = graphs;
-            list
-        });
-        Self {
-            superfile_list: self.superfile_list.clone(),
-            list: new_list,
-            parts: self.parts.clone(),
-            loader: self.loader.clone(),
-            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
-            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
-            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
-        }
+        self.with_list_edited(false, |list| list.slow_vector_state_graphs = graphs)
     }
 
     /// Stamp (or replace) the partition strategy on this manifest snapshot.
@@ -2119,6 +2217,12 @@ impl ManifestSnapshot {
             } else {
                 None
             },
+            // The term index carries forward on every commit, removals
+            // included: its postings are per superfile, so a reader simply
+            // ignores those whose superfile is no longer live, and a
+            // superfile with no postings yet is probed directly.
+            term_index: self.list.as_ref().and_then(|l| l.term_index.clone()),
+            term_index_complete: self.list.as_ref().is_some_and(|l| l.term_index_complete),
             // The `hnsw` graph ref, by contrast, IS carried forward:
             // the graph is a function of which stable doc ids exist, not how
             // they are packed, so it survives a repack. The post-drain /
@@ -2366,6 +2470,11 @@ pub struct ManifestPartLoader {
     /// resident, shared across every part of the load. See
     /// [`OpenBlobBudget`].
     open_blob_budget: Arc<OpenBlobBudget>,
+    /// The term index the list references, loaded once per root and kept
+    /// for the loader's life. Keyed by root URI: a successor that carries
+    /// the same reference reuses it; a commit that published a delta has a
+    /// new root and loads that instead.
+    term_index: tokio::sync::Mutex<Option<Arc<TermIndex>>>,
 }
 
 impl ManifestPartLoader {
@@ -2404,6 +2513,37 @@ impl ManifestPartLoader {
             manifest_disk_cache,
             prefer_routing,
             open_blob_budget: Arc::new(OpenBlobBudget::new(DEFAULT_OPEN_BLOB_BUDGET_BYTES)),
+            term_index: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// The term index `reference` names, loaded on first use and reused
+    /// while the reference is unchanged. `None` when it cannot be loaded:
+    /// the caller routes the old way, trading latency for availability,
+    /// never correctness.
+    pub(crate) async fn term_index(&self, reference: &RoutingRef) -> Option<Arc<TermIndex>> {
+        let mut slot = self.term_index.lock().await;
+        if let Some(index) = slot.as_ref()
+            && index.root_uri() == reference.uri
+        {
+            return Some(Arc::clone(index));
+        }
+        match TermIndex::load(
+            Arc::clone(&self.storage),
+            self.manifest_disk_cache.clone(),
+            reference,
+        )
+        .await
+        {
+            Ok(index) => {
+                let index = Arc::new(index);
+                *slot = Some(Arc::clone(&index));
+                Some(index)
+            }
+            Err(e) => {
+                warn!(error = %e, uri = %reference.uri, "term index load failed; routing by manifest summaries instead");
+                None
+            }
         }
     }
 
@@ -2812,9 +2952,11 @@ pub struct SubsectionOffsets {
     /// batch so `VectorReader::open_lazy` can resolve header,
     /// directory, subheaders, and codec metadata from the overlay.
     pub vec_open_ranges: Vec<(u64, u64)>,
-    /// Absolute ranges that fully cover FTS open-time metadata:
-    /// header+dictionary and doc-length tables. Query-time postings
-    /// stay lazy.
+    /// Absolute ranges that cover what an FTS open reads: the header and
+    /// the doc-lengths directory for a current writer; older writers also
+    /// recorded the dictionary and the length arrays here, and the reader
+    /// still honours those. Postings, the dictionary and the length arrays
+    /// are otherwise read by the first query that needs them.
     pub fts_open_ranges: Vec<(u64, u64)>,
     /// the actual bytes covering the superfile's
     /// open-time batch (parquet footer tail + the
@@ -5062,6 +5204,8 @@ mod tests {
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
                 term_stats: None,
+                term_index: None,
+                term_index_complete: false,
                 parts: entries,
             }
         }
@@ -5565,6 +5709,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![list::ManifestPartEntry {
                 part_id: entry,
                 uri: "manifests/part-x".into(),
@@ -5747,6 +5893,8 @@ mod tests {
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
                 term_stats: None,
+                term_index: None,
+                term_index_complete: false,
                 parts: vec![],
             }),
             parts: DashMap::new(),
@@ -5887,6 +6035,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![part_entry(pa_id), part_entry(pb_id)],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -5965,6 +6115,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: Vec::new(),
         };
         // Storage must be attached: `new` only keeps the list (and builds
@@ -6094,6 +6246,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -6307,6 +6461,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![ManifestPartEntry {
                 part_id: part.part_id,
                 uri: part_uri(&full_hash),
@@ -6570,6 +6726,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -6726,6 +6884,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![
                 entry_for(&pw_a_old),
                 entry_for(&pw_a_latest),
@@ -6940,6 +7100,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -7046,6 +7208,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -7179,6 +7343,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri.clone(),
@@ -7302,6 +7468,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_old.part_id,
@@ -7441,6 +7609,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -7590,6 +7760,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -7753,6 +7925,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -7978,6 +8152,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -8081,6 +8257,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -8200,6 +8378,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -8342,6 +8522,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -8481,6 +8663,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -8574,6 +8758,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -8686,6 +8872,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -8821,6 +9009,8 @@ mod tests {
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
             term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts,
         }
     }
