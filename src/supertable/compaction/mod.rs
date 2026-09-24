@@ -2751,6 +2751,109 @@ mod tests {
         assert!(reader_after.n_superfiles() < before_n);
     }
 
+    /// After a compaction large enough that the merged blob stores its
+    /// documents in an order of its own, a search must still name the
+    /// row that actually carries the term.
+    ///
+    /// The existing compaction search test runs twenty documents, far
+    /// below the size at which an order is chosen, so it cannot reach
+    /// this path at all. Here every document carries a token unique to
+    /// it, so a returned row can be checked against the text it should
+    /// hold: an untranslated id would come back in range, with a real
+    /// score, naming the wrong document.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_compacted_table_names_the_right_rows_when_the_blob_reorders() {
+        // Comfortably past the threshold below which arrival order is kept.
+        const BATCHES: usize = 60;
+        const PER_BATCH: usize = 80;
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        let mut expected: Vec<String> = Vec::with_capacity(BATCHES * PER_BATCH);
+        for b in 0..BATCHES {
+            let titles: Vec<String> = (0..PER_BATCH)
+                .map(|i| {
+                    let n = b * PER_BATCH + i;
+                    format!("uq{n} shared t{} t{}", n % 37, n % 53)
+                })
+                .collect();
+            expected.extend(titles.iter().cloned());
+            let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            commit_titles(&st, &refs);
+        }
+
+        let before = st.manifest_id();
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+        assert!(
+            st.manifest_id() > before,
+            "compact must have run; adjust small_compact_cfg() if needed"
+        );
+
+        // Spread over the corpus so the check does not depend on where a
+        // document happened to land.
+        for &n in &[0usize, 1, 977, 2500, 4095, 4096, 4799] {
+            let want = expected[n].clone();
+            let token = format!("uq{n}");
+
+            // Ranked: the row a score is attached to must be the row
+            // holding the token.
+            let batches = st
+                .bm25_search(
+                    "title",
+                    &token,
+                    5,
+                    Bm25SearchOptions::new()
+                        .with_mode(BoolMode::And)
+                        .with_stats(Bm25Stats::Global),
+                    Some(&["title"]),
+                )
+                .unwrap_or_else(|e| panic!("bm25_search for {token}: {e}"));
+            assert_eq!(
+                titles_of(&batches),
+                vec![want.clone()],
+                "bm25_search for {token} named the wrong row"
+            );
+
+            // Unranked: the same, through the walk that returns bare ids.
+            let batches = st
+                .token_match("title", &token, BoolMode::And, Some(&["title"]))
+                .unwrap_or_else(|e| panic!("token_match for {token}: {e}"));
+            assert_eq!(
+                titles_of(&batches),
+                vec![want],
+                "token_match for {token} named the wrong row"
+            );
+        }
+
+        // A term every document carries still matches all of them, so the
+        // translation has not dropped or duplicated anything.
+        let n_shared: usize = st
+            .token_match("title", "shared", BoolMode::And, None)
+            .expect("token_match shared")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(n_shared, BATCHES * PER_BATCH, "every document carries it");
+    }
+
+    /// The `title` column of every row in a result, in order.
+    fn titles_of(batches: &[RecordBatch]) -> Vec<String> {
+        let mut out = Vec::new();
+        for b in batches {
+            let col = b.column_by_name("title").expect("title projected");
+            let arr = col
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("title is LargeUtf8");
+            for i in 0..b.num_rows() {
+                out.push(arr.value(i).to_string());
+            }
+        }
+        out
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn fts_search_returns_correct_results_after_compact() {
         let dir = TempDir::new().expect("tempdir");

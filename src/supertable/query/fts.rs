@@ -876,10 +876,16 @@ impl SupertableReader {
                             match prep {
                                 // Already-final shapes: the walk (and its
                                 // kernel time) happened inside
-                                // `prepare_clauses`; `run_prepared` would be
-                                // a no-op move and the bracket two wasted
-                                // schedstat reads.
-                                PreparedClauses::Done { hits, .. } => hits,
+                                // `prepare_clauses`. It still goes through
+                                // `run_prepared`, which is where a blob
+                                // storing its documents in an order of its
+                                // own turns them back into rows; taking the
+                                // hits directly would hand the caller blob
+                                // ids, and everything downstream reads them
+                                // as rows.
+                                prep @ PreparedClauses::Done { .. } => {
+                                    r.run_prepared(prep, bm25_params).map_err(fts_read_error)?
+                                }
                                 // Gate on posting mass, not term count: this
                                 // scan isn't sliced, so a rare-term query
                                 // with many terms can be cheaper than a

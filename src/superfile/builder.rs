@@ -4564,6 +4564,50 @@ mod tests {
             );
         }
 
+        // The unranked paths return bare ids rather than scored hits, and
+        // callers read them as ascending rows: a row-keyed bitmap is
+        // built from them and the exact-match second pass decodes them in
+        // order. So they must come back translated *and* still ascending.
+        let same_ids = |want: Vec<u32>, got: Vec<u32>, what: &str| {
+            assert!(
+                got.windows(2).all(|w| w[0] < w[1]),
+                "{what}: ids must be ascending and unique, got {:?}",
+                &got[..got.len().min(8)]
+            );
+            assert_eq!(want, got, "{what}: id sets differ");
+        };
+        for tokens in [&["t0"][..], &["common"][..], &["t0", "t41"][..]] {
+            same_ids(
+                reindex_fts
+                    .token_match("title", tokens, BoolMode::And)
+                    .await
+                    .expect("re-index token_match")
+                    .0,
+                merge_fts
+                    .token_match("title", tokens, BoolMode::And)
+                    .await
+                    .expect("merged token_match")
+                    .0,
+                &format!("token_match {tokens:?} (positions={positions}, deletes={deletes:?})"),
+            );
+        }
+        // And through the reader that decodes the rows those ids name:
+        // a wrong id here surfaces as a row whose text does not match.
+        let exact = title_for(7);
+        same_ids(
+            reindex_reader
+                .exact_match("title", &exact)
+                .await
+                .expect("re-index exact_match")
+                .0,
+            merge_reader
+                .exact_match("title", &exact)
+                .await
+                .expect("merged exact_match")
+                .0,
+            &format!("exact_match (positions={positions}, deletes={deletes:?})"),
+        );
+
         // A phrase reads positions, which are stored per document and so
         // travel with it when the order changes. Nothing else in the
         // blob is as easy to get subtly wrong under a permutation.
@@ -4581,6 +4625,24 @@ mod tests {
                     .await
                     .expect("merged phrase"),
                 &format!("phrase (deletes={deletes:?})"),
+            );
+            // The unranked phrase path, which is a different walk again.
+            let phrase = vec![crate::superfile::fts::tokenize::Phrase::adjacent(vec![
+                "t0".to_string(),
+                "t1".to_string(),
+            ])];
+            same_ids(
+                reindex_fts
+                    .atoms_match_ids("title", &[], &phrase, BoolMode::And)
+                    .await
+                    .expect("re-index atoms")
+                    .0,
+                merge_fts
+                    .atoms_match_ids("title", &[], &phrase, BoolMode::And)
+                    .await
+                    .expect("merged atoms")
+                    .0,
+                &format!("atoms_match_ids (deletes={deletes:?})"),
             );
         }
     }

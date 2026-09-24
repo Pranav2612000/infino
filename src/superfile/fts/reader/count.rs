@@ -155,7 +155,7 @@ impl FtsReader {
                 .map(|()| out)
         });
         work.kernel_cpu_ns = walk_ns;
-        Ok((walk?, work))
+        Ok((self.ids_to_rows(walk?), work))
     }
 
     /// Phrase-aware unranked match **count** — the atoms sibling of
@@ -266,7 +266,7 @@ impl FtsReader {
             BoolMode::Or => or_merge_unranked(cursors),
         });
         work.kernel_cpu_ns = walk_ns;
-        Ok((docs, work))
+        Ok((self.ids_to_rows(docs), work))
     }
 
     /// Unranked token-match **count** — the cardinality

@@ -759,12 +759,17 @@ impl FtsReader {
 
     /// CPU half paired with [`Self::prepare_clauses`] — scores the
     /// cursors it fetched. No I/O, so it can run on the reader pool.
-    /// Translate a kernel's doc ids into Parquet rows.
+    /// Translate a ranked kernel's doc ids into Parquet rows.
     ///
     /// The kernels work in the blob's own id space from end to end, so
-    /// every path that hands hits back to a caller passes them through
-    /// here exactly once. A no-op on any blob without a doc-id map,
-    /// which is every blob through `V7`.
+    /// anything handing hits to a caller passes them through here, once.
+    /// A no-op on any blob without a doc-id map, which is every blob
+    /// through `V7`.
+    ///
+    /// Order is left alone: a ranked result is ordered by score, and
+    /// translating ids does not disturb that. The unranked siblings
+    /// promise ascending ids instead, which translation *does* disturb,
+    /// so they use [`Self::ids_to_rows`].
     #[inline]
     pub(super) fn hits_to_rows(&self, mut hits: Vec<(u32, f32)>) -> Vec<(u32, f32)> {
         if self.has_doc_map() {
@@ -773,6 +778,26 @@ impl FtsReader {
             }
         }
         hits
+    }
+
+    /// Translate an unranked kernel's doc ids into Parquet rows, kept
+    /// ascending.
+    ///
+    /// The unranked walks emit ids in blob order, which callers read as
+    /// ascending row order: a row-keyed bitmap is built from them, a
+    /// membership filter is probed with them, and the exact-match second
+    /// pass decodes them in order. On a blob storing its documents in an
+    /// order of its own those are different orders, so this re-sorts;
+    /// there is nothing to re-sort when there is no map.
+    #[inline]
+    pub(super) fn ids_to_rows(&self, mut ids: Vec<u32>) -> Vec<u32> {
+        if self.has_doc_map() {
+            for id in &mut ids {
+                *id = self.row_of(*id);
+            }
+            ids.sort_unstable();
+        }
+        ids
     }
 
     pub(crate) fn run_prepared(&self, prep: PreparedClauses) -> Result<Vec<(u32, f32)>, FtsError> {
