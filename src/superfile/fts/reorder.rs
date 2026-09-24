@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Infino Authors
+
 //! Choosing the order a superfile stores its documents in.
 //!
 //! A posting list costs less to store and less to walk when the
