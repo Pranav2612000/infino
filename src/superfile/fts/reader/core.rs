@@ -1112,15 +1112,25 @@ impl FtsReader {
     ///
     /// The identity on every blob through `V7`, where the two are the
     /// same number, and a lookup on a `V8` blob whose documents are
-    /// stored under an ordering of their own. Out-of-range ids pass
-    /// through unchanged rather than panicking: the kernels never
-    /// produce one, and a corrupt map should not take down a query that
-    /// the CRC over the region did not already reject.
+    /// stored under an ordering of their own.
+    ///
+    /// An id past the end of the map is a bug in the caller or a blob
+    /// the CRC over the region should already have rejected, so it trips
+    /// an assertion where assertions run. In a release build it passes
+    /// through unchanged instead of panicking, because a corrupt map
+    /// should not take down a query.
     #[inline]
     pub(crate) fn row_of(&self, doc_id: u32) -> u32 {
         match &self.doc_map {
             None => doc_id,
-            Some(map) => map.get(doc_id as usize).copied().unwrap_or(doc_id),
+            Some(map) => {
+                debug_assert!(
+                    (doc_id as usize) < map.len(),
+                    "doc id {doc_id} is past the {} entries of this blob's map",
+                    map.len()
+                );
+                map.get(doc_id as usize).copied().unwrap_or(doc_id)
+            }
         }
     }
 

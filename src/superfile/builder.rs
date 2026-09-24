@@ -141,12 +141,14 @@ const REORDER_MIN_DOCS: usize = 4_096;
 /// contributes what it has.
 const REORDER_TERMS_PER_DOC: usize = 16;
 
-/// Bits of term-id space the bisection works in. Terms are hashed into
-/// it rather than interned, so the vocabulary costs nothing to hold;
-/// two terms colliding are treated as one, which can only weaken the
-/// grouping and never make a posting wrong, since the order is a
-/// heuristic and the map records whatever it produces.
-const REORDER_TERM_ID_BITS: u32 = 22;
+/// Bits of bucket space the bisection groups terms in. Terms are hashed
+/// into it rather than interned, so the vocabulary costs nothing to
+/// hold. At this width a corpus with millions of distinct terms will
+/// certainly put several of them in one bucket, and the bisection then
+/// treats those as a single term. That costs layout quality and nothing
+/// else: the order is a heuristic, the map records whatever it
+/// produces, and no posting can be made wrong by it.
+const REORDER_TERM_BUCKET_BITS: u32 = 22;
 
 /// The output row each of an input's documents becomes, `None` where a
 /// tombstone drops it, and how many survived.
@@ -173,16 +175,18 @@ fn survivor_rows(
     (rows, kept)
 }
 
-/// A term's id for the bisection. Deterministic, so a merge of the same
-/// inputs chooses the same order every time.
-fn hash_term(term: &[u8]) -> u32 {
+/// The bucket a term groups under, which is **not** an identity: see
+/// [`REORDER_TERM_BUCKET_BITS`] for why distinct terms are expected to
+/// share one. Deterministic, so a merge of the same inputs chooses the
+/// same order every time.
+fn term_bucket(term: &[u8]) -> u32 {
     // FNV-1a, 64-bit, folded into the id space.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in term {
         h ^= u64::from(b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    ((h >> 32) as u32 ^ h as u32) & ((1 << REORDER_TERM_ID_BITS) - 1)
+    ((h >> 32) as u32 ^ h as u32) & ((1 << REORDER_TERM_BUCKET_BITS) - 1)
 }
 
 /// Per-column FTS configuration. The `column` must exist in
@@ -1912,14 +1916,14 @@ impl SuperfileBuilder {
         // document groups nothing and a term in most of them separates
         // nothing, so this is what makes a term eligible, and among the
         // eligible it is what makes one more informative than another.
-        let n_term_ids = 1usize << REORDER_TERM_ID_BITS;
-        let mut df: Vec<u32> = vec![0; n_term_ids];
+        let n_buckets = 1usize << REORDER_TERM_BUCKET_BITS;
+        let mut df: Vec<u32> = vec![0; n_buckets];
         for ((reader, _), rows) in readers.iter().zip(rows_of.iter()) {
             let fts = reader.fts().expect("checked above");
             for column_id in 0..n_fts_columns {
                 fts.for_each_term_posting(column_id, |term, local_doc, _tf, _pos| {
                     if rows[local_doc as usize].is_some() {
-                        df[hash_term(term) as usize] += 1;
+                        df[term_bucket(term) as usize] += 1;
                     }
                     Ok(())
                 })
@@ -1951,7 +1955,7 @@ impl SuperfileBuilder {
                     let Some(row) = rows[local_doc as usize] else {
                         return Ok(());
                     };
-                    let t = hash_term(term);
+                    let t = term_bucket(term);
                     if !eligible(t) {
                         return Ok(());
                     }
@@ -4733,8 +4737,8 @@ mod tests {
     }
 
     #[test]
-    fn a_term_hashes_to_the_same_id_every_time_and_stays_in_range() {
-        let limit = 1u32 << REORDER_TERM_ID_BITS;
+    fn a_term_buckets_the_same_way_every_time_and_stays_in_range() {
+        let limit = 1u32 << REORDER_TERM_BUCKET_BITS;
         for t in [
             &b""[..],
             b"a",
@@ -4742,13 +4746,13 @@ mod tests {
             b"observatory",
             b"a much longer term than any tokenizer would produce",
         ] {
-            assert_eq!(hash_term(t), hash_term(t), "stable for {t:?}");
-            assert!(hash_term(t) < limit, "in range for {t:?}");
+            assert_eq!(term_bucket(t), term_bucket(t), "stable for {t:?}");
+            assert!(term_bucket(t) < limit, "in range for {t:?}");
         }
         // Different terms should mostly differ; a handful of collisions
         // in the id space is expected and harmless, a constant is not.
         let ids: std::collections::HashSet<u32> = (0..5_000u32)
-            .map(|i| hash_term(format!("term{i}").as_bytes()))
+            .map(|i| term_bucket(format!("term{i}").as_bytes()))
             .collect();
         assert!(ids.len() > 4_900, "hash collapsed: {} distinct", ids.len());
     }
