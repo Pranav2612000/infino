@@ -580,12 +580,14 @@ impl FtsReader {
         // Length of the FTS subsection itself (≈ `kv::FTS_LENGTH`), not
         // the whole superfile: `source` is the FTS-scoped sub-source.
         let fts_blob_len = source.size() as usize;
-        // One GET covers either header size: any real FTS blob is
-        // larger than the 56-byte v2 header (header + FST CRC +
-        // postings CRC + a non-empty doc-lengths directory), so
-        // fetching the v2 span up front costs no extra round-trip on
-        // v1 blobs and saves one on v2.
-        let header_fetch = format::fts::HEADER_SIZE_V2.min(fts_blob_len);
+        // One GET covers every header size: any real FTS blob is larger
+        // than the widest header (header + FST CRC + postings CRC + a
+        // non-empty doc-lengths directory), so fetching the widest span
+        // up front costs no extra round-trip on a narrower one and saves
+        // one on the widest. Sized off the largest rather than a
+        // particular version, because a header short of what the version
+        // declares cannot be parsed and there is no second fetch here.
+        let header_fetch = format::fts::HEADER_SIZE_V8.min(fts_blob_len);
         let header = fetch_lazy_range(source.as_ref(), 0..header_fetch, "fts header").await?;
         if header.len() < FTS_HEADER_SIZE {
             return Err(FtsError::Read(ReadError::MissingKv("fts header")));
@@ -622,6 +624,19 @@ impl FtsReader {
         let doc_lengths_table_offset =
             read_u64_le(&header[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
                 as usize;
+        // A `V8` blob's doc-id map sits immediately before the
+        // doc-lengths directory and is read whole at open, so the tail
+        // starts there instead and the map rides the same GET. Leaving
+        // it out would still work, since a region missing from the
+        // overlay falls back to an async fetch, but it would cost a
+        // second round trip at every open for bytes every query needs.
+        let tail_offset = match version == format::fts::VERSION_V8 {
+            true => {
+                read_u64_le(&header[hdr::DOC_MAP_OFFSET_OFF..hdr::DOC_MAP_OFFSET_OFF + U64_BYTES])
+                    as usize
+            }
+            false => doc_lengths_table_offset,
+        };
 
         // Prefetch the FST directory ([48..postings_offset], contiguous
         // after the header) so every later `dict_bytes()` resolves from
@@ -647,7 +662,7 @@ impl FtsReader {
             fetch_lazy_range(source.as_ref(), header_size..postings_offset, "fts/dict"),
             fetch_lazy_range(
                 source.as_ref(),
-                doc_lengths_table_offset..fts_blob_len,
+                tail_offset..fts_blob_len,
                 "fts/doc_lengths_tail",
             ),
         )?;
@@ -655,7 +670,7 @@ impl FtsReader {
         let mut overlay = PrefetchedSource::new(Arc::clone(&source));
         overlay.install(0, header.clone());
         overlay.install(header_size as u64, fst_region.clone());
-        overlay.install(doc_lengths_table_offset as u64, doc_lengths_tail);
+        overlay.install(tail_offset as u64, doc_lengths_tail);
 
         let mut reader =
             Self::open_with_source(Source::Lazy(Arc::new(overlay)), columns_json, opts)?;
@@ -3659,6 +3674,86 @@ mod tests {
             "the doc-lengths region must no longer be held by the overlay"
         );
         let _ = dict_reads;
+    }
+
+    /// A source that only serves bytes asynchronously, the way an
+    /// object store or a cold disk cache does.
+    ///
+    /// `BytesLazyByteSource` answers a synchronous read from memory, so
+    /// a region left out of the open-time prefetch is still served and
+    /// the omission never shows. This one refuses, which is what turns
+    /// "the prefetch is missing a region the open needs" into a failure
+    /// rather than a slower path.
+    struct AsyncOnlySource(Bytes);
+
+    #[async_trait]
+    impl LazyByteSource for AsyncOnlySource {
+        fn size(&self) -> u64 {
+            self.0.len() as u64
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let s = start as usize;
+            let e = s + len as usize;
+            match e <= self.0.len() {
+                true => Ok(self.0.slice(s..e)),
+                false => Err(LazyByteSourceError::OutOfBounds {
+                    start,
+                    len,
+                    size: self.0.len() as u64,
+                }),
+            }
+        }
+
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    /// Opening a blob that stores its documents in an order of its own
+    /// must work on a source that cannot be read synchronously.
+    ///
+    /// The map is read whole at open, and the open runs against the
+    /// prefetch overlay alone, so the map has to be inside it. Placing
+    /// the region outside the prefetched tail to keep that fetch small
+    /// makes every in-memory test pass and every object-store open fail.
+    #[tokio::test]
+    async fn open_lazy_serves_a_reordered_blob_from_an_async_only_source() {
+        const N_DOCS: u32 = 400;
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), false).expect("register");
+        // Fed in reverse, with the map that puts each document back.
+        let map: Vec<u32> = (0..N_DOCS).rev().collect();
+        for (id, &row) in map.iter().enumerate() {
+            b.add_doc(0, id as u32, &format!("alpha t{} uq{row}", row % 23))
+                .expect("add doc");
+        }
+        b.doc_map = Some(map);
+        let blob = Bytes::from(b.finish().expect("finish"));
+        assert_eq!(
+            read_u32_le(&blob[VERSION_FIELD]),
+            format::fts::VERSION_V8,
+            "fixture must be a mapped blob"
+        );
+
+        let src: Arc<dyn LazyByteSource> = Arc::new(AsyncOnlySource(blob));
+        let r = FtsReader::open_lazy(src, json, OpenOptions::for_object_store())
+            .await
+            .expect("a reordered blob must open from an async-only source");
+        assert!(r.has_doc_map());
+        assert_eq!(r.n_docs(), N_DOCS);
+
+        // And the rows it names are the rows that hold the term.
+        let hits = r
+            .search("body", &["uq7"], 10, BoolMode::Or)
+            .await
+            .expect("search");
+        assert_eq!(
+            hits.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
+            vec![7],
+            "the map must survive the lazy open"
+        );
     }
 
     #[tokio::test]

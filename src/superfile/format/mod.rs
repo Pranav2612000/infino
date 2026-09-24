@@ -190,8 +190,9 @@ pub mod fts {
     /// serve a `V8` blob; the search kernels never see it, because they
     /// work in the blob's own id space throughout and the ids are
     /// translated once, on the way out. The region sits between the
-    /// positions region and the doc-lengths directory so the lazy-open
-    /// tail fetch stays the directory and the length arrays.
+    /// positions region and the doc-lengths directory, and the open-time
+    /// tail fetch starts at the map rather than at the directory, so the
+    /// two arrive in one range read instead of two.
     ///
     /// One thing a caller can observe changes, and it is not a bug: a
     /// top-k breaks equal scores by the blob's own doc id, so a `V8`
