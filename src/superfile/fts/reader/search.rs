@@ -560,7 +560,11 @@ impl FtsReader {
             // atom, or a pushed-down row set.
             let filter = match (negative_atoms.is_empty(), lists.allow.clone()) {
                 (true, None) => None,
-                (_, allow) => Some(AtomExcludeFilter::with_allow(negative_atoms, allow)),
+                (_, allow) => Some(AtomExcludeFilter::with_allow(
+                    negative_atoms,
+                    allow,
+                    self.doc_map.clone(),
+                )),
             };
             // The atom walk is the whole kernel for phrase shapes —
             // `run_prepared` sees only the finished `Done` — so bracket
@@ -601,7 +605,11 @@ impl FtsReader {
         // term present in this superfile, or a pushed-down row set.
         let neg_filter = match (neg_cursors.is_empty(), lists.allow.clone()) {
             (true, None) => None,
-            (_, allow) => Some(ExcludeFilter::with_allow(neg_cursors, allow)),
+            (_, allow) => Some(ExcludeFilter::with_allow(
+                neg_cursors,
+                allow,
+                self.doc_map.clone(),
+            )),
         };
 
         // Fold repeated MUST/SHOULD terms into one weighted cursor each: the

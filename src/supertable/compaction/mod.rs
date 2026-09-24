@@ -2838,6 +2838,47 @@ mod tests {
         assert_eq!(n_shared, BATCHES * PER_BATCH, "every document carries it");
     }
 
+    /// A `WHERE` on an indexed column pushes a row-keyed allow-set into
+    /// the kernel, which walks the blob's own ids. On a reordered blob
+    /// the two are different spaces, so the set has to be consulted with
+    /// the row a blob id stands for and not with the id itself.
+    ///
+    /// The failure this guards is quiet rather than wrong: the predicate
+    /// is re-applied after the search, so a mismatched set returns an
+    /// empty result. In a hybrid query the full-text leg simply drops
+    /// out and the ranking degrades with nothing to show for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scoped_search_after_a_reordering_compaction_finds_the_row() {
+        const BATCHES: usize = 60;
+        const PER_BATCH: usize = 80;
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        let mut expected: Vec<String> = Vec::new();
+        for b in 0..BATCHES {
+            let titles: Vec<String> = (0..PER_BATCH)
+                .map(|i| {
+                    let n = b * PER_BATCH + i;
+                    format!("uq{n} shared t{} t{}", n % 37, n % 53)
+                })
+                .collect();
+            expected.extend(titles.iter().cloned());
+            let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            commit_titles(&st, &refs);
+        }
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+
+        for n in [0usize, 7, 977, 2500, 4799] {
+            let sql = format!(
+                "SELECT title FROM bm25_search('title', 'shared', 10) WHERE title = '{}'",
+                expected[n]
+            );
+            let got = st.reader().expect("reader").query_sql(&sql).expect("sql");
+            assert_eq!(titles_of(&got), vec![expected[n].clone()], "doc {n}");
+        }
+    }
+
     /// The `title` column of every row in a result, in order.
     fn titles_of(batches: &[RecordBatch]) -> Vec<String> {
         let mut out = Vec::new();
