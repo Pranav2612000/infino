@@ -2561,6 +2561,95 @@ mod tests {
         }
     }
 
+    /// A corrupt doc-id map is refused at open rather than silently
+    /// answering with the wrong rows.
+    ///
+    /// The map is the one region whose damage a query could not
+    /// otherwise notice: every id it returns would still be in range and
+    /// still carry a real score, just attached to the wrong document. So
+    /// both of its guards are checked, the region's own checksum and its
+    /// length against the document count.
+    #[tokio::test]
+    async fn a_damaged_doc_map_is_refused_at_open() {
+        const N_DOCS: u32 = 300;
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), false).expect("register");
+        for row in 0..N_DOCS {
+            b.add_doc(0, row, &format!("alpha t{}", row % 17))
+                .expect("add doc");
+        }
+        b.doc_map = Some((0..N_DOCS).rev().collect());
+        let blob = b.finish().expect("finish");
+        assert_eq!(
+            read_u32_le(&blob[VERSION_FIELD]),
+            format::fts::VERSION_V8,
+            "fixture must be a mapped blob"
+        );
+        FtsReader::open(Bytes::from(blob.clone()), json).expect("the fixture opens clean");
+
+        let map_off =
+            read_u64_le(&blob[hdr::DOC_MAP_OFFSET_OFF..hdr::DOC_MAP_OFFSET_OFF + U64_BYTES])
+                as usize;
+        let dls_off =
+            read_u64_le(&blob[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
+                as usize;
+        assert_eq!(
+            dls_off - map_off,
+            N_DOCS as usize * U32_BYTES + 4,
+            "the region is one entry per document plus its checksum"
+        );
+
+        // A flipped byte inside the region.
+        let mut flipped = blob.clone();
+        flipped[map_off] ^= 0xff;
+        let err = FtsReader::open(Bytes::from(flipped), json).expect_err("corrupt map");
+        assert!(
+            matches!(
+                err,
+                FtsError::Read(ReadError::ChecksumMismatch {
+                    section: "fts/doc-map",
+                    ..
+                })
+            ),
+            "expected a doc-map checksum failure, got {err:?}"
+        );
+
+        // A moved region boundary. The map's own length check is the
+        // backstop here rather than the first line of defence: moving
+        // where it starts also moves where the region before it ends, so
+        // that region's checksum is what fails. Either way the file is
+        // refused rather than read with the boundary the header claims.
+        let mut moved_start = blob.clone();
+        let moved = (map_off + U32_BYTES) as u64;
+        moved_start[hdr::DOC_MAP_OFFSET_OFF..hdr::DOC_MAP_OFFSET_OFF + U64_BYTES]
+            .copy_from_slice(&moved.to_le_bytes());
+        let err = FtsReader::open(Bytes::from(moved_start), json).expect_err("moved map");
+        assert!(
+            matches!(
+                err,
+                FtsError::Read(ReadError::MalformedVersion(_))
+                    | FtsError::Read(ReadError::ChecksumMismatch { .. })
+            ),
+            "expected the moved boundary to be refused, got {err:?}"
+        );
+
+        // A header claiming the map starts where the doc-lengths
+        // directory does leaves no room for one entry per document. The
+        // offsets are range-checked before anything is sliced, so that
+        // check is what refuses it, and the length check behind it is
+        // the backstop for a header that passes the range test with a
+        // region still the wrong size.
+        let mut empty_map = blob.clone();
+        empty_map[hdr::DOC_MAP_OFFSET_OFF..hdr::DOC_MAP_OFFSET_OFF + U64_BYTES]
+            .copy_from_slice(&(dls_off as u64).to_le_bytes());
+        let err = FtsReader::open(Bytes::from(empty_map), json).expect_err("empty map");
+        assert!(
+            matches!(err, FtsError::Read(ReadError::MalformedVersion(_))),
+            "expected a malformed-header failure, got {err:?}"
+        );
+    }
+
     /// Ranked results with pruning live (`k` far below the match count).
     async fn top(r: &FtsReader, terms: &[&str], k: usize) -> Vec<(u32, f32)> {
         r.search("body", terms, k, BoolMode::Or)
