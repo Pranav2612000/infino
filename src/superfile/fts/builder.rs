@@ -324,6 +324,42 @@ const EXTERNAL_MERGE_CHUNK_CAP_TRIPLES: usize = 1024 * 1024;
 /// per flush).
 const SORT_OUTPUT_BATCH_TRIPLES: usize = 4096;
 
+/// The version stamped on a finished blob.
+///
+/// New code always writes the current version: every PFOR term carries a
+/// coarse block-max table, and it subsumes the earlier eras (positions
+/// region iff positional with the `V3` sub-index; bitset blocks
+/// self-describing per block as in `V4`). The legacy ladder
+/// (`V2`/`V3`/`V4`) is written only when the coarse table is suppressed
+/// (test-only), so the backwards-compat tests can produce a genuine
+/// pre-086 blob.
+///
+/// A column's BM25 parameters do not move the version: they are recorded
+/// in its `inf.fts.columns` entry and read back from there, so the
+/// stored per-block bound is interpreted against the pair that entry
+/// names. Nothing about the layout differs either way.
+///
+/// A doc-id map is what lifts the current era to `V8`; the caller has
+/// already refused a map on any older era.
+fn blob_version(
+    era: BlobEra,
+    doc_map: &Option<Vec<u32>>,
+    finish_profile: &FinishProfile,
+    positions_region_len: u64,
+) -> u32 {
+    match era {
+        BlobEra::V7 if doc_map.is_some() => format::fts::VERSION_V8,
+        BlobEra::V7 => format::fts::VERSION_V7,
+        BlobEra::V6 => format::fts::VERSION_V6,
+        BlobEra::V5 => format::fts::VERSION_V5,
+        BlobEra::V2ToV4 if finish_profile.saw_bitset_block => format::fts::VERSION_V4,
+        BlobEra::V2ToV4 if positions_region_len > format::CRC_BYTES as u64 => {
+            format::fts::VERSION_V3
+        }
+        BlobEra::V2ToV4 => format::fts::VERSION_V2,
+    }
+}
+
 /// Per-column build-time state (scalar accounting only).
 /// The blob version an [`FtsBuilder`] writes. Production always writes
 /// the current one; the older variants exist so tests can produce the
@@ -3561,13 +3597,25 @@ fn assemble_and_write_blob<W: Write>(
         FstSource::InRam(bytes) => bytes.len() as u64,
         FstSource::Streamed { len, .. } => *len,
     };
-    // A blob carrying a doc-id map is `V8` and its header gains the
-    // field locating the region; without one nothing about the layout
-    // moves and the era's own version is stamped.
-    let header_size: u64 = match doc_map.is_some() {
-        true => format::fts::HEADER_SIZE_V8 as u64,
-        false => format::fts::HEADER_SIZE_V2 as u64,
-    };
+    // A doc-id map is the only thing that makes a blob `V8`, and `V8`
+    // rides on the current era's layout: its header gains the field
+    // locating the region, and nothing else moves. A legacy era with a
+    // map would need a header its own version does not describe, so
+    // every offset after the header would sit eight bytes from where a
+    // reader of that version looks. The pairing is enforced rather than
+    // assumed.
+    if doc_map.is_some() && !matches!(era, BlobEra::V7) {
+        return Err(BuildError::Io(Error::other(
+            "fts doc-id map requires the current blob era",
+        )));
+    }
+    let fts_version = blob_version(era, &doc_map, &finish_profile, positions_region.1);
+    // One place derives the header's size from the version, so the
+    // assembly here and the reader's parse cannot disagree about where
+    // the dictionary starts.
+    let header_size: u64 = format::fts::header_size(fts_version)
+        .ok_or_else(|| BuildError::Io(Error::other("fts blob version has no header size")))?
+        as u64;
     let fst_offset: u64 = header_size;
     let postings_offset: u64 = fst_offset + fst_total_len;
     // The positions region sits between the postings and the
@@ -3657,17 +3705,6 @@ fn assemble_and_write_blob<W: Write>(
     // recorded in its `inf.fts.columns` entry and read back from there,
     // so the stored per-block bound is interpreted against the pair that
     // entry names. Nothing about the layout differs either way.
-    let fts_version = match era {
-        // The map is the only thing that makes a blob `V8`, and it rides
-        // on the current era's layout; an older era never carries one.
-        BlobEra::V7 if doc_map.is_some() => format::fts::VERSION_V8,
-        BlobEra::V7 => format::fts::VERSION_V7,
-        BlobEra::V6 => format::fts::VERSION_V6,
-        BlobEra::V5 => format::fts::VERSION_V5,
-        BlobEra::V2ToV4 if finish_profile.saw_bitset_block => format::fts::VERSION_V4,
-        BlobEra::V2ToV4 if positions_region.1 > format::CRC_BYTES as u64 => format::fts::VERSION_V3,
-        BlobEra::V2ToV4 => format::fts::VERSION_V2,
-    };
     header.extend_from_slice(&fts_version.to_le_bytes()); // 4
     header.extend_from_slice(&n_columns.to_le_bytes()); // 4
     header.extend_from_slice(&n_docs.to_le_bytes()); // 4

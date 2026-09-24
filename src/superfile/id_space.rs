@@ -69,17 +69,11 @@ impl Display for RowId {
 /// Comparison against a plain number, for the assertions and literals
 /// that name a row directly. It relates a row to an untyped integer,
 /// never to a [`FtsDocId`]: the operations that actually confuse the two
-/// spaces -- indexing an array, probing a row set -- still have to name
+/// spaces, indexing an array or probing a row set, still have to name
 /// the conversion.
 impl PartialEq<u32> for RowId {
     fn eq(&self, other: &u32) -> bool {
         self.0 == *other
-    }
-}
-
-impl From<RowId> for u32 {
-    fn from(r: RowId) -> Self {
-        r.0
     }
 }
 
@@ -121,22 +115,10 @@ impl Display for FtsDocId {
     }
 }
 
-/// Comparison against a plain number — see [`RowId`]'s.
+/// Comparison against a plain number, as for [`RowId`].
 impl PartialEq<u32> for FtsDocId {
     fn eq(&self, other: &u32) -> bool {
         self.0 == *other
-    }
-}
-
-impl From<FtsDocId> for u32 {
-    fn from(d: FtsDocId) -> Self {
-        d.0
-    }
-}
-
-impl From<FtsDocId> for u64 {
-    fn from(d: FtsDocId) -> Self {
-        Self::from(d.0)
     }
 }
 
@@ -162,18 +144,6 @@ impl StableId {
     #[inline]
     pub const fn get(self) -> i128 {
         self.0
-    }
-}
-
-impl Display for StableId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        Display::fmt(&self.0, f)
-    }
-}
-
-impl From<StableId> for i128 {
-    fn from(s: StableId) -> Self {
-        s.0
     }
 }
 
@@ -236,15 +206,6 @@ impl DocMap {
     pub fn is_permuted(&self) -> bool {
         matches!(self, Self::Permuted(_))
     }
-
-    /// The rows in blob order, or `None` for the identity map.
-    #[inline]
-    pub fn rows(&self) -> Option<&[RowId]> {
-        match self {
-            Self::Identity => None,
-            Self::Permuted(rows) => Some(rows),
-        }
-    }
 }
 
 /// The rows a caller admits at all: a SQL `WHERE`'s candidate set,
@@ -277,12 +238,6 @@ impl RowSet {
     }
 }
 
-impl FromIterator<RowId> for RowSet {
-    fn from_iter<I: IntoIterator<Item = RowId>>(iter: I) -> Self {
-        Self(Arc::new(iter.into_iter().map(RowId::get).collect()))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,7 +248,6 @@ mod tests {
         let map = DocMap::Identity;
         assert_eq!(map.row_of(FtsDocId::new(7)), RowId::new(7));
         assert!(!map.is_permuted());
-        assert!(map.rows().is_none());
     }
 
     /// A permuted map hands back the row its region recorded.
@@ -305,13 +259,12 @@ mod tests {
         assert_eq!(map.row_of(FtsDocId::new(1)), RowId::new(0));
         assert_eq!(map.row_of(FtsDocId::new(2)), RowId::new(1));
         assert!(map.is_permuted());
-        assert_eq!(map.rows().map(<[RowId]>::len), Some(3));
     }
 
-    /// The row set answers in row space, and is built from rows.
+    /// The row set answers in row space.
     #[test]
     fn a_row_set_admits_exactly_the_rows_it_was_built_from() {
-        let set: RowSet = [RowId::new(1), RowId::new(4)].into_iter().collect();
+        let set = RowSet::new(Arc::new([1u32, 4].into_iter().collect()));
         assert!(set.contains(RowId::new(1)));
         assert!(set.contains(RowId::new(4)));
         assert!(!set.contains(RowId::new(2)));

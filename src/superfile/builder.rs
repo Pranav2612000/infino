@@ -104,7 +104,7 @@ use crate::{
             reorder::{ForwardIndex, bisect_order},
             tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER},
         },
-        id_space::{FtsDocId, RowId},
+        id_space::{FtsDocId, RowId, StableId},
         ids,
         stats::SuperfileStats,
         vector::{
@@ -196,6 +196,44 @@ fn remap_by_blob_id<T: Copy>(fts: &FtsReader, remap_by_row: &[Option<T>]) -> Vec
             remap_by_row.get(row.get() as usize).copied().flatten()
         })
         .collect()
+}
+
+/// Place one input's stored document lengths at the output positions its
+/// remap names, one entry per FTS column.
+///
+/// The lengths are read in the input blob's own id order and belong at
+/// the output's, so they are placed rather than pushed: a merge that
+/// reorders, drops or interleaves rows has no push order to rely on.
+/// `base` is subtracted from each output position, for the caller that
+/// fills a window of the output rather than the whole of it. `what`
+/// names the input in the error a failed read raises.
+fn scatter_doc_lengths(
+    fts: &FtsReader,
+    remap: &[Option<FtsDocId>],
+    base: u32,
+    what: &str,
+    out: &mut [Vec<u32>],
+) -> Result<(), BuildError> {
+    for (col, lengths) in out.iter_mut().enumerate() {
+        let dls = fts.read_doc_lengths(col as u32).map_err(|e| {
+            BuildError::Io(Error::other(format!(
+                "{what} column {col}: read doc-lengths failed: {e}"
+            )))
+        })?;
+        for (d, &len) in dls.iter().enumerate() {
+            if let Some(out_id) = remap.get(d).copied().flatten() {
+                lengths[(out_id.get() - base) as usize] = len;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Hand each column's placed lengths to the output's FTS builder.
+fn append_doc_lengths(fb: &mut FtsBuilder, out: &[Vec<u32>]) {
+    for (col, lengths) in out.iter().enumerate() {
+        fb.append_prebuilt_doc_lengths(col as u32, lengths);
+    }
 }
 
 /// The bucket a term groups under, which is **not** an identity: see
@@ -1137,26 +1175,14 @@ impl SuperfileBuilder {
             .collect();
         self.carry_fts_postings_with_remap(reader, &remap)?;
 
-        // The lengths are read in the input's own id order and appended in
-        // the output's, so they are placed rather than pushed.
-        let n_fts_columns = self.opts.fts_columns.len() as u32;
-        for column_id in 0..n_fts_columns {
-            let dls = fts.read_doc_lengths(column_id).map_err(|e| {
-                BuildError::Io(Error::other(format!(
-                    "fts merge column {column_id}: read doc-lengths failed: {e}"
-                )))
-            })?;
-            let mut kept: Vec<u32> = vec![0; n_kept as usize];
-            for (d, &len) in dls.iter().enumerate() {
-                if let Some(out) = remap.get(d).copied().flatten() {
-                    kept[(out.get() - base) as usize] = len;
-                }
-            }
-            self.fts_builder
-                .as_mut()
-                .expect("checked Some above")
-                .append_prebuilt_doc_lengths(column_id, &kept);
-        }
+        // This input fills the window of the output starting at `base`.
+        let n_fts_columns = self.opts.fts_columns.len();
+        let mut kept: Vec<Vec<u32>> = vec![vec![0; n_kept as usize]; n_fts_columns];
+        scatter_doc_lengths(fts, &remap, base, "fts merge", &mut kept)?;
+        append_doc_lengths(
+            self.fts_builder.as_mut().expect("checked Some above"),
+            &kept,
+        );
         Ok(())
     }
 
@@ -1666,9 +1692,9 @@ impl SuperfileBuilder {
             // claims it first feeds the (identical) row, the other maps to
             // `None` — mirroring the single row the reordered scalar batch
             // keeps.
-            let mut pos_of_id: HashMap<i128, u32> = HashMap::with_capacity(n_out);
+            let mut pos_of_id: HashMap<StableId, RowId> = HashMap::with_capacity(n_out);
             for (pos, &sid) in all_stable_ids.iter().enumerate() {
-                pos_of_id.insert(sid, pos as u32);
+                pos_of_id.insert(StableId::new(sid), RowId::new(pos as u32));
             }
             let id_idx = scalar_schema
                 .index_of(&id_column)
@@ -1696,10 +1722,12 @@ impl SuperfileBuilder {
                     if is_deleted {
                         continue;
                     }
-                    let sid = ids.value(rank);
+                    let sid = StableId::new(ids.value(rank));
                     rank += 1;
-                    if let Some(pos) = pos_of_id.remove(&sid) {
-                        remap_by_row[d as usize] = Some(FtsDocId::new(pos));
+                    if let Some(row) = pos_of_id.remove(&sid) {
+                        // This merge appends in arrival order, so an output
+                        // row is the doc id the output blob stores it under.
+                        remap_by_row[d as usize] = Some(FtsDocId::new(row.get()));
                     }
                 }
                 // The walk above is over rows: it reads a row-keyed
@@ -1708,27 +1736,22 @@ impl SuperfileBuilder {
                 // so the input's map composes in -- a copy on any input
                 // that kept arrival order.
                 let remap = remap_by_blob_id(fts, &remap_by_row);
-                for (col, lengths) in out_lengths.iter_mut().enumerate() {
-                    let dls = fts.read_doc_lengths(col as u32).map_err(|e| {
-                        BuildError::Io(Error::other(format!(
-                            "multi-cell merge input {idx} column {col}: read doc-lengths failed: {e}"
-                        )))
-                    })?;
-                    for (d, &len) in dls.iter().enumerate() {
-                        if let Some(pos) = remap[d] {
-                            lengths[pos.get() as usize] = len;
-                        }
-                    }
-                }
+                scatter_doc_lengths(
+                    fts,
+                    &remap,
+                    0,
+                    &format!("multi-cell merge input {idx}"),
+                    &mut out_lengths,
+                )?;
                 superfile_builder.carry_fts_postings_with_remap(reader, &remap)?;
             }
-            for (col, lengths) in out_lengths.iter().enumerate() {
+            append_doc_lengths(
                 superfile_builder
                     .fts_builder
                     .as_mut()
-                    .expect("checked Some above")
-                    .append_prebuilt_doc_lengths(col as u32, lengths);
-            }
+                    .expect("checked Some above"),
+                &out_lengths,
+            );
         }
 
         // Parquet rows must follow the same cell-directory order as the packed
@@ -2178,18 +2201,13 @@ impl SuperfileBuilder {
                             .map(|row| row.map(|r| FtsDocId::new(inv[r.get() as usize])))
                             .collect();
                         let remap = remap_by_blob_id(fts, &remap_by_row);
-                        for (col, lengths) in out_lengths.iter_mut().enumerate() {
-                            let dls = fts.read_doc_lengths(col as u32).map_err(|e| {
-                                BuildError::Io(Error::other(format!(
-                                    "fts merge input {idx} column {col}: read doc-lengths failed: {e}"
-                                )))
-                            })?;
-                            for (d, &len) in dls.iter().enumerate() {
-                                if let Some(new_id) = remap[d] {
-                                    lengths[new_id.get() as usize] = len;
-                                }
-                            }
-                        }
+                        scatter_doc_lengths(
+                            fts,
+                            &remap,
+                            0,
+                            &format!("fts merge input {idx}"),
+                            &mut out_lengths,
+                        )?;
                         superfile_builder.carry_fts_postings_with_remap(reader, &remap)?;
                     }
                 }
@@ -2213,13 +2231,13 @@ impl SuperfileBuilder {
             superfile_builder.next_local_doc_id += n_rows;
         }
         if let Some(order) = order {
-            for (col, lengths) in out_lengths.iter().enumerate() {
+            append_doc_lengths(
                 superfile_builder
                     .fts_builder
                     .as_mut()
-                    .expect("an order is only chosen when the FTS builder exists")
-                    .append_prebuilt_doc_lengths(col as u32, lengths);
-            }
+                    .expect("an order is only chosen when the FTS builder exists"),
+                &out_lengths,
+            );
             // The map is what lets the reader reach a row from a doc id,
             // and writing it is what makes the blob carry its own order.
             if let Some(fb) = superfile_builder.fts_builder.as_mut() {
@@ -4770,6 +4788,73 @@ mod tests {
             !reader.fts().expect("fts").has_doc_map(),
             "a merge below the threshold writes no map"
         );
+    }
+
+    /// The composition both merge paths depend on: a remap the caller built
+    /// against the input's ROWS, re-keyed by the doc ids that input's
+    /// postings and lengths actually arrive under.
+    ///
+    /// Tombstones, the `_id` column and the scalar batch are all keyed by
+    /// the row, so every caller numbers its output that way. Postings and
+    /// doc lengths are keyed by the blob's own doc id. Through `V7` those
+    /// are the same number and this is a copy; on an input that stores
+    /// its documents in an order of its own they are not, and indexing a
+    /// row-keyed array with a blob id files a posting under a different
+    /// document. The failure is silent: every id involved is in range.
+    #[test]
+    fn remap_by_blob_id_rekeys_a_row_remap_by_the_inputs_own_doc_ids() {
+        use crate::superfile::fts::{
+            builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
+        };
+
+        const JSON: &str = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        /// `map[blob doc id] = row`, a permutation that moves every
+        /// document.
+        const MAP: [u32; 8] = [3, 1, 7, 0, 5, 2, 6, 4];
+
+        let reader_over = |doc_map: Option<Vec<u32>>| {
+            let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+            b.register_column("body".into(), false).expect("register");
+            for id in 0..MAP.len() as u32 {
+                b.add_doc(0, id, "alpha").expect("add doc");
+            }
+            b.doc_map = doc_map;
+            FtsReader::open(Bytes::from(b.finish().expect("finish")), JSON).expect("open")
+        };
+
+        // Where each input ROW is going: row 2 is dropped, the rest take
+        // consecutive output positions.
+        let remap_by_row: Vec<Option<FtsDocId>> = (0..MAP.len() as u32)
+            .map(|row| match row {
+                2 => None,
+                r => Some(FtsDocId::new(r * 10)),
+            })
+            .collect();
+
+        let mapped = reader_over(Some(MAP.to_vec()));
+        assert!(mapped.has_doc_map());
+        let by_blob = remap_by_blob_id(&mapped, &remap_by_row);
+        assert_eq!(by_blob.len(), MAP.len());
+        for (blob_id, &row) in MAP.iter().enumerate() {
+            assert_eq!(
+                by_blob[blob_id], remap_by_row[row as usize],
+                "blob doc id {blob_id} carries row {row}, so it goes where that row goes"
+            );
+        }
+        assert_eq!(
+            by_blob.iter().filter(|o| o.is_none()).count(),
+            1,
+            "exactly the dropped row is dropped, wherever the blob stored it"
+        );
+        assert_ne!(
+            by_blob, remap_by_row,
+            "a reordered input must not come back unchanged"
+        );
+
+        // An input that kept arrival order asks nothing of the map.
+        let plain = reader_over(None);
+        assert!(!plain.has_doc_map());
+        assert_eq!(remap_by_blob_id(&plain, &remap_by_row), remap_by_row);
     }
 
     #[test]

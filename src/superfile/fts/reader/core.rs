@@ -700,10 +700,15 @@ impl FtsReader {
                 "fts section version {version}"
             )))
         })?;
-        let header_size = match positional_blob {
-            true => format::fts::HEADER_SIZE_V2,
-            false => FTS_HEADER_SIZE,
-        };
+        // From the version, the same way the writer sizes what it
+        // assembles. Deriving it from the layout instead would call a
+        // `V8` header 56 bytes and let a dictionary claiming to start
+        // inside the header past the bound check below.
+        let header_size = format::fts::header_size(version).ok_or_else(|| {
+            FtsError::Read(ReadError::UnsupportedVersion(format!(
+                "fts section version {version}"
+            )))
+        })?;
         if source_len < header_size {
             return Err(FtsError::Read(ReadError::MissingKv("fts header")));
         }
@@ -771,7 +776,7 @@ impl FtsReader {
             || doc_lengths_table_offset < regions_end
             || doc_lengths_table_offset > source_len
             || positions_offset.is_some_and(|po| regions_end < po + 4)
-            || doc_map_offset.is_some_and(|mo| doc_lengths_table_offset < mo + 4)
+            || doc_map_offset.is_some_and(|mo| doc_lengths_table_offset < mo + format::CRC_BYTES)
         {
             return Err(FtsError::Read(ReadError::MalformedVersion(format!(
                 "fts header offsets out of range: fst={fst_offset}, postings={postings_offset}, \
@@ -992,7 +997,7 @@ impl FtsReader {
         let doc_map: DocMap = match doc_map_offset {
             None => DocMap::Identity,
             Some(mo) => {
-                let body_end = doc_lengths_table_offset.saturating_sub(4);
+                let body_end = doc_lengths_table_offset.saturating_sub(format::CRC_BYTES);
                 let expect = (n_docs as usize) * U32_BYTES;
                 if body_end < mo || body_end - mo != expect {
                     return Err(FtsError::Read(ReadError::MalformedVersion(format!(
@@ -1002,8 +1007,11 @@ impl FtsReader {
                 }
                 let body = fetch_source_range(&source, mo..body_end, "fts/doc-map")?;
                 if opts.verify_crc {
-                    let crc_bytes =
-                        fetch_source_range(&source, body_end..body_end + 4, "fts/doc-map crc")?;
+                    let crc_bytes = fetch_source_range(
+                        &source,
+                        body_end..body_end + format::CRC_BYTES,
+                        "fts/doc-map crc",
+                    )?;
                     if read_u32_le(&crc_bytes) != crc32c(&body) {
                         return Err(FtsError::Read(ReadError::ChecksumMismatch {
                             section: "fts/doc-map",
@@ -2168,6 +2176,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use async_trait::async_trait;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     use super::{super::test_util::*, *};
     use crate::superfile::{
@@ -2612,6 +2621,170 @@ mod tests {
         assert!(
             matches!(err, FtsError::Read(ReadError::MalformedVersion(_))),
             "expected a malformed-header failure, got {err:?}"
+        );
+    }
+
+    /// A doc-id map is what lifts the current era to `V8`, and only the
+    /// current era's header has room for the field locating it. Asked to
+    /// write a map under an older era, the builder refuses.
+    ///
+    /// Without the refusal the blob would be stamped with a version
+    /// whose readers parse a 56-byte header while carrying a 64-byte
+    /// one, putting every offset after it eight bytes from where they
+    /// look. Nothing in the file would say so: the magic, the version
+    /// and the checksums would all be intact.
+    #[test]
+    fn a_doc_map_on_a_legacy_era_is_refused_rather_than_mislabelled() {
+        const N_DOCS: u32 = 64;
+        for era in [BlobEra::V6, BlobEra::V5, BlobEra::V2ToV4] {
+            let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+            b.register_column("body".into(), false).expect("register");
+            for row in 0..N_DOCS {
+                b.add_doc(0, row, &format!("alpha t{}", row % 7))
+                    .expect("add doc");
+            }
+            b.era = era;
+            b.doc_map = Some((0..N_DOCS).rev().collect());
+            let err = b.finish().expect_err("a legacy era must refuse a map");
+            assert!(
+                format!("{err}").contains("doc-id map"),
+                "expected the refusal to name the map, got {err:?} for {era:?}"
+            );
+        }
+    }
+
+    /// The map region round-trips for any permutation, at sizes either
+    /// side of the block and partition boundaries.
+    ///
+    /// The map is written as a flat array and read back as one, so a
+    /// mistake here is an off-by-one that survives both checksums: the
+    /// ids stay in range and the search still answers, just about
+    /// different documents. Checking the identity permutation alongside
+    /// the scrambled ones keeps the degenerate case honest too, since it
+    /// is the one where a bug is invisible to a parity test.
+    #[tokio::test]
+    async fn a_doc_map_round_trips_for_any_permutation() {
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        for (n_docs, seed) in [(1u32, 1u64), (2, 2), (7, 3), (128, 4), (129, 5), (513, 6)] {
+            let mut rng = StdRng::seed_from_u64(seed);
+            // Fisher-Yates, so every size gets a genuine permutation
+            // rather than a stride that happens to be well behaved.
+            let mut map: Vec<u32> = (0..n_docs).collect();
+            for i in (1..map.len()).rev() {
+                map.swap(i, rng.random_range(0..=i));
+            }
+            let text = |row: u32| format!("alpha t{} p{}", row % 11, row % 5);
+
+            let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+            b.register_column("body".into(), false).expect("register");
+            for (id, &row) in map.iter().enumerate() {
+                b.add_doc(0, id as u32, &text(row)).expect("add doc");
+            }
+            b.doc_map = Some(map.clone());
+            let blob = Bytes::from(b.finish().expect("finish"));
+            let r = FtsReader::open(blob, json).expect("open");
+
+            assert!(r.has_doc_map(), "n_docs {n_docs}: the map must survive");
+            for (id, &row) in map.iter().enumerate() {
+                assert_eq!(
+                    r.row_of(FtsDocId::new(id as u32)),
+                    RowId::new(row),
+                    "n_docs {n_docs}: doc id {id} must name row {row}"
+                );
+            }
+            // And the rows a search names are the rows that carry the
+            // term, not the blob positions that happen to hold them.
+            let mut got: Vec<u32> = r
+                .search("body", &["alpha"], n_docs as usize, BoolMode::Or)
+                .await
+                .expect("search")
+                .into_iter()
+                .map(|(row, _)| row.get())
+                .collect();
+            got.sort_unstable();
+            assert_eq!(
+                got,
+                (0..n_docs).collect::<Vec<_>>(),
+                "n_docs {n_docs}: every row carries `alpha`"
+            );
+
+            // The unranked path promises ascending rows, which on a
+            // reordered blob means it must re-sort after translating:
+            // the walk emits blob ids in order, and those are a
+            // different order.
+            let matched = r
+                .token_match("body", &["alpha"], BoolMode::Or)
+                .await
+                .expect("token match")
+                .0;
+            assert!(
+                matched.windows(2).all(|w| w[0] < w[1]),
+                "n_docs {n_docs}: unranked rows must come back ascending, got {matched:?}"
+            );
+            assert_eq!(
+                matched.iter().map(|r| r.get()).collect::<Vec<_>>(),
+                (0..n_docs).collect::<Vec<_>>(),
+                "n_docs {n_docs}: and name every row exactly once"
+            );
+        }
+    }
+
+    /// The ranged union kernel windows on the blob's own ids while
+    /// handing back rows, so slicing a reordered blob into windows and
+    /// merging must equal the unsliced search.
+    ///
+    /// This is the one kernel whose input is in blob space and whose
+    /// output is in row space at the same time. If the window bounds
+    /// were translated, or the hits were not, the union of the slices
+    /// would drop or double-count documents that a single call finds.
+    #[tokio::test]
+    async fn a_sliced_range_union_over_a_reordered_blob_equals_the_unsliced_search() {
+        const N_DOCS: u32 = 600;
+        const STRIDE: u32 = 137;
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let text = |row: u32| format!("alpha beta t{} t{}", row % 23, row % 31);
+
+        let map: Vec<u32> = (0..N_DOCS).map(|id| (id * STRIDE) % N_DOCS).collect();
+        let mut b = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        b.register_column("body".into(), false).expect("register");
+        for (id, &row) in map.iter().enumerate() {
+            b.add_doc(0, id as u32, &text(row)).expect("add doc");
+        }
+        b.doc_map = Some(map);
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+
+        let terms = ["alpha", "beta"];
+        let whole = r
+            .search_or_range_pretokenized("body", &terms, N_DOCS as usize, 0, N_DOCS)
+            .await
+            .expect("unsliced");
+
+        assert_eq!(
+            whole.len(),
+            N_DOCS as usize,
+            "every row carries both terms, so the unsliced search is not empty"
+        );
+
+        let mut sliced: Vec<(RowId, f32)> = Vec::new();
+        for &(lo, hi) in &[(0u32, 149u32), (149, 400), (400, N_DOCS)] {
+            sliced.extend(
+                r.search_or_range_pretokenized("body", &terms, N_DOCS as usize, lo, hi)
+                    .await
+                    .expect("sliced"),
+            );
+        }
+
+        let key = |v: &mut Vec<(RowId, f32)>| {
+            v.sort_by_key(|&(d, _)| d);
+            v.iter()
+                .map(|&(d, s)| (d.get(), s.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        let mut whole_sorted = whole;
+        assert_eq!(
+            key(&mut sliced),
+            key(&mut whole_sorted),
+            "the windows must partition the blob exactly once"
         );
     }
 

@@ -19,6 +19,19 @@ use crate::superfile::{
     id_space::{DocMap, FtsDocId, RowSet},
 };
 
+/// Whether the pushed-down row set admits the blob id `doc`.
+///
+/// The set is the one thing that reaches a kernel in row space while the
+/// kernel walks blob ids, so the translation happens here, in the single
+/// place both gates ask the question. `None` admits everything.
+#[inline]
+fn allows(allow: &Option<RowSet>, doc_map: &DocMap, doc: u32) -> bool {
+    match allow {
+        None => true,
+        Some(allow) => allow.contains(doc_map.row_of(FtsDocId::new(doc))),
+    }
+}
+
 /// Atom-walk admission gate: the heterogeneous sibling of
 /// [`ExcludeFilter`], additionally able to exclude docs containing a
 /// negated *phrase*. Same monotonic-doc contract, same allow-set.
@@ -60,9 +73,7 @@ impl AtomExcludeFilter {
             self.last_doc
         );
         self.last_doc = doc;
-        if let Some(allow) = &self.allow
-            && !allow.contains(self.doc_map.row_of(FtsDocId::new(doc)))
-        {
+        if !allows(&self.allow, &self.doc_map, doc) {
             return Ok(false);
         }
         for a in &mut self.atoms {
@@ -160,9 +171,7 @@ impl ExcludeFilter {
             self.last_doc
         );
         self.last_doc = doc;
-        if let Some(allow) = &self.allow
-            && !allow.contains(self.doc_map.row_of(FtsDocId::new(doc)))
-        {
+        if !allows(&self.allow, &self.doc_map, doc) {
             return false;
         }
         for c in &mut self.cursors {
