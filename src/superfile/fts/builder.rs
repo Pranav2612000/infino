@@ -1376,6 +1376,14 @@ pub struct FtsBuilder {
     /// the backwards-compatibility tests pick an older one so the reader's
     /// legacy paths are exercised against faithfully written files.
     pub(crate) era: BlobEra,
+    /// The Parquet row each doc id stands for, when the caller fed
+    /// documents in an order of its own rather than in row order.
+    ///
+    /// `Some` makes the blob [`format::fts::VERSION_V8`]: the map is
+    /// written as its own region and the reader translates hits through
+    /// it. `None`, the default, writes the era's version unchanged, so
+    /// nothing about a build that does not reorder moves.
+    pub(crate) doc_map: Option<Vec<u32>>,
 }
 
 impl FtsBuilder {
@@ -1431,6 +1439,7 @@ impl FtsBuilder {
             run_scratch: Vec::new(),
             bump: Bump::new(),
             era: BlobEra::V7,
+            doc_map: None,
         }
     }
 
@@ -2658,6 +2667,7 @@ impl FtsBuilder {
             run_scratch: _,
             bump,
             era,
+            doc_map,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -2808,6 +2818,7 @@ impl FtsBuilder {
                 scratch_dir,
                 finish_profile,
                 era,
+                doc_map,
             },
             &mut w,
         )
@@ -2840,6 +2851,7 @@ impl FtsBuilder {
             run_scratch: _,
             bump,
             era,
+            doc_map,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -3317,6 +3329,7 @@ impl FtsBuilder {
                 scratch_dir,
                 finish_profile,
                 era,
+                doc_map,
             },
             &mut w,
         )
@@ -3396,6 +3409,8 @@ struct BlobAssemblyInputs {
     /// Whether the per-term coarse block-max table was written (V5 and later). When
     /// false the blob is a legacy V2–V4 (no coarse) — test-only.
     era: BlobEra,
+    /// See [`FtsBuilder::doc_map`]. `Some` makes this a `V8` blob.
+    doc_map: Option<Vec<u32>>,
 }
 
 /// FST emission sink picked by the active finish path.
@@ -3438,6 +3453,7 @@ fn assemble_and_write_blob<W: Write>(
         scratch_dir,
         mut finish_profile,
         era,
+        doc_map,
     } = inputs;
 
     debug_assert!(
@@ -3536,14 +3552,26 @@ fn assemble_and_write_blob<W: Write>(
         FstSource::InRam(bytes) => bytes.len() as u64,
         FstSource::Streamed { len, .. } => *len,
     };
-    let header_size: u64 = format::fts::HEADER_SIZE_V2 as u64;
+    // A blob carrying a doc-id map is `V8` and its header gains the
+    // field locating the region; without one nothing about the layout
+    // moves and the era's own version is stamped.
+    let header_size: u64 = match doc_map.is_some() {
+        true => format::fts::HEADER_SIZE_V8 as u64,
+        false => format::fts::HEADER_SIZE_V2 as u64,
+    };
     let fst_offset: u64 = header_size;
     let postings_offset: u64 = fst_offset + fst_total_len;
     // The positions region sits between the postings and the
     // doc-lengths directory (keeping the lazy-open doc-lengths tail
     // fetch small); absent, the directory follows postings directly.
     let positions_offset: u64 = postings_offset + postings_len;
-    let doc_lengths_table_offset: u64 = positions_offset + positions_region.1;
+    // One `u32` per document plus the region CRC, or nothing at all.
+    let doc_map_offset: u64 = positions_offset + positions_region.1;
+    let doc_map_len: u64 = match &doc_map {
+        Some(map) => (map.len() * format::fts::U32_BYTES + format::CRC_BYTES) as u64,
+        None => 0,
+    };
+    let doc_lengths_table_offset: u64 = doc_map_offset + doc_map_len;
     let mut doc_lengths_array_offset: u64 =
         doc_lengths_table_offset + (n_columns as u64) * (DOC_LENGTHS_ENTRY_SIZE as u64) + 4 /* dir CRC */;
 
@@ -3621,6 +3649,9 @@ fn assemble_and_write_blob<W: Write>(
     // so the stored per-block bound is interpreted against the pair that
     // entry names. Nothing about the layout differs either way.
     let fts_version = match era {
+        // The map is the only thing that makes a blob `V8`, and it rides
+        // on the current era's layout; an older era never carries one.
+        BlobEra::V7 if doc_map.is_some() => format::fts::VERSION_V8,
         BlobEra::V7 => format::fts::VERSION_V7,
         BlobEra::V6 => format::fts::VERSION_V6,
         BlobEra::V5 => format::fts::VERSION_V5,
@@ -3636,6 +3667,9 @@ fn assemble_and_write_blob<W: Write>(
     header.extend_from_slice(&postings_offset.to_le_bytes()); // 8
     header.extend_from_slice(&doc_lengths_table_offset.to_le_bytes()); // 8
     header.extend_from_slice(&positions_offset.to_le_bytes()); // 8
+    if doc_map.is_some() {
+        header.extend_from_slice(&doc_map_offset.to_le_bytes()); // 8
+    }
     debug_assert_eq!(header.len(), header_size as usize, "header size mismatch");
 
     w.write_all(&header)?;
@@ -3664,6 +3698,21 @@ fn assemble_and_write_blob<W: Write>(
     // Mirror of vector's `drop(scratch_dir);` at the bottom of
     // `VectorBuilder::finish_to`.
     drop(scratch_dir);
+
+    if let Some(map) = &doc_map {
+        debug_assert_eq!(
+            map.len() as u32,
+            n_docs,
+            "doc-id map must carry one row per document"
+        );
+        let mut map_buf: Vec<u8> = Vec::with_capacity(map.len() * format::fts::U32_BYTES);
+        for row in map {
+            map_buf.extend_from_slice(&row.to_le_bytes());
+        }
+        let map_crc = crc32c(&map_buf);
+        w.write_all(&map_buf)?;
+        w.write_all(&map_crc.to_le_bytes())?;
+    }
 
     w.write_all(&dir_buf)?;
     w.write_all(&arrays_buf)?;

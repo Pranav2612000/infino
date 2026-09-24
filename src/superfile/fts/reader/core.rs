@@ -507,6 +507,14 @@ pub struct FtsReader {
     pub(super) dict_layout: DictLayout,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
+    /// The Parquet row each doc id in this blob stands for, `V8` only.
+    /// `None` on every older blob, where a doc id already is a row.
+    ///
+    /// The kernels never consult it: they walk, score and prune in the
+    /// blob's own id space from end to end, and the ids they return are
+    /// translated once here. That is what lets the writer group
+    /// documents by the terms they share without a Parquet row moving.
+    pub(super) doc_map: Option<Arc<[u32]>>,
 }
 
 impl FtsReader {
@@ -603,18 +611,7 @@ impl FtsReader {
         // fetched span (and in the overlay below), so
         // `open_with_source` re-reads them without another GET. (v3/v4 share
         // v2's header size.)
-        let header_size = match version {
-            v if v == format::fts::VERSION_V2
-                || v == format::fts::VERSION_V3
-                || v == format::fts::VERSION_V4
-                || v == format::fts::VERSION_V5
-                || v == format::fts::VERSION_V6
-                || v == format::fts::VERSION_V7 =>
-            {
-                format::fts::HEADER_SIZE_V2
-            }
-            _ => FTS_HEADER_SIZE,
-        };
+        let header_size = format::fts::header_size(version).unwrap_or(FTS_HEADER_SIZE);
         if header.len() < header_size {
             return Err(FtsError::Read(ReadError::MissingKv("fts header")));
         }
@@ -770,6 +767,23 @@ impl FtsReader {
             false => None,
         };
 
+        // The doc-id map region, `VERSION_V8` only: one `u32` per document
+        // giving the Parquet row that document's postings belong to, then
+        // a CRC. It sits between the positions region and the doc-lengths
+        // directory, so on a blob that has one the positions region ends
+        // where the map begins rather than at the directory.
+        let doc_map_offset: Option<usize> = match version == format::fts::VERSION_V8 {
+            true => {
+                let ext = fetch_source_range(
+                    &source,
+                    format::fts::HEADER_SIZE_V2..format::fts::HEADER_SIZE_V8,
+                    "fts header doc-map ext",
+                )?;
+                Some(read_u64_le(&ext[0..U64_BYTES]) as usize)
+            }
+            false => None,
+        };
+
         // Bounds-check every offset against the blob length before
         // any slice indexing. A single byte flip in the header can
         // corrupt these into multi-GB values; without this check
@@ -781,13 +795,16 @@ impl FtsReader {
         // short-circuit, the postings region body is zero bytes and
         // only the trailing 4-byte CRC32C(empty) sits between
         // `postings_offset` and `doc_lengths_table_offset`.
-        let postings_end = positions_offset.unwrap_or(doc_lengths_table_offset);
+        let regions_end = doc_map_offset.unwrap_or(doc_lengths_table_offset);
+        let postings_end = positions_offset.unwrap_or(regions_end);
         if fst_offset < header_size
             || postings_offset < fst_offset + 4
             || postings_end < postings_offset + 4
-            || doc_lengths_table_offset < postings_end
+            || regions_end < postings_end
+            || doc_lengths_table_offset < regions_end
             || doc_lengths_table_offset > source_len
-            || positions_offset.is_some_and(|po| doc_lengths_table_offset < po + 4)
+            || positions_offset.is_some_and(|po| regions_end < po + 4)
+            || doc_map_offset.is_some_and(|mo| doc_lengths_table_offset < mo + 4)
         {
             return Err(FtsError::Read(ReadError::MalformedVersion(format!(
                 "fts header offsets out of range: fst={fst_offset}, postings={postings_offset}, \
@@ -805,7 +822,7 @@ impl FtsReader {
         let fst_range = fst_offset..postings_offset.saturating_sub(4); // strip CRC
         let postings_range = postings_offset..postings_end.saturating_sub(4); // strip CRC
         let positions_range: Option<Range<usize>> =
-            positions_offset.map(|po| po..doc_lengths_table_offset.saturating_sub(4));
+            positions_offset.map(|po| po..regions_end.saturating_sub(4));
 
         // Verify FST CRC32C (4 bytes after fst body).
         if opts.verify_crc {
@@ -846,12 +863,11 @@ impl FtsReader {
         if opts.verify_crc
             && let Some(pos_range) = &positions_range
         {
-            let crc_pos = doc_lengths_table_offset.saturating_sub(4);
-            let crc_bytes = fetch_source_range(
-                &source,
-                crc_pos..doc_lengths_table_offset,
-                "fts/positions crc",
-            )?;
+            // The positions region's CRC trails the region, which is the
+            // doc-lengths directory only on a blob with no doc-id map;
+            // with one, the map sits between them.
+            let crc_pos = regions_end.saturating_sub(4);
+            let crc_bytes = fetch_source_range(&source, crc_pos..regions_end, "fts/positions crc")?;
             let crc_expected = read_u32_le(&crc_bytes);
             let pos_bytes = fetch_source_range(&source, pos_range.clone(), "fts/positions")?;
             let crc_actual = crc32c(&pos_bytes);
@@ -1044,6 +1060,38 @@ impl FtsReader {
             column_id_by_name.insert(col_cfg.name.clone(), i as u32);
         }
 
+        // The map is read whole at open, beside the doc-lengths tail it
+        // sits next to, because every query that returns a hit needs it.
+        let doc_map: Option<Arc<[u32]>> = match doc_map_offset {
+            None => None,
+            Some(mo) => {
+                let body_end = doc_lengths_table_offset.saturating_sub(4);
+                let expect = (n_docs as usize) * U32_BYTES;
+                if body_end < mo || body_end - mo != expect {
+                    return Err(FtsError::Read(ReadError::MalformedVersion(format!(
+                        "fts doc-map is {} bytes for {n_docs} docs, expected {expect}",
+                        body_end.saturating_sub(mo)
+                    ))));
+                }
+                let body = fetch_source_range(&source, mo..body_end, "fts/doc-map")?;
+                if opts.verify_crc {
+                    let crc_bytes =
+                        fetch_source_range(&source, body_end..body_end + 4, "fts/doc-map crc")?;
+                    if read_u32_le(&crc_bytes) != crc32c(&body) {
+                        return Err(FtsError::Read(ReadError::ChecksumMismatch {
+                            section: "fts/doc-map",
+                            column: String::new(),
+                        }));
+                    }
+                }
+                let rows: Vec<u32> = body
+                    .chunks_exact(U32_BYTES)
+                    .map(read_u32_le)
+                    .collect();
+                Some(Arc::from(rows))
+            }
+        };
+
         Ok(FtsReader {
             source,
             n_docs,
@@ -1059,7 +1107,30 @@ impl FtsReader {
             dict_layout,
             columns,
             column_id_by_name,
+            doc_map,
         })
+    }
+
+    /// The Parquet row a doc id of this blob stands for.
+    ///
+    /// The identity on every blob through `V7`, where the two are the
+    /// same number, and a lookup on a `V8` blob whose documents are
+    /// stored under an ordering of their own. Out-of-range ids pass
+    /// through unchanged rather than panicking: the kernels never
+    /// produce one, and a corrupt map should not take down a query that
+    /// the CRC over the region did not already reject.
+    #[inline]
+    pub(crate) fn row_of(&self, doc_id: u32) -> u32 {
+        match &self.doc_map {
+            None => doc_id,
+            Some(map) => map.get(doc_id as usize).copied().unwrap_or(doc_id),
+        }
+    }
+
+    /// Whether this blob stores its documents under an ordering of its
+    /// own rather than in row order.
+    pub(crate) fn has_doc_map(&self) -> bool {
+        self.doc_map.is_some()
     }
 
     pub fn n_docs(&self) -> u32 {
@@ -2131,7 +2202,7 @@ mod tests {
         }
     }
     use std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         sync::atomic::{AtomicUsize, Ordering},
     };
 
@@ -2355,6 +2426,142 @@ mod tests {
             Bytes::from(b.finish().expect("finish")),
             r#"[{"name":"body","tokenizer":"ascii_lower"}]"#,
         )
+    }
+
+    /// A corpus built twice: once in row order, once under an ordering
+    /// of its own with the map that undoes it. Every query must return
+    /// the same rows with the same scores.
+    ///
+    /// This is the whole contract of the doc-id map. The second blob's
+    /// postings, skip tables, block maxima and doc lengths are all in a
+    /// different order from the first's, and the kernels work in that
+    /// order from end to end; only the ids handed back are translated.
+    /// If any path returned a blob id where a row was meant, or
+    /// translated one twice, the two rankings would disagree.
+    #[tokio::test]
+    async fn a_reordered_blob_answers_exactly_like_a_row_ordered_one() {
+        const N_DOCS: u32 = 900;
+        // A deterministic permutation that moves every document and is
+        // its own kind of scramble rather than a rotation: coprime
+        // stride over the corpus length.
+        const STRIDE: u32 = 401;
+        fn text_for(row: u32) -> String {
+            let mut t = String::new();
+            for _ in 0..=(row % 3) {
+                t.push_str("alpha ");
+            }
+            if !row.is_multiple_of(3) {
+                t.push_str("beta ");
+            }
+            if row.is_multiple_of(7) {
+                t.push_str("gamma ");
+            }
+            for f in 0..(row % 5) {
+                t.push_str(&format!("pad{f} "));
+            }
+            t.trim().to_string()
+        }
+
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+
+        let mut plain = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        plain
+            .register_column("body".into(), false)
+            .expect("register");
+        for row in 0..N_DOCS {
+            plain.add_doc(0, row, &text_for(row)).expect("add doc");
+        }
+        let plain_blob = Bytes::from(plain.finish().expect("finish"));
+        let plain_reader = FtsReader::open(plain_blob.clone(), json).expect("open plain");
+
+        // `map[id]` is the row that doc id stands for. Documents are fed
+        // in that order, so the blob's own ids run 0..N ascending while
+        // the rows they carry do not.
+        let map: Vec<u32> = (0..N_DOCS).map(|id| (id * STRIDE) % N_DOCS).collect();
+        let mut distinct: Vec<u32> = map.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            N_DOCS as usize,
+            "the map must be a permutation"
+        );
+        assert!(
+            map.iter().enumerate().any(|(i, &r)| i as u32 != r),
+            "and must move something"
+        );
+
+        let mut reordered = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        reordered
+            .register_column("body".into(), false)
+            .expect("register");
+        for (id, &row) in map.iter().enumerate() {
+            reordered
+                .add_doc(0, id as u32, &text_for(row))
+                .expect("add doc");
+        }
+        reordered.doc_map = Some(map.clone());
+        let reordered_blob = Bytes::from(reordered.finish().expect("finish"));
+
+        assert_eq!(
+            read_u32_le(&reordered_blob[VERSION_FIELD]),
+            format::fts::VERSION_V8,
+            "a blob with a map is V8"
+        );
+        assert_eq!(
+            read_u32_le(&plain_blob[VERSION_FIELD]),
+            format::fts::VERSION_V7,
+            "and one without is unchanged"
+        );
+        let reordered_reader = FtsReader::open(reordered_blob, json).expect("open reordered");
+        assert!(reordered_reader.has_doc_map());
+        assert!(!plain_reader.has_doc_map());
+
+        for terms in [
+            &["alpha"][..],
+            &["beta"][..],
+            &["gamma"][..],
+            &["alpha", "beta"][..],
+            &["alpha", "beta", "gamma"][..],
+        ] {
+            // Taken whole, the two must agree on every row and score.
+            let mut want_all = top(&plain_reader, terms, N_DOCS as usize + 1).await;
+            let mut got_all = top(&reordered_reader, terms, N_DOCS as usize + 1).await;
+            assert_eq!(want_all.len(), got_all.len(), "{terms:?} match count");
+            let by_row = |v: &mut Vec<(u32, f32)>| v.sort_by_key(|&(d, _)| d);
+            by_row(&mut want_all);
+            by_row(&mut got_all);
+            for ((dw, sw), (dg, sg)) in want_all.iter().zip(got_all.iter()) {
+                assert_eq!(dw, dg, "{terms:?}: row {dw} missing or extra");
+                assert!(
+                    (sw - sg).abs() < 1e-5,
+                    "{terms:?} row {dw}: score {sw} vs {sg}"
+                );
+            }
+
+            // Truncated, the two agree on the scores at every rank but
+            // need not name the same rows, because equal scores are
+            // broken by the blob's own doc id and reordering is exactly
+            // a change to that. So check the score sequence, and that
+            // each row a truncated search returns really does carry the
+            // score its rank claims.
+            let truth: HashMap<u32, f32> = want_all.iter().copied().collect();
+            for k in [1usize, 5, 50, 400] {
+                let want = top(&plain_reader, terms, k).await;
+                let got = top(&reordered_reader, terms, k).await;
+                assert_eq!(want.len(), got.len(), "{terms:?} k={k} length");
+                for (rank, ((_, sw), (dg, sg))) in want.iter().zip(got.iter()).enumerate() {
+                    assert!(
+                        (sw - sg).abs() < 1e-5,
+                        "{terms:?} k={k} rank {rank}: score {sw} vs {sg}"
+                    );
+                    assert!(
+                        truth.get(dg).is_some_and(|t| (t - sg).abs() < 1e-5),
+                        "{terms:?} k={k} rank {rank}: row {dg} scored {sg}, not its real score"
+                    );
+                }
+            }
+        }
     }
 
     /// Ranked results with pruning live (`k` far below the match count).

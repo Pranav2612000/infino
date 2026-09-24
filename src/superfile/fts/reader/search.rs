@@ -415,12 +415,12 @@ impl FtsReader {
         let hits = match prep {
             PreparedClauses::Done { hits, .. } => hits,
             prep => {
-                let (hits, run_ns) = timed_section(|| self.run_prepared(prep));
+                let (hits, run_ns) = timed_section(|| self.run_prepared_in_blob_ids(prep));
                 work.kernel_cpu_ns += run_ns;
                 hits?
             }
         };
-        Ok((hits, work))
+        Ok((self.hits_to_rows(hits), work))
     }
 
     /// BM25 search over explicit clause lists, with negated terms
@@ -759,7 +759,30 @@ impl FtsReader {
 
     /// CPU half paired with [`Self::prepare_clauses`] — scores the
     /// cursors it fetched. No I/O, so it can run on the reader pool.
+    /// Translate a kernel's doc ids into Parquet rows.
+    ///
+    /// The kernels work in the blob's own id space from end to end, so
+    /// every path that hands hits back to a caller passes them through
+    /// here exactly once. A no-op on any blob without a doc-id map,
+    /// which is every blob through `V7`.
+    #[inline]
+    pub(super) fn hits_to_rows(&self, mut hits: Vec<(u32, f32)>) -> Vec<(u32, f32)> {
+        if self.has_doc_map() {
+            for (doc, _) in &mut hits {
+                *doc = self.row_of(*doc);
+            }
+        }
+        hits
+    }
+
     pub(crate) fn run_prepared(&self, prep: PreparedClauses) -> Result<Vec<(u32, f32)>, FtsError> {
+        self.run_prepared_in_blob_ids(prep)
+            .map(|h| self.hits_to_rows(h))
+    }
+
+    /// [`Self::run_prepared`] without the translation, for the one caller
+    /// that reports work alongside the hits and does its own.
+    fn run_prepared_in_blob_ids(&self, prep: PreparedClauses) -> Result<Vec<(u32, f32)>, FtsError> {
         match prep {
             PreparedClauses::Done { hits, .. } => Ok(hits),
             PreparedClauses::Must {
@@ -906,6 +929,9 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let cursors = set.cursors.clone();
+        // The range is a slice of the blob's id space, taken to split one
+        // superfile across threads; it carries no row meaning, so a
+        // reordered blob slices exactly as an unreordered one does.
         self.run_windowed_maxscore(
             set.column_id,
             cursors,
@@ -915,6 +941,7 @@ impl FtsReader {
             doc_id_start,
             doc_id_end,
         )
+        .map(|h| self.hits_to_rows(h))
     }
 
     /// Multi-column BM25 search (most_fields semantics): each
