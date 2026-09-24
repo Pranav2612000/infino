@@ -9,16 +9,15 @@
 //! all, checked before any negated list is consulted. `pub(super)` within
 //! `reader/` (ExcludeFilter stays pub(crate) — PreparedClauses carries it).
 
-use std::sync::Arc;
-
-use roaring::RoaringBitmap;
-
 use super::{
     cursor::TermCursor,
     phrase::AnyCursor,
     work::{term_cursor_bytes, term_cursor_ranges},
 };
-use crate::superfile::error::FtsError;
+use crate::superfile::{
+    error::FtsError,
+    id_space::{DocMap, FtsDocId, RowSet},
+};
 
 /// Atom-walk admission gate: the heterogeneous sibling of
 /// [`ExcludeFilter`], additionally able to exclude docs containing a
@@ -26,23 +25,23 @@ use crate::superfile::error::FtsError;
 pub(super) struct AtomExcludeFilter {
     pub(super) atoms: Vec<AnyCursor>,
     /// See [`ExcludeFilter::allow`].
-    pub(super) allow: Option<Arc<RoaringBitmap>>,
+    pub(super) allow: Option<RowSet>,
     /// See [`ExcludeFilter::doc_map`].
-    pub(super) doc_map: Option<Arc<[u32]>>,
+    pub(super) doc_map: DocMap,
     pub(super) last_doc: u32,
 }
 
 impl AtomExcludeFilter {
     pub(super) fn new(atoms: Vec<AnyCursor>) -> Self {
-        Self::with_allow(atoms, None, None)
+        Self::with_allow(atoms, None, DocMap::Identity)
     }
 
     /// A gate over `atoms` that additionally admits only the docs in
     /// `allow` (`None` admits every doc the atoms do not exclude).
     pub(super) fn with_allow(
         atoms: Vec<AnyCursor>,
-        allow: Option<Arc<RoaringBitmap>>,
-        doc_map: Option<Arc<[u32]>>,
+        allow: Option<RowSet>,
+        doc_map: DocMap,
     ) -> Self {
         Self {
             atoms,
@@ -62,7 +61,7 @@ impl AtomExcludeFilter {
         );
         self.last_doc = doc;
         if let Some(allow) = &self.allow
-            && !allow.contains(self.row_for(doc))
+            && !allow.contains(self.doc_map.row_of(FtsDocId::new(doc)))
         {
             return Ok(false);
         }
@@ -96,7 +95,7 @@ pub(crate) struct ExcludeFilter {
     /// resolved for this superfile as `local_doc_id`s. `None` admits every
     /// doc the negated lists do not exclude. Checked first: a doc outside
     /// the set never costs a negated-list probe.
-    pub(super) allow: Option<Arc<RoaringBitmap>>,
+    pub(super) allow: Option<RowSet>,
     /// This blob's doc-id map, when it stores its documents in an order
     /// of its own.
     ///
@@ -105,21 +104,9 @@ pub(crate) struct ExcludeFilter {
     /// kernel walks blob ids, so the id is translated before the set is
     /// consulted. Without this a scoped search on a reordered blob tests
     /// a row set with a blob id and matches almost nothing.
-    pub(super) doc_map: Option<Arc<[u32]>>,
+    pub(super) doc_map: DocMap,
     /// Last doc-id passed to `admits`; guards the monotonic call order.
     pub(super) last_doc: u32,
-}
-
-impl AtomExcludeFilter {
-    /// The row a blob id stands for, which is the space the allow-set is
-    /// expressed in. The identity when the blob is in arrival order.
-    #[inline]
-    fn row_for(&self, doc: u32) -> u32 {
-        match &self.doc_map {
-            None => doc,
-            Some(map) => map.get(doc as usize).copied().unwrap_or(doc),
-        }
-    }
 }
 
 impl ExcludeFilter {
@@ -128,15 +115,15 @@ impl ExcludeFilter {
     /// shorthand is for the tests that exercise negation alone.
     #[cfg(test)]
     pub(super) fn new(cursors: Vec<TermCursor>) -> Self {
-        Self::with_allow(cursors, None, None)
+        Self::with_allow(cursors, None, DocMap::Identity)
     }
 
     /// A gate over `cursors` that additionally admits only the docs in
     /// `allow` (`None` admits every doc the cursors do not exclude).
     pub(super) fn with_allow(
         cursors: Vec<TermCursor>,
-        allow: Option<Arc<RoaringBitmap>>,
-        doc_map: Option<Arc<[u32]>>,
+        allow: Option<RowSet>,
+        doc_map: DocMap,
     ) -> Self {
         Self {
             cursors,
@@ -160,18 +147,6 @@ impl ExcludeFilter {
 }
 
 impl ExcludeFilter {
-    /// The row a blob id stands for, which is the space the allow-set is
-    /// expressed in. The identity when the blob is in arrival order.
-    #[inline]
-    fn row_for(&self, doc: u32) -> u32 {
-        match &self.doc_map {
-            None => doc,
-            Some(map) => map.get(doc as usize).copied().unwrap_or(doc),
-        }
-    }
-}
-
-impl ExcludeFilter {
     /// `false` iff `doc` is outside the allow-set or in any negated list.
     ///
     /// `doc` must be non-decreasing across a search: `skip_to` only
@@ -186,7 +161,7 @@ impl ExcludeFilter {
         );
         self.last_doc = doc;
         if let Some(allow) = &self.allow
-            && !allow.contains(self.row_for(doc))
+            && !allow.contains(self.doc_map.row_of(FtsDocId::new(doc)))
         {
             return false;
         }
@@ -202,7 +177,10 @@ impl ExcludeFilter {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use bytes::Bytes;
+    use roaring::RoaringBitmap;
 
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
@@ -263,13 +241,21 @@ mod tests {
             .await
             .expect("build cursors");
         let allow: RoaringBitmap = [1u32, 2].into_iter().collect();
-        let mut f = ExcludeFilter::with_allow(cursors, Some(Arc::new(allow.clone())), None);
+        let mut f = ExcludeFilter::with_allow(
+            cursors,
+            Some(RowSet::new(Arc::new(allow.clone()))),
+            DocMap::Identity,
+        );
         assert!(!f.admits(0), "outside the allow-set (and negated)");
         assert!(!f.admits(1), "inside the allow-set but negated");
         assert!(f.admits(2), "inside the allow-set, not negated");
 
         // A bare row bound: no negated cursors at all.
-        let mut bound = ExcludeFilter::with_allow(Vec::new(), Some(Arc::new(allow)), None);
+        let mut bound = ExcludeFilter::with_allow(
+            Vec::new(),
+            Some(RowSet::new(Arc::new(allow))),
+            DocMap::Identity,
+        );
         assert!(!bound.admits(0));
         assert!(bound.admits(1));
         assert!(bound.admits(2));
@@ -289,8 +275,8 @@ mod tests {
         let allow: RoaringBitmap = (0u32..4).collect();
         let mut f = AtomExcludeFilter::with_allow(
             atoms.into_iter().flatten().collect(),
-            Some(Arc::new(allow)),
-            None,
+            Some(RowSet::new(Arc::new(allow))),
+            DocMap::Identity,
         );
         assert!(!f.admits(0).expect("admits"), "allowed but negated");
         assert!(f.admits(1).expect("admits"), "allowed, clean");

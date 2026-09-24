@@ -110,6 +110,7 @@ use crate::{
             short::{SHORT_MAX_DF, encode_short},
             tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
         },
+        id_space::FtsDocId,
     },
     utils::{
         terms::{
@@ -1764,10 +1765,14 @@ impl FtsBuilder {
         &mut self,
         column_id: u32,
         term: &str,
-        doc_id: u32,
+        doc_id: FtsDocId,
         tf: u32,
         positions: &[u32],
     ) -> Result<(), BuildError> {
+        // The accumulators below are the blob's own id space from end to
+        // end, so the id comes off here, once, at the entry point that
+        // decides what space the caller had to be in.
+        let doc_id = doc_id.get();
         let col_idx = column_id as usize;
         if self.postings[col_idx].is_spilled() {
             return self.push_prebuilt_spilled(col_idx, term, doc_id, tf, positions);
@@ -4671,7 +4676,7 @@ mod tests {
             .search("title", &["rust"], 10, BoolMode::Or)
             .await
             .expect("title search");
-        let ids_t: Vec<u32> = hits_t.iter().map(|(d, _)| *d).collect();
+        let ids_t: Vec<u32> = hits_t.iter().map(|(d, _)| d.get()).collect();
         assert_eq!(ids_t.len(), 2, "title 'rust' hit count");
         assert!(ids_t.contains(&0));
         assert!(ids_t.contains(&1));
@@ -4683,7 +4688,7 @@ mod tests {
             .search("body", &["rust"], 10, BoolMode::Or)
             .await
             .expect("body search");
-        let ids_b: Vec<u32> = hits_b.iter().map(|(d, _)| *d).collect();
+        let ids_b: Vec<u32> = hits_b.iter().map(|(d, _)| d.get()).collect();
         assert_eq!(ids_b.len(), 2, "body 'rust' hit count");
         assert!(ids_b.contains(&0));
         assert!(ids_b.contains(&1));

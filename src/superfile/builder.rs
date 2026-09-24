@@ -104,6 +104,7 @@ use crate::{
             reorder::{ForwardIndex, bisect_order},
             tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER},
         },
+        id_space::{FtsDocId, RowId},
         ids,
         stats::SuperfileStats,
         vector::{
@@ -163,12 +164,12 @@ fn survivor_rows(
     n_local: u32,
     deleted: Option<&RoaringBitmap>,
     base: u32,
-) -> (Vec<Option<u32>>, u32) {
+) -> (Vec<Option<RowId>>, u32) {
     let mut rows = vec![None; n_local as usize];
     let mut kept = 0u32;
     for d in 0..n_local {
         if !deleted.is_some_and(|b| b.contains(d)) {
-            rows[d as usize] = Some(base + kept);
+            rows[d as usize] = Some(RowId::new(base + kept));
             kept += 1;
         }
     }
@@ -185,12 +186,15 @@ fn survivor_rows(
 /// they are not, and reading a posting's id as a row silently files it
 /// under a different document, so the input's own map composes in: a
 /// blob id goes wherever the row it stands for goes.
-fn remap_by_blob_id(fts: &FtsReader, remap_by_row: &[Option<u32>]) -> Vec<Option<u32>> {
+fn remap_by_blob_id<T: Copy>(fts: &FtsReader, remap_by_row: &[Option<T>]) -> Vec<Option<T>> {
     if !fts.has_doc_map() {
         return remap_by_row.to_vec();
     }
     (0..fts.n_docs())
-        .map(|b| remap_by_row.get(fts.row_of(b) as usize).copied().flatten())
+        .map(|b| {
+            let row = fts.row_of(FtsDocId::new(b));
+            remap_by_row.get(row.get() as usize).copied().flatten()
+        })
         .collect()
 }
 
@@ -1123,6 +1127,14 @@ impl SuperfileBuilder {
         // Postings and lengths are keyed by the input's doc ids, which are
         // its rows only when it kept arrival order.
         let remap = remap_by_blob_id(fts, &remap_by_row);
+        // This carry appends in arrival order, so an output row is the
+        // doc id the output blob stores it under. The reordering merge
+        // is the path where the two part company, and it converts
+        // through the chosen order instead.
+        let remap: Vec<Option<FtsDocId>> = remap
+            .iter()
+            .map(|o| o.map(|row| FtsDocId::new(row.get())))
+            .collect();
         self.carry_fts_postings_with_remap(reader, &remap)?;
 
         // The lengths are read in the input's own id order and appended in
@@ -1137,7 +1149,7 @@ impl SuperfileBuilder {
             let mut kept: Vec<u32> = vec![0; n_kept as usize];
             for (d, &len) in dls.iter().enumerate() {
                 if let Some(out) = remap.get(d).copied().flatten() {
-                    kept[(out - base) as usize] = len;
+                    kept[(out.get() - base) as usize] = len;
                 }
             }
             self.fts_builder
@@ -1161,7 +1173,7 @@ impl SuperfileBuilder {
     fn carry_fts_postings_with_remap(
         &mut self,
         reader: &SuperfileReader,
-        remap: &[Option<u32>],
+        remap: &[Option<FtsDocId>],
     ) -> Result<(), BuildError> {
         // Same compatibility gate as `carry_fts_from_reader`, so callers
         // that feed this directly (the multi-cell merge) get it too.
@@ -1677,7 +1689,7 @@ impl SuperfileBuilder {
                 // stable id was already claimed (or whose cell was
                 // superseded out of the pack) maps to `None`.
                 let n_local = fts.n_docs();
-                let mut remap: Vec<Option<u32>> = vec![None; n_local as usize];
+                let mut remap_by_row: Vec<Option<FtsDocId>> = vec![None; n_local as usize];
                 let mut rank: usize = 0;
                 for d in 0..n_local {
                     let is_deleted = deleted.as_ref().is_some_and(|b| b.contains(d));
@@ -1687,9 +1699,15 @@ impl SuperfileBuilder {
                     let sid = ids.value(rank);
                     rank += 1;
                     if let Some(pos) = pos_of_id.remove(&sid) {
-                        remap[d as usize] = Some(pos);
+                        remap_by_row[d as usize] = Some(FtsDocId::new(pos));
                     }
                 }
+                // The walk above is over rows: it reads a row-keyed
+                // tombstone bitmap and the row-ordered id column. Postings
+                // and lengths arrive under the input blob's own doc ids,
+                // so the input's map composes in -- a copy on any input
+                // that kept arrival order.
+                let remap = remap_by_blob_id(fts, &remap_by_row);
                 for (col, lengths) in out_lengths.iter_mut().enumerate() {
                     let dls = fts.read_doc_lengths(col as u32).map_err(|e| {
                         BuildError::Io(Error::other(format!(
@@ -1698,7 +1716,7 @@ impl SuperfileBuilder {
                     })?;
                     for (d, &len) in dls.iter().enumerate() {
                         if let Some(pos) = remap[d] {
-                            lengths[pos as usize] = len;
+                            lengths[pos.get() as usize] = len;
                         }
                     }
                 }
@@ -1924,7 +1942,7 @@ impl SuperfileBuilder {
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
         n_fts_columns: u32,
         n_out_docs: u32,
-        rows_of: &[Vec<Option<u32>>],
+        rows_of: &[Vec<Option<RowId>>],
     ) -> Result<Option<Vec<u32>>, BuildError> {
         if (n_out_docs as usize) <= REORDER_MIN_DOCS {
             return Ok(None);
@@ -1941,7 +1959,7 @@ impl SuperfileBuilder {
         // eligible it is what makes one more informative than another.
         let n_buckets = 1usize << REORDER_TERM_BUCKET_BITS;
         let mut df: Vec<u32> = vec![0; n_buckets];
-        let rows_by_blob: Vec<Vec<Option<u32>>> = readers
+        let rows_by_blob: Vec<Vec<Option<RowId>>> = readers
             .iter()
             .zip(rows_of.iter())
             .map(|((reader, _), rows)| remap_by_blob_id(reader.fts().expect("checked above"), rows))
@@ -1987,7 +2005,7 @@ impl SuperfileBuilder {
                     if !eligible(t) {
                         return Ok(());
                     }
-                    let row = row as usize;
+                    let row = row.get() as usize;
                     let slot_base = row * REORDER_TERMS_PER_DOC;
                     let used = filled[row] as usize;
                     if used < REORDER_TERMS_PER_DOC {
@@ -2080,7 +2098,7 @@ impl SuperfileBuilder {
         // The output row every input document becomes, numbered once and
         // shared by the order and the carry below, so the two cannot
         // disagree about which document a posting belongs to.
-        let mut rows_of: Vec<Vec<Option<u32>>> = Vec::with_capacity(readers.len());
+        let mut rows_of: Vec<Vec<Option<RowId>>> = Vec::with_capacity(readers.len());
         let mut n_out_docs: u32 = 0;
         for (reader, deleted) in readers {
             let n_local = reader.fts().map_or(0, |f| f.n_docs());
@@ -2155,9 +2173,9 @@ impl SuperfileBuilder {
                         // inverse gives the doc id that row is stored under;
                         // and the input's own map turns that into the key
                         // its postings and lengths actually arrive under.
-                        let remap_by_row: Vec<Option<u32>> = rows_of[idx]
+                        let remap_by_row: Vec<Option<FtsDocId>> = rows_of[idx]
                             .iter()
-                            .map(|row| row.map(|r| inv[r as usize]))
+                            .map(|row| row.map(|r| FtsDocId::new(inv[r.get() as usize])))
                             .collect();
                         let remap = remap_by_blob_id(fts, &remap_by_row);
                         for (col, lengths) in out_lengths.iter_mut().enumerate() {
@@ -2168,7 +2186,7 @@ impl SuperfileBuilder {
                             })?;
                             for (d, &len) in dls.iter().enumerate() {
                                 if let Some(new_id) = remap[d] {
-                                    lengths[new_id as usize] = len;
+                                    lengths[new_id.get() as usize] = len;
                                 }
                             }
                         }
@@ -3335,12 +3353,18 @@ mod tests {
             .bm25_hits_async("body", "baz", 10, BoolMode::Or)
             .await
             .expect("search body");
-        assert_eq!(hits.iter().map(|(d, _)| *d).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            hits.iter().map(|(d, _)| d.get()).collect::<Vec<_>>(),
+            vec![1]
+        );
         let hits = reader
             .bm25_hits_async("title", "hello", 10, BoolMode::Or)
             .await
             .expect("search title");
-        assert_eq!(hits.iter().map(|(d, _)| *d).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(
+            hits.iter().map(|(d, _)| d.get()).collect::<Vec<_>>(),
+            vec![0]
+        );
         // A rebuild sees the column as index-only, absent from the schema.
         let rebuilt = BuilderOptions::new_from_reader(&reader);
         assert_eq!(rebuilt.fts_columns.len(), 2);
@@ -3356,7 +3380,10 @@ mod tests {
             .bm25_hits_async("body", "foo", 10, BoolMode::Or)
             .await
             .expect("search merged body");
-        assert_eq!(hits.iter().map(|(d, _)| *d).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(
+            hits.iter().map(|(d, _)| d.get()).collect::<Vec<_>>(),
+            vec![0]
+        );
     }
 
     /// Multi-cell merge reorders rows by stable id (cell-directory
@@ -3445,7 +3472,7 @@ mod tests {
                 .await
                 .expect("unique-token search");
             assert_eq!(
-                hits.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
+                hits.iter().map(|(d, _)| d.get()).collect::<Vec<_>>(),
                 vec![local as u32],
                 "tok{sid} must land on merged-local row {local}"
             );
@@ -3464,7 +3491,7 @@ mod tests {
             .expect("phrase search");
         let mut got: Vec<i128> = hits
             .iter()
-            .map(|(d, _)| stable_of_local[*d as usize])
+            .map(|(d, _)| stable_of_local[d.get() as usize])
             .collect();
         got.sort_unstable();
         let mut want: Vec<i128> = stable_of_local
@@ -4567,7 +4594,7 @@ mod tests {
 
         // And the answers did not change.
         let all_k = (PER_INPUT * 2) as usize + 1;
-        let same_hits = |mut want: Vec<(u32, f32)>, mut got: Vec<(u32, f32)>, what: &str| {
+        let same_hits = |mut want: Vec<(RowId, f32)>, mut got: Vec<(RowId, f32)>, what: &str| {
             assert_eq!(want.len(), got.len(), "{what}: match count");
             want.sort_by_key(|&(d, _)| d);
             got.sort_by_key(|&(d, _)| d);
@@ -4603,7 +4630,7 @@ mod tests {
         // callers read them as ascending rows: a row-keyed bitmap is
         // built from them and the exact-match second pass decodes them in
         // order. So they must come back translated *and* still ascending.
-        let same_ids = |want: Vec<u32>, got: Vec<u32>, what: &str| {
+        let same_ids = |want: Vec<RowId>, got: Vec<RowId>, what: &str| {
             assert!(
                 got.windows(2).all(|w| w[0] < w[1]),
                 "{what}: ids must be ascending and unique, got {:?}",
@@ -4749,17 +4776,21 @@ mod tests {
     fn survivor_rows_numbers_the_survivors_densely_from_the_base() {
         let (rows, kept) = survivor_rows(6, None, 10);
         assert_eq!(kept, 6);
-        assert_eq!(
-            rows,
-            vec![Some(10), Some(11), Some(12), Some(13), Some(14), Some(15)]
-        );
+        assert_eq!(rows, (10..16).map(RowId::new).map(Some).collect::<Vec<_>>());
 
         let deleted: RoaringBitmap = [1u32, 4].into_iter().collect();
         let (rows, kept) = survivor_rows(6, Some(&deleted), 10);
         assert_eq!(kept, 4, "two of six dropped");
         assert_eq!(
             rows,
-            vec![Some(10), None, Some(11), Some(12), None, Some(13)],
+            vec![
+                Some(RowId::new(10)),
+                None,
+                Some(RowId::new(11)),
+                Some(RowId::new(12)),
+                None,
+                Some(RowId::new(13))
+            ],
             "survivors take consecutive rows and the gaps close"
         );
 
@@ -5685,13 +5716,19 @@ mod tests {
             .bm25_hits_async("body", "worldzzz", 10, BoolMode::Or)
             .await
             .expect("bm25 on carried index-only column");
-        assert_eq!(hits.iter().map(|(d, _)| *d).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(
+            hits.iter().map(|(d, _)| d.get()).collect::<Vec<_>>(),
+            vec![2]
+        );
         // The stored column carried too (the same feed serves both).
         let hits = merged
             .bm25_hits_async("title", "gamma", 10, BoolMode::Or)
             .await
             .expect("bm25 on carried stored column");
-        assert_eq!(hits.iter().map(|(d, _)| *d).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(
+            hits.iter().map(|(d, _)| d.get()).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
     }
 
     #[tokio::test]

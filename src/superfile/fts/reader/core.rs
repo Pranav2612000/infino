@@ -56,6 +56,7 @@ use crate::{
             short::decode_short,
             tokenize::{Phrase, Tokenizer},
         },
+        id_space::{DocMap, FtsDocId, RowId},
         lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
     },
     utils::terms::{FstValue, TermDict, make_key},
@@ -140,7 +141,7 @@ pub(crate) enum PreparedClauses {
     /// into, so the fast paths report work like the cursor-carrying
     /// shapes do.
     Done {
-        hits: Vec<(u32, f32)>,
+        hits: Vec<(FtsDocId, f32)>,
         postings_bytes: u64,
         /// Byte-source ranges the inline walk requested (0 for the df=1
         /// inline-FST and empty-resolution paths).
@@ -508,14 +509,15 @@ pub struct FtsReader {
     pub(super) dict_layout: DictLayout,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
-    /// The Parquet row each doc id in this blob stands for, `V8` only.
-    /// `None` on every older blob, where a doc id already is a row.
+    /// The Parquet row each doc id in this blob stands for. The
+    /// identity on every blob below `V8`, where a doc id already is a
+    /// row.
     ///
     /// The kernels never consult it: they walk, score and prune in the
     /// blob's own id space from end to end, and the ids they return are
     /// translated once here. That is what lets the writer group
     /// documents by the terms they share without a Parquet row moving.
-    pub(super) doc_map: Option<Arc<[u32]>>,
+    pub(super) doc_map: DocMap,
 }
 
 impl FtsReader {
@@ -987,8 +989,8 @@ impl FtsReader {
 
         // The map is read whole at open, beside the doc-lengths tail it
         // sits next to, because every query that returns a hit needs it.
-        let doc_map: Option<Arc<[u32]>> = match doc_map_offset {
-            None => None,
+        let doc_map: DocMap = match doc_map_offset {
+            None => DocMap::Identity,
             Some(mo) => {
                 let body_end = doc_lengths_table_offset.saturating_sub(4);
                 let expect = (n_docs as usize) * U32_BYTES;
@@ -1009,8 +1011,11 @@ impl FtsReader {
                         }));
                     }
                 }
-                let rows: Vec<u32> = body.chunks_exact(U32_BYTES).map(read_u32_le).collect();
-                Some(Arc::from(rows))
+                let rows: Vec<RowId> = body
+                    .chunks_exact(U32_BYTES)
+                    .map(|b| RowId::new(read_u32_le(b)))
+                    .collect();
+                DocMap::permuted(Arc::from(rows))
             }
         };
 
@@ -1045,24 +1050,14 @@ impl FtsReader {
     /// through unchanged instead of panicking, because a corrupt map
     /// should not take down a query.
     #[inline]
-    pub(crate) fn row_of(&self, doc_id: u32) -> u32 {
-        match &self.doc_map {
-            None => doc_id,
-            Some(map) => {
-                debug_assert!(
-                    (doc_id as usize) < map.len(),
-                    "doc id {doc_id} is past the {} entries of this blob's map",
-                    map.len()
-                );
-                map.get(doc_id as usize).copied().unwrap_or(doc_id)
-            }
-        }
+    pub(crate) fn row_of(&self, doc_id: FtsDocId) -> RowId {
+        self.doc_map.row_of(doc_id)
     }
 
     /// Whether this blob stores its documents under an ordering of its
     /// own rather than in row order.
     pub(crate) fn has_doc_map(&self) -> bool {
-        self.doc_map.is_some()
+        self.doc_map.is_permuted()
     }
 
     pub fn n_docs(&self) -> u32 {
@@ -1795,11 +1790,13 @@ impl OrCursorSet {
     }
 }
 
-/// Merge a `doc_id -> score` map into top-k by descending score, ties
-/// broken by ascending doc_id. Used by `search_multi`'s cross-column
+/// Merge a `row -> score` map into top-k by descending score, ties
+/// broken by ascending row. Used by `search_multi`'s cross-column
 /// combiner, where the per-column scores have already been weighted
-/// and summed into `scores`.
-pub(super) fn top_k(scores: FxHashMap<u32, f32>, k: usize) -> Vec<(u32, f32)> {
+/// and summed into `scores` — and where each column's hits have
+/// already been translated out of the blob's id space, which is why
+/// this one heap is keyed by rows rather than blob ids.
+pub(super) fn top_k(scores: FxHashMap<RowId, f32>, k: usize) -> Vec<(RowId, f32)> {
     // Iterate in ascending doc_id order so ties resolve deterministically
     // (smaller doc_ids enter the heap first; the strict `score > peek`
     // check below means subsequent equal-score entries don't displace
@@ -1807,18 +1804,19 @@ pub(super) fn top_k(scores: FxHashMap<u32, f32>, k: usize) -> Vec<(u32, f32)> {
     // tied result non-deterministic and would disagree with the BMW
     // single-term path (which naturally iterates in doc_id order).
     // pdqsort: doc_ids are unique by construction (HashMap keys).
-    let mut sorted: Vec<(u32, f32)> = scores.into_iter().collect();
+    let mut sorted: Vec<(RowId, f32)> = scores.into_iter().collect();
     sorted.sort_unstable_by_key(|(d, _)| *d);
 
-    let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(k.min(sorted.len()).max(1));
-    for (doc_id, score) in sorted {
+    let mut heap: BinaryHeap<TopKEntry<RowId>> =
+        BinaryHeap::with_capacity(k.min(sorted.len()).max(1));
+    for (row, score) in sorted {
         if heap.len() < k {
-            heap.push(TopKEntry(score, doc_id));
+            heap.push(TopKEntry(score, row));
         } else if let Some(TopKEntry(top_score, _)) = heap.peek()
             && score > *top_score
         {
             heap.pop();
-            heap.push(TopKEntry(score, doc_id));
+            heap.push(TopKEntry(score, row));
         }
     }
     drain_top_k_desc(heap)
@@ -2492,7 +2490,7 @@ mod tests {
             let mut want_all = top(&plain_reader, terms, N_DOCS as usize + 1).await;
             let mut got_all = top(&reordered_reader, terms, N_DOCS as usize + 1).await;
             assert_eq!(want_all.len(), got_all.len(), "{terms:?} match count");
-            let by_row = |v: &mut Vec<(u32, f32)>| v.sort_by_key(|&(d, _)| d);
+            let by_row = |v: &mut Vec<(RowId, f32)>| v.sort_by_key(|&(d, _)| d);
             by_row(&mut want_all);
             by_row(&mut got_all);
             for ((dw, sw), (dg, sg)) in want_all.iter().zip(got_all.iter()) {
@@ -2509,7 +2507,7 @@ mod tests {
             // a change to that. So check the score sequence, and that
             // each row a truncated search returns really does carry the
             // score its rank claims.
-            let truth: HashMap<u32, f32> = want_all.iter().copied().collect();
+            let truth: HashMap<RowId, f32> = want_all.iter().copied().collect();
             for k in [1usize, 5, 50, 400] {
                 let want = top(&plain_reader, terms, k).await;
                 let got = top(&reordered_reader, terms, k).await;
@@ -2618,7 +2616,7 @@ mod tests {
     }
 
     /// Ranked results with pruning live (`k` far below the match count).
-    async fn top(r: &FtsReader, terms: &[&str], k: usize) -> Vec<(u32, f32)> {
+    async fn top(r: &FtsReader, terms: &[&str], k: usize) -> Vec<(RowId, f32)> {
         r.search("body", terms, k, BoolMode::Or)
             .await
             .expect("search")
@@ -2706,10 +2704,10 @@ mod tests {
             &["common", "shared"][..],
             &["gamma", "beta"][..],
         ] {
-            let a: Vec<(u32, f32)> = top(&dense, terms, 20).await;
-            let b: Vec<(u32, f32)> = top(&sparse, terms, 20).await;
-            let a_docs: Vec<u32> = a.iter().map(|(d, _)| *d).collect();
-            let b_docs: Vec<u32> = b.iter().map(|(d, _)| d / 2).collect();
+            let a: Vec<(RowId, f32)> = top(&dense, terms, 20).await;
+            let b: Vec<(RowId, f32)> = top(&sparse, terms, 20).await;
+            let a_docs: Vec<u32> = a.iter().map(|(d, _)| d.get()).collect();
+            let b_docs: Vec<u32> = b.iter().map(|(d, _)| d.get() / 2).collect();
             assert_eq!(
                 a_docs, b_docs,
                 "{terms:?}: same documents in the same order"
@@ -2900,7 +2898,7 @@ mod tests {
         b.register_column("body".into(), true).expect("register b");
         ra.for_each_term_posting(0, |term, doc_id, tf, positions| {
             let term_str = std::str::from_utf8(term).expect("utf8 term");
-            b.add_prebuilt_term_posting(0, term_str, doc_id, tf, positions)
+            b.add_prebuilt_term_posting(0, term_str, FtsDocId::new(doc_id), tf, positions)
                 .expect("prebuilt push");
             Ok(())
         })
@@ -2949,7 +2947,7 @@ mod tests {
         b.set_spill_threshold_bytes(1);
         ra.for_each_term_posting(0, |term, doc_id, tf, positions| {
             let term_str = std::str::from_utf8(term).expect("utf8 term");
-            b.add_prebuilt_term_posting(0, term_str, doc_id, tf, positions)
+            b.add_prebuilt_term_posting(0, term_str, FtsDocId::new(doc_id), tf, positions)
                 .expect("prebuilt push (spilled)");
             Ok(())
         })
@@ -3002,7 +3000,7 @@ mod tests {
             .search("body", &["tok"], 10, BoolMode::Or)
             .await
             .expect("search");
-        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![0, 1]);
     }
@@ -3538,23 +3536,23 @@ mod tests {
 
     #[test]
     fn top_k_keeps_highest_scores_with_doc_id_tiebreak() {
-        let mut scores: FxHashMap<u32, f32> = FxHashMap::default();
-        scores.insert(0, 1.0);
-        scores.insert(1, 3.0);
-        scores.insert(2, 2.0);
-        scores.insert(3, 3.0); // tie with doc 1 on score 3.0
+        let mut scores: FxHashMap<RowId, f32> = FxHashMap::default();
+        scores.insert(RowId::new(0), 1.0);
+        scores.insert(RowId::new(1), 3.0);
+        scores.insert(RowId::new(2), 2.0);
+        scores.insert(RowId::new(3), 3.0); // tie with row 1 on score 3.0
         let out = top_k(scores, 2);
-        // Descending score; ties broken by ascending doc_id ⇒ doc 1 before 3.
-        assert_eq!(out, vec![(1, 3.0), (3, 3.0)]);
+        // Descending score; ties broken by ascending row ⇒ row 1 before 3.
+        assert_eq!(out, vec![(RowId::new(1), 3.0), (RowId::new(3), 3.0)]);
     }
 
     #[test]
     fn top_k_smaller_than_k_returns_all_sorted() {
-        let mut scores: FxHashMap<u32, f32> = FxHashMap::default();
-        scores.insert(5, 2.0);
-        scores.insert(9, 5.0);
+        let mut scores: FxHashMap<RowId, f32> = FxHashMap::default();
+        scores.insert(RowId::new(5), 2.0);
+        scores.insert(RowId::new(9), 5.0);
         let out = top_k(scores, 10);
-        assert_eq!(out, vec![(9, 5.0), (5, 2.0)]);
+        assert_eq!(out, vec![(RowId::new(9), 5.0), (RowId::new(5), 2.0)]);
     }
 
     /// A lazy open reads the header and the doc-lengths directory and
@@ -3762,7 +3760,7 @@ mod tests {
             .await
             .expect("search");
         assert_eq!(
-            hits.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
+            hits.iter().map(|(d, _)| d.get()).collect::<Vec<_>>(),
             vec![7],
             "the map must survive the lazy open"
         );
@@ -3783,7 +3781,7 @@ mod tests {
             .search("body", &["rust"], 10, BoolMode::Or)
             .await
             .expect("search over lazy reader");
-        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0) && ids.contains(&1));
     }
 }
