@@ -108,6 +108,7 @@ use crate::{
             },
             reader::ColumnLengthStats,
             short::{SHORT_MAX_DF, encode_short},
+            sorted_merge::{SortedInput, merge_column},
             tokenize::{AsciiLowerTokenizer, StandardTokenizer, Tokenizer},
         },
     },
@@ -525,6 +526,12 @@ impl ColumnPostings {
     }
     fn is_spilled(&self) -> bool {
         matches!(self, Self::Spilled { .. })
+    }
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::InRam { terms, .. } => terms.is_empty(),
+            Self::Spilled { .. } => false,
+        }
     }
 }
 
@@ -1380,6 +1387,10 @@ pub struct FtsBuilder {
     /// the backwards-compatibility tests pick an older one so the reader's
     /// legacy paths are exercised against faithfully written files.
     pub(crate) era: BlobEra,
+    /// Prebuilt inputs whose postings the finish merges term by term
+    /// instead of reading the accumulator (the compaction merge). Empty
+    /// for every other build.
+    sorted_inputs: Vec<SortedInput>,
 }
 
 impl FtsBuilder {
@@ -1435,7 +1446,15 @@ impl FtsBuilder {
             run_scratch: Vec::new(),
             bump: Bump::new(),
             era: BlobEra::V7,
+            sorted_inputs: Vec::new(),
         }
+    }
+
+    /// Have the finish merge these inputs' postings term by term instead of
+    /// reading the accumulator, which must stay empty. Inputs are in output
+    /// row order; their doc lengths are appended separately.
+    pub(crate) fn set_sorted_inputs(&mut self, inputs: Vec<SortedInput>) {
+        self.sorted_inputs = inputs;
     }
 
     /// Override the per-column in-RAM accumulator budget. Once a
@@ -2628,7 +2647,14 @@ impl FtsBuilder {
         // builds that *could* be served by either (regression-
         // gated by `build_above_threshold_spills_and_matches_in_
         // ram_byte_for_byte`).
-        if self.postings.iter().any(|c| c.is_spilled()) {
+        // The sorted merge supplies every posting; any the accumulator also
+        // holds would be dropped from the output.
+        if !self.sorted_inputs.is_empty() && self.postings.iter().any(|c| !c.is_empty()) {
+            return Err(BuildError::Io(Error::other(
+                "fts: sorted merge inputs set on a builder that also accumulated postings",
+            )));
+        }
+        if !self.sorted_inputs.is_empty() || self.postings.iter().any(|c| c.is_spilled()) {
             self.finish_to_spilled(w)
         } else {
             self.finish_to_inram(w)
@@ -2662,6 +2688,7 @@ impl FtsBuilder {
             run_scratch: _,
             bump,
             era,
+            sorted_inputs: _,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -2844,6 +2871,7 @@ impl FtsBuilder {
             run_scratch: _,
             bump,
             era,
+            sorted_inputs,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -2954,6 +2982,47 @@ impl FtsBuilder {
             // The collection size idf is baked with: the documents that
             // carry tokens, matching what the reader divides by.
             let n_scored = n_scored_per_col[orig_col_idx];
+
+            // The compaction merge: the accumulator is empty (checked in
+            // `finish_to`) and the inputs are merged term by term, already in
+            // output order.
+            if !sorted_inputs.is_empty() {
+                let merge_span = detail_span!(
+                    "fts_sorted_merge",
+                    column = col_name.as_str(),
+                    inputs = sorted_inputs.len(),
+                    terms = tracing::field::Empty,
+                )
+                .entered();
+                let mut n_emitted: usize = 0;
+                merge_column(&sorted_inputs, orig_col_idx as u32, |term, pairs, runs| {
+                    n_emitted += 1;
+                    encode_and_emit_term(
+                        term,
+                        pairs,
+                        col_name_bytes,
+                        col_doc_lengths,
+                        avgdl,
+                        params,
+                        n_scored,
+                        &mut key_buf,
+                        &mut postings_writer,
+                        &mut postings_crc_acc,
+                        &mut postings_len,
+                        None,
+                        Some(&mut fst_streaming),
+                        col_positions.then_some((&mut positions_sink, runs)),
+                        &mut finish_profile,
+                        &mut term_scratch,
+                        era,
+                    )
+                })?;
+                n_terms_total_usize += n_emitted;
+                record("terms", n_emitted as u64);
+                drop(merge_span);
+                doc_lengths_by_orig_col[orig_col_idx] = Some(col_doc_lengths_owned);
+                continue;
+            }
 
             match posting_state {
                 ColumnPostings::InRam {

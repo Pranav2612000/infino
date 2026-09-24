@@ -101,6 +101,7 @@ use crate::{
             bm25,
             builder::FtsBuilder,
             reader::{ColumnLengthStats, ColumnMeta},
+            sorted_merge::SortedInput,
             tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER},
         },
         ids,
@@ -1017,6 +1018,20 @@ impl SuperfileBuilder {
         reader: &SuperfileReader,
         deleted: Option<&RoaringBitmap>,
     ) -> Result<(), BuildError> {
+        if let Some(remap) = self.carry_fts_doc_lengths(reader, deleted)? {
+            self.carry_fts_postings_with_remap(reader, &remap)?;
+        }
+        Ok(())
+    }
+
+    /// The doc-length half of [`Self::carry_fts_from_reader`]: append the
+    /// input's surviving doc lengths and return its doc-id remap, or `None`
+    /// when there is no FTS to carry. The caller carries the postings.
+    fn carry_fts_doc_lengths(
+        &mut self,
+        reader: &SuperfileReader,
+        deleted: Option<&RoaringBitmap>,
+    ) -> Result<Option<Vec<Option<u32>>>, BuildError> {
         // Config compatibility first, before any early return — a
         // presence or per-column mismatch must fail loud, never carry
         // partially (see `check_fts_carry_compat`).
@@ -1025,10 +1040,10 @@ impl SuperfileBuilder {
             .map(|f| f.fts_columns_config().collect::<Vec<_>>());
         self.opts.check_fts_carry_compat(remote_cfg.as_deref())?;
         let Some(fts) = reader.fts() else {
-            return Ok(());
+            return Ok(None);
         };
         if self.fts_builder.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         // Map each input-local doc id to its output doc id. Survivors get
         // dense ids `base + rank`; deleted docs map to `None`. `rank` walks
@@ -1046,7 +1061,6 @@ impl SuperfileBuilder {
                 rank += 1;
             }
         }
-        self.carry_fts_postings_with_remap(reader, &remap)?;
 
         // Dense remap preserves input order, so the surviving lengths
         // append in output order.
@@ -1068,7 +1082,7 @@ impl SuperfileBuilder {
                 .expect("checked Some above")
                 .append_prebuilt_doc_lengths(column_id, &kept);
         }
-        Ok(())
+        Ok(Some(remap))
     }
 
     /// Stream one input's prebuilt postings into this builder's FTS
@@ -1811,15 +1825,14 @@ impl SuperfileBuilder {
     /// is the FTS counterpart, and the memory-bounded path for compacting a
     /// large corpus into one superfile.
     ///
-    /// Per input `i` with cumulative surviving-doc base `base_i`, for each FTS
-    /// column it streams the input's `(term, doc_id, tf, positions)` postings
-    /// ([`FtsReader::for_each_term_posting`]) into the builder's prebuilt
-    /// accumulator with `doc_id` remapped to `base_i + rank` (`rank` = position
-    /// among that input's surviving docs). Deleted docs are dropped and the
-    /// doc-id space stays dense, so it aligns row-for-row with the concatenated
-    /// Parquet body. Positions flow into the spilled positions blob on disk, not
-    /// RAM; doc-lengths are read from each input and concatenated — never
-    /// recomputed from tokens.
+    /// Per input `i` with cumulative surviving-doc base `base_i`, each doc id
+    /// is remapped to `base_i + rank` (`rank` = position among that input's
+    /// surviving docs). Deleted docs are dropped and the doc-id space stays
+    /// dense, so it aligns row-for-row with the concatenated Parquet body. At
+    /// finish, each FTS column is merged term by term across the inputs'
+    /// dictionaries, already in output order, so postings are never
+    /// accumulated, spilled or sorted. Doc-lengths are read from each input and
+    /// concatenated — never recomputed from tokens.
     ///
     /// Requires FTS/scalar inputs (no vector index); vector-bearing merges use
     /// [`build_from_sq8_ivf_readers`](Self::build_from_sq8_ivf_readers).
@@ -1835,6 +1848,21 @@ impl SuperfileBuilder {
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
         fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
+    ) -> Result<SuperfileStats, BuildError> {
+        Self::fts_merge_to(readers, fts_corpus, output, true)
+    }
+
+    /// [`Self::build_from_readers_fts_merge_to`] with the posting path
+    /// chosen: `sorted` merges term by term, otherwise through the
+    /// accumulator. Only tests pass `false`, to check both write identical
+    /// bytes.
+    // TODO: remove the accumulator path once the term-by-term merge has
+    // proven itself in production.
+    fn fts_merge_to<W: Write>(
+        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+        fts_corpus: &HashMap<String, ColumnLengthStats>,
+        output: W,
+        sorted: bool,
     ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
         let builder_opts =
@@ -1868,6 +1896,7 @@ impl SuperfileBuilder {
         let mut ids_ok = true;
         let id_column = superfile_builder.opts.id_column.clone();
 
+        let mut sorted_inputs = Vec::new();
         let copy_span = detail_span!("merge_copy_rows").entered();
         for (idx, (reader, deleted)) in readers.iter().enumerate() {
             superfile_builder.opts.check_mergeability(
@@ -1893,7 +1922,20 @@ impl SuperfileBuilder {
             // Carry the input's prebuilt postings + doc-lengths across,
             // remapped densely onto the output rows this batch is about to
             // append (so it must run before `next_local_doc_id` advances).
-            superfile_builder.carry_fts_from_reader(reader, deleted.as_deref())?;
+            // The sorted path carries only doc-lengths now; the finish merges
+            // the postings.
+            if sorted {
+                if let Some(remap) =
+                    superfile_builder.carry_fts_doc_lengths(reader, deleted.as_deref())?
+                {
+                    sorted_inputs.push(SortedInput {
+                        reader: Arc::clone(reader),
+                        remap,
+                    });
+                }
+            } else {
+                superfile_builder.carry_fts_from_reader(reader, deleted.as_deref())?;
+            }
 
             // Stream this input's surviving rows straight into the Parquet body
             // and drop the batch — the corpus is never accumulated in RAM. The
@@ -1913,6 +1955,9 @@ impl SuperfileBuilder {
             superfile_builder.next_local_doc_id += n_rows;
         }
         drop(copy_span);
+        if let Some(fb) = superfile_builder.fts_builder.as_mut() {
+            fb.set_sorted_inputs(sorted_inputs);
+        }
 
         let finish_span =
             detail_span!("merge_finish", rows = superfile_builder.next_local_doc_id).entered();
@@ -4188,6 +4233,134 @@ mod tests {
     #[test]
     fn fts_merge_matches_reindex_positional_with_deletes() {
         assert_fts_merge_matches_reindex(true, &[&[0], &[1]]);
+    }
+
+    // --- sorted (term-by-term) FTS merge vs the accumulator path ---------
+
+    /// Docs in each sorted-merge test input. The fully tombstoned case
+    /// reuses these sizes.
+    const SORTED_MERGE_INPUT_DOCS: [u32; 4] = [300, 50, 200, 300];
+    /// Doc-unique tokens per doc: enough that each input has more terms than
+    /// one term-cursor chunk, so chunk refills are exercised.
+    const SORTED_MERGE_UNIQUE_TOKENS: u32 = 20;
+
+    /// Build one sorted-merge input. Covers every posting form: `common`
+    /// sits in every doc (long lists), `w*` / `b*` in some (short lists),
+    /// `u*` in one doc (inline), `only{input}` in one input, and `gone`
+    /// only in doc 5 of input 0 (so tombstoning that doc removes the term).
+    fn sorted_merge_input(opts: &BuilderOptions, input: u32, first_id: u32, docs: u32) -> Vec<u8> {
+        let mut titles = Vec::new();
+        let mut bodies = Vec::new();
+        for d in 0..docs {
+            let id = first_id + d;
+            let mut title = format!("common common w{} w{} only{input}", d % 7, d % 13);
+            for k in 0..SORTED_MERGE_UNIQUE_TOKENS {
+                title.push_str(&format!(" u{id}x{k}"));
+            }
+            if input == 0 && d == 5 {
+                title.push_str(" gone");
+            }
+            titles.push(title);
+            bodies.push(format!("b{} b{} z{id}", d % 5, d % 3));
+        }
+        let ids = decimal128_ids((first_id..first_id + docs).map(u64::from));
+        let batch = RecordBatch::try_new(
+            opts.schema.clone(),
+            vec![
+                Arc::new(ids),
+                Arc::new(LargeStringArray::from(titles)),
+                Arc::new(LargeStringArray::from(bodies)),
+            ],
+        )
+        .expect("build RecordBatch");
+        let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        b.finish().expect("finish input")
+    }
+
+    /// Merging term by term must write exactly the bytes the accumulator
+    /// path writes, for the whole superfile.
+    fn assert_sorted_merge_matches_accumulator(positions: bool, deletes: &[&[u32]]) {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![
+                FtsConfig::new("title").positions(positions),
+                FtsConfig::new("body"),
+            ],
+            vec![],
+        );
+        let mut first_id = 0;
+        let mut inputs = Vec::new();
+        for (i, &docs) in SORTED_MERGE_INPUT_DOCS.iter().enumerate() {
+            let bytes = sorted_merge_input(&opts, i as u32, first_id, docs);
+            first_id += docs;
+            let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open input");
+            inputs.push((
+                Arc::new(reader),
+                tombstones(deletes.get(i).copied().unwrap_or(&[])),
+            ));
+        }
+
+        let mut accumulator = Vec::new();
+        SuperfileBuilder::fts_merge_to(&inputs, &HashMap::new(), &mut accumulator, false)
+            .expect("accumulator merge");
+        let mut sorted = Vec::new();
+        SuperfileBuilder::fts_merge_to(&inputs, &HashMap::new(), &mut sorted, true)
+            .expect("sorted merge");
+        assert!(!sorted.is_empty(), "merge wrote a superfile");
+        assert!(
+            accumulator == sorted,
+            "sorted merge must match the accumulator byte for byte"
+        );
+    }
+
+    #[test]
+    fn sorted_merge_refuses_a_builder_with_accumulated_postings() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig::new("title"), FtsConfig::new("body")],
+            vec![],
+        );
+        let docs = SORTED_MERGE_INPUT_DOCS[1];
+        let input = SuperfileReader::open(Bytes::from(sorted_merge_input(&opts, 0, 0, docs)))
+            .expect("open input");
+        let mut fb = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        fb.register_column("title".into(), false).expect("register");
+        fb.add_doc(0, 0, "hello").expect("add doc");
+        fb.set_sorted_inputs(vec![SortedInput {
+            reader: Arc::new(input),
+            remap: vec![None; docs as usize],
+        }]);
+        assert!(
+            fb.finish().is_err(),
+            "accumulated postings must not be dropped"
+        );
+    }
+
+    #[test]
+    fn sorted_merge_matches_accumulator_non_positional() {
+        assert_sorted_merge_matches_accumulator(false, &[]);
+    }
+
+    #[test]
+    fn sorted_merge_matches_accumulator_positional() {
+        assert_sorted_merge_matches_accumulator(true, &[]);
+    }
+
+    #[test]
+    fn sorted_merge_matches_accumulator_with_deletes() {
+        // Input 0 loses doc 5 (the only `gone` doc), input 1 is fully
+        // tombstoned, input 2 keeps everything, input 3 loses every third doc.
+        let all_of_input_1: Vec<u32> = (0..SORTED_MERGE_INPUT_DOCS[1]).collect();
+        let every_third: Vec<u32> = (0..SORTED_MERGE_INPUT_DOCS[3]).step_by(3).collect();
+        for positions in [false, true] {
+            assert_sorted_merge_matches_accumulator(
+                positions,
+                &[&[5, 7, 100], &all_of_input_1, &[], &every_third],
+            );
+        }
     }
 
     #[test]
