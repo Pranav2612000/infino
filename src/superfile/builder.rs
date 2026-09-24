@@ -123,7 +123,7 @@ use crate::{
             rerank_codec::RerankCodec,
         },
     },
-    utils::trace::detail_span,
+    utils::{terms::validate_column_name, trace::detail_span},
 };
 
 /// Merges below this many surviving documents keep arrival order: a
@@ -2749,7 +2749,7 @@ fn finish_index_blobs_streamed<Wf: Write + Send, Wv: Write + Send>(
 /// the same name) on its own column lists so callers see the
 /// typed error at the earliest possible construction point.
 fn check_user_column_name(name: &str) -> Result<(), BuildError> {
-    if name.as_bytes().contains(&format::FST_SEPARATOR) {
+    if !validate_column_name(name) {
         return Err(BuildError::ReservedSeparatorInColumnName(name.to_string()));
     }
     if name.starts_with(format::RESERVED_PREFIX) {
