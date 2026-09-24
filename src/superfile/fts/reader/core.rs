@@ -1084,10 +1084,7 @@ impl FtsReader {
                         }));
                     }
                 }
-                let rows: Vec<u32> = body
-                    .chunks_exact(U32_BYTES)
-                    .map(read_u32_le)
-                    .collect();
+                let rows: Vec<u32> = body.chunks_exact(U32_BYTES).map(read_u32_le).collect();
                 Some(Arc::from(rows))
             }
         };
