@@ -100,7 +100,7 @@ use crate::{
             analysis::{Base, Stemmer, Stopwords, chain_name, chain_tokenizer},
             bm25,
             builder::FtsBuilder,
-            reader::{ColumnLengthStats, ColumnMeta},
+            reader::{ColumnLengthStats, ColumnMeta, FtsReader},
             reorder::{ForwardIndex, bisect_order},
             tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER},
         },
@@ -173,6 +173,25 @@ fn survivor_rows(
         }
     }
     (rows, kept)
+}
+
+/// Where each of an input's **blob ids** sends its postings and its
+/// stored length, given where its rows are going.
+///
+/// Two different keys meet in a merge. Tombstones and Parquet rows are
+/// keyed by the row; a posting and a doc-length entry are keyed by the
+/// blob's own doc id. Through `V7` those are the same number and this is
+/// a copy. On an input that stores its documents in an order of its own
+/// they are not, and reading a posting's id as a row silently files it
+/// under a different document, so the input's own map composes in: a
+/// blob id goes wherever the row it stands for goes.
+fn remap_by_blob_id(fts: &FtsReader, remap_by_row: &[Option<u32>]) -> Vec<Option<u32>> {
+    if !fts.has_doc_map() {
+        return remap_by_row.to_vec();
+    }
+    (0..fts.n_docs())
+        .map(|b| remap_by_row.get(fts.row_of(b) as usize).copied().flatten())
+        .collect()
 }
 
 /// The bucket a term groups under, which is **not** an identity: see
@@ -1099,11 +1118,15 @@ impl SuperfileBuilder {
         // local ids in order skipping tombstones, so it ends at the
         // surviving row count — the same count and order as the caller's
         // Parquet-bound batch.
-        let (remap, _) = survivor_rows(fts.n_docs(), deleted, self.next_local_doc_id);
+        let base = self.next_local_doc_id;
+        let (remap_by_row, n_kept) = survivor_rows(fts.n_docs(), deleted, base);
+        // Postings and lengths are keyed by the input's doc ids, which are
+        // its rows only when it kept arrival order.
+        let remap = remap_by_blob_id(fts, &remap_by_row);
         self.carry_fts_postings_with_remap(reader, &remap)?;
 
-        // Dense remap preserves input order, so the surviving lengths
-        // append in output order.
+        // The lengths are read in the input's own id order and appended in
+        // the output's, so they are placed rather than pushed.
         let n_fts_columns = self.opts.fts_columns.len() as u32;
         for column_id in 0..n_fts_columns {
             let dls = fts.read_doc_lengths(column_id).map_err(|e| {
@@ -1111,12 +1134,12 @@ impl SuperfileBuilder {
                     "fts merge column {column_id}: read doc-lengths failed: {e}"
                 )))
             })?;
-            let kept: Vec<u32> = dls
-                .iter()
-                .enumerate()
-                .filter(|(d, _)| remap[*d].is_some())
-                .map(|(_, &len)| len)
-                .collect();
+            let mut kept: Vec<u32> = vec![0; n_kept as usize];
+            for (d, &len) in dls.iter().enumerate() {
+                if let Some(out) = remap.get(d).copied().flatten() {
+                    kept[(out - base) as usize] = len;
+                }
+            }
             self.fts_builder
                 .as_mut()
                 .expect("checked Some above")
@@ -1918,7 +1941,12 @@ impl SuperfileBuilder {
         // eligible it is what makes one more informative than another.
         let n_buckets = 1usize << REORDER_TERM_BUCKET_BITS;
         let mut df: Vec<u32> = vec![0; n_buckets];
-        for ((reader, _), rows) in readers.iter().zip(rows_of.iter()) {
+        let rows_by_blob: Vec<Vec<Option<u32>>> = readers
+            .iter()
+            .zip(rows_of.iter())
+            .map(|((reader, _), rows)| remap_by_blob_id(reader.fts().expect("checked above"), rows))
+            .collect();
+        for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
             let fts = reader.fts().expect("checked above");
             for column_id in 0..n_fts_columns {
                 fts.for_each_term_posting(column_id, |term, local_doc, _tf, _pos| {
@@ -1948,7 +1976,7 @@ impl SuperfileBuilder {
         let mut slots: Vec<u32> = vec![0; n * REORDER_TERMS_PER_DOC];
         let mut filled: Vec<u8> = vec![0; n];
         let mut worst: Vec<u8> = vec![0; n];
-        for ((reader, _), rows) in readers.iter().zip(rows_of.iter()) {
+        for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
             let fts = reader.fts().expect("checked above");
             for column_id in 0..n_fts_columns {
                 fts.for_each_term_posting(column_id, |term, local_doc, _tf, _pos| {
@@ -2124,11 +2152,14 @@ impl SuperfileBuilder {
                 Some(inv) => {
                     if let Some(fts) = reader.fts() {
                         // The shared numbering gives the row; the order's
-                        // inverse gives the doc id that row is stored under.
-                        let remap: Vec<Option<u32>> = rows_of[idx]
+                        // inverse gives the doc id that row is stored under;
+                        // and the input's own map turns that into the key
+                        // its postings and lengths actually arrive under.
+                        let remap_by_row: Vec<Option<u32>> = rows_of[idx]
                             .iter()
                             .map(|row| row.map(|r| inv[r as usize]))
                             .collect();
+                        let remap = remap_by_blob_id(fts, &remap_by_row);
                         for (col, lengths) in out_lengths.iter_mut().enumerate() {
                             let dls = fts.read_doc_lengths(col as u32).map_err(|e| {
                                 BuildError::Io(Error::other(format!(

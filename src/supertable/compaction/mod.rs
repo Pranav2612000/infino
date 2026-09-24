@@ -1099,6 +1099,7 @@ mod tests {
         ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::{col, lit};
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
     use tokio::task;
@@ -2876,6 +2877,69 @@ mod tests {
             );
             let got = st.reader().expect("reader").query_sql(&sql).expect("sql");
             assert_eq!(titles_of(&got), vec![expected[n].clone()], "doc {n}");
+        }
+    }
+
+    /// Compacting an already-reordered superfile again must keep every
+    /// document with its own postings.
+    ///
+    /// This is ordinary operation, not an edge case: a reordered output
+    /// is usually below the target size, so the next pass picks it up
+    /// again. The merge reads an input's postings and stored lengths by
+    /// the input's own doc ids while its tombstones and rows are keyed by
+    /// row, and on a reordered input those are different numbers. Reading
+    /// one as the other files a posting under a different document and
+    /// writes the result to storage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_compaction_of_a_reordered_superfile_keeps_the_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        let mut expected: Vec<String> = Vec::new();
+        let mut commit = |st: &Supertable, from: usize, to: usize| {
+            for b in from..to {
+                let titles: Vec<String> = (0..80)
+                    .map(|i| {
+                        let n = b * 80 + i;
+                        format!("uq{n} shared t{} t{}", n % 37, n % 53)
+                    })
+                    .collect();
+                expected.extend(titles.iter().cloned());
+                let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+                commit_titles(st, &refs);
+            }
+        };
+        commit(&st, 0, 60);
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact 1");
+
+        // The reordered output is below target, so the next compaction
+        // merges it again.
+        let deleted = [3usize, 1000, 2222, 4000];
+        for n in deleted {
+            let title = format!("uq{n} shared t{} t{}", n % 37, n % 53);
+            st.delete(col("title").eq(lit(title))).expect("delete");
+        }
+        commit(&st, 60, 75);
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact 2");
+
+        for n in (0..expected.len()).step_by(97) {
+            let want = match deleted.contains(&n) {
+                true => vec![],
+                false => vec![expected[n].clone()],
+            };
+            let got = st
+                .token_match("title", &format!("uq{n}"), BoolMode::And, Some(&["title"]))
+                .expect("token_match");
+            assert_eq!(titles_of(&got), want, "doc {n}");
+        }
+        for n in deleted {
+            let got = st
+                .token_match("title", &format!("uq{n}"), BoolMode::And, Some(&["title"]))
+                .expect("token_match");
+            assert!(titles_of(&got).is_empty(), "deleted doc {n} still matches");
         }
     }
 
