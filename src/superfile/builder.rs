@@ -82,7 +82,6 @@ use arrow_array::{Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatc
 use arrow_schema::{DataType, Field, Schema};
 use parquet::basic::{Compression, ZstdLevel};
 use roaring::RoaringBitmap;
-use rustc_hash::FxHashMap;
 use tempfile::{NamedTempFile, tempfile};
 
 pub use crate::superfile::vector::builder::VectorConfig;
@@ -131,11 +130,16 @@ use crate::{
 /// corpus this small has short gaps already and nothing to regroup.
 const REORDER_MIN_DOCS: usize = 4_096;
 
-/// Most `(document, term)` pairs collected before giving up on choosing
-/// an order. At 8 bytes a pair this caps the pass near 256 MiB, and a
-/// merge that would exceed it is written in arrival order rather than
-/// growing without limit.
-const REORDER_MAX_PAIRS: usize = 32_000_000;
+/// Terms per document the bisection is given. Bounding the forward
+/// index by documents rather than by postings is what keeps the pass a
+/// fixed size whatever the corpus holds: at four bytes a slot this is
+/// about 64 MiB per million documents, and it does not grow with how
+/// much text a document carries.
+///
+/// The terms kept are the most selective a document has, which is where
+/// the grouping signal is. A document with fewer eligible terms
+/// contributes what it has.
+const REORDER_TERMS_PER_DOC: usize = 16;
 
 /// Bits of term-id space the bisection works in. Terms are hashed into
 /// it rather than interned, so the vocabulary costs nothing to hold;
@@ -1879,80 +1883,131 @@ impl SuperfileBuilder {
         n_fts_columns: u32,
         n_out_docs: u32,
     ) -> Result<Option<Vec<u32>>, BuildError> {
-        if n_out_docs as usize <= REORDER_MIN_DOCS {
+        if (n_out_docs as usize) <= REORDER_MIN_DOCS {
             return Ok(None);
         }
-        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        for (reader, _) in readers {
+            if reader.fts().is_none() {
+                return Ok(None);
+            }
+        }
+
+        // Which output row each input-local document becomes, for every
+        // input, numbered exactly as the carry below numbers survivors.
+        let mut rows_of: Vec<Vec<Option<u32>>> = Vec::with_capacity(readers.len());
         let mut base: u32 = 0;
         for (reader, deleted) in readers {
-            let Some(fts) = reader.fts() else {
-                return Ok(None);
-            };
+            let fts = reader.fts().expect("checked above");
             let n_local = fts.n_docs();
-            // Same dense survivor numbering the carry below uses, so a
-            // pair's document is the row it will occupy.
-            let mut row_of_local: Vec<Option<u32>> = vec![None; n_local as usize];
+            let mut rows = vec![None; n_local as usize];
             let mut rank = 0u32;
             for d in 0..n_local {
                 if !deleted.as_ref().is_some_and(|b| b.contains(d)) {
-                    row_of_local[d as usize] = Some(base + rank);
+                    rows[d as usize] = Some(base + rank);
                     rank += 1;
                 }
             }
+            base += rank;
+            rows_of.push(rows);
+        }
+
+        // Pass one: how many documents carry each term. A term in one
+        // document groups nothing and a term in most of them separates
+        // nothing, so this is what makes a term eligible, and among the
+        // eligible it is what makes one more informative than another.
+        let n_term_ids = 1usize << REORDER_TERM_ID_BITS;
+        let mut df: Vec<u32> = vec![0; n_term_ids];
+        for ((reader, _), rows) in readers.iter().zip(rows_of.iter()) {
+            let fts = reader.fts().expect("checked above");
             for column_id in 0..n_fts_columns {
-                let mut over_budget = false;
-                let walk = fts.for_each_term_posting(column_id, |term, local_doc, _tf, _pos| {
-                    if pairs.len() >= REORDER_MAX_PAIRS {
-                        over_budget = true;
-                        return Err(FtsError::Read(ReadError::MalformedVersion(
-                            "reorder budget reached".into(),
-                        )));
-                    }
-                    if let Some(row) = row_of_local[local_doc as usize] {
-                        pairs.push((row, hash_term(term)));
+                fts.for_each_term_posting(column_id, |term, local_doc, _tf, _pos| {
+                    if rows[local_doc as usize].is_some() {
+                        df[hash_term(term) as usize] += 1;
                     }
                     Ok(())
-                });
-                if over_budget {
-                    return Ok(None);
-                }
-                walk.map_err(|e| {
+                })
+                .map_err(|e| {
                     BuildError::Io(Error::other(format!(
-                        "fts merge: reading postings for the document order failed: {e}"
+                        "fts merge: counting terms for the document order failed: {e}"
                     )))
                 })?;
             }
-            base += rank;
-        }
-        if pairs.is_empty() {
-            return Ok(None);
-        }
-
-        // A term in a single document groups nothing, and one in most of
-        // them separates nothing; dropping both sharpens the split and
-        // shrinks the work.
-        let mut df: FxHashMap<u32, u32> = FxHashMap::default();
-        for &(_, t) in &pairs {
-            *df.entry(t).or_default() += 1;
         }
         let too_common = (n_out_docs / 2).max(2);
-        pairs.retain(|&(_, t)| {
-            let d = df.get(&t).copied().unwrap_or(0);
+        let eligible = |t: u32| -> bool {
+            let d = df[t as usize];
             d >= 2 && d <= too_common
-        });
-        if pairs.is_empty() {
-            return Ok(None);
-        }
+        };
 
-        pairs.sort_unstable();
-        let mut docs: Vec<Vec<u32>> = vec![Vec::new(); n_out_docs as usize];
-        for (row, term) in pairs {
-            if let Some(slot) = docs.get_mut(row as usize) {
-                slot.push(term);
+        // Pass two: keep each document's most selective terms, in a
+        // fixed number of slots per document. `worst` tracks the slot
+        // holding the least selective term kept so far, so a posting
+        // that cannot displace it costs one comparison.
+        let n = n_out_docs as usize;
+        let mut slots: Vec<u32> = vec![0; n * REORDER_TERMS_PER_DOC];
+        let mut filled: Vec<u8> = vec![0; n];
+        let mut worst: Vec<u8> = vec![0; n];
+        for ((reader, _), rows) in readers.iter().zip(rows_of.iter()) {
+            let fts = reader.fts().expect("checked above");
+            for column_id in 0..n_fts_columns {
+                fts.for_each_term_posting(column_id, |term, local_doc, _tf, _pos| {
+                    let Some(row) = rows[local_doc as usize] else {
+                        return Ok(());
+                    };
+                    let t = hash_term(term);
+                    if !eligible(t) {
+                        return Ok(());
+                    }
+                    let row = row as usize;
+                    let slot_base = row * REORDER_TERMS_PER_DOC;
+                    let used = filled[row] as usize;
+                    if used < REORDER_TERMS_PER_DOC {
+                        slots[slot_base + used] = t;
+                        if used == 0
+                            || df[t as usize] > df[slots[slot_base + worst[row] as usize] as usize]
+                        {
+                            worst[row] = used as u8;
+                        }
+                        filled[row] = (used + 1) as u8;
+                        return Ok(());
+                    }
+                    let worst_slot = slot_base + worst[row] as usize;
+                    if df[t as usize] >= df[slots[worst_slot] as usize] {
+                        return Ok(());
+                    }
+                    slots[worst_slot] = t;
+                    // The worst moved; find it again over the fixed,
+                    // small slot count.
+                    let mut w = 0usize;
+                    for i in 1..REORDER_TERMS_PER_DOC {
+                        if df[slots[slot_base + i] as usize] > df[slots[slot_base + w] as usize] {
+                            w = i;
+                        }
+                    }
+                    worst[row] = w as u8;
+                    Ok(())
+                })
+                .map_err(|e| {
+                    BuildError::Io(Error::other(format!(
+                        "fts merge: reading terms for the document order failed: {e}"
+                    )))
+                })?;
             }
+        }
+        drop(df);
+
+        let docs: Vec<&[u32]> = (0..n)
+            .map(|row| {
+                let lo = row * REORDER_TERMS_PER_DOC;
+                &slots[lo..lo + filled[row] as usize]
+            })
+            .collect();
+        if docs.iter().all(|d| d.is_empty()) {
+            return Ok(None);
         }
         let fwd = ForwardIndex::from_docs(&docs);
         drop(docs);
+        drop(slots);
         Ok(Some(bisect_order(&fwd)))
     }
 
