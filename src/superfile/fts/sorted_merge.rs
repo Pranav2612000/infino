@@ -14,6 +14,8 @@ use std::{
     cmp::Reverse, collections::BinaryHeap, io::Error, iter::once, str::from_utf8, sync::Arc, vec,
 };
 
+use bytes::Bytes;
+
 use crate::{
     superfile::{
         BuildError, FtsError, SuperfileReader,
@@ -50,7 +52,8 @@ pub(crate) fn merge_column(
     let mut cursors: Vec<TermCursor> = readers
         .iter()
         .map(|fts| TermCursor::new(fts, column_id))
-        .collect();
+        .collect::<Result<_, _>>()
+        .map_err(read_error)?;
 
     // Min-heap of each input's current term; ties pop in input order.
     let mut heap = BinaryHeap::new();
@@ -116,6 +119,8 @@ pub(crate) fn merge_column(
 /// Walks one input column's dictionary in term order, a chunk at a time.
 struct TermCursor<'a> {
     fts: &'a FtsReader,
+    /// The input's dictionary, fetched once rather than per chunk.
+    fst_bytes: Bytes,
     column_id: u32,
     chunk: vec::IntoIter<(Vec<u8>, FstValue)>,
     /// Last term of the latest chunk; the next chunk starts after it.
@@ -125,15 +130,16 @@ struct TermCursor<'a> {
 }
 
 impl<'a> TermCursor<'a> {
-    fn new(fts: &'a FtsReader, column_id: u32) -> Self {
-        Self {
+    fn new(fts: &'a FtsReader, column_id: u32) -> Result<Self, FtsError> {
+        Ok(Self {
             fts,
+            fst_bytes: fts.dict_bytes()?,
             column_id,
             chunk: Vec::new().into_iter(),
             resume: Vec::new(),
             started: false,
             done: false,
-        }
+        })
     }
 
     fn next(&mut self) -> Result<Option<(Vec<u8>, FstValue)>, FtsError> {
@@ -144,9 +150,12 @@ impl<'a> TermCursor<'a> {
             if self.done {
                 return Ok(None);
             }
-            let terms =
-                self.fts
-                    .column_terms_from(self.column_id, &self.resume, TERMS_PER_CHUNK)?;
+            let terms = self.fts.column_terms_from(
+                &self.fst_bytes,
+                self.column_id,
+                &self.resume,
+                TERMS_PER_CHUNK,
+            )?;
             self.done = terms.len() < TERMS_PER_CHUNK;
             // A chunk starts at `resume` itself, which was already handed out.
             let skip_first =

@@ -1034,7 +1034,7 @@ impl FtsReader {
         Ok(Arc::clone(&self.columns[id as usize].tokenizer))
     }
 
-    pub(super) fn dict_bytes(&self) -> Result<Bytes, FtsError> {
+    pub(crate) fn dict_bytes(&self) -> Result<Bytes, FtsError> {
         fetch_source_range(&self.source, self.fst_range.clone(), "fts/dict")
     }
 
@@ -1443,14 +1443,16 @@ impl FtsReader {
     /// Up to `limit` of a column's terms that are `>= from`, in lex order,
     /// each with its dictionary value. Lets a merge walk many inputs'
     /// vocabularies side by side without loading any of them whole.
+    /// `fst_bytes` is this reader's [`Self::dict_bytes`], fetched once by
+    /// the caller: on a lazy source each fetch is a full-dictionary read.
     pub(crate) fn column_terms_from(
         &self,
+        fst_bytes: &[u8],
         column_id: u32,
         from: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, FstValue)>, FtsError> {
-        let fst_bytes = self.dict_bytes()?;
-        let dict = self.open_dict(&fst_bytes)?;
+        let dict = self.open_dict(fst_bytes)?;
         let prefix = make_key(&self.columns[column_id as usize].name, "");
         let mut start = prefix.clone();
         start.extend_from_slice(from);
