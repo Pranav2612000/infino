@@ -14,9 +14,12 @@ use std::{
     cmp::Reverse, collections::BinaryHeap, io::Error, iter::once, str::from_utf8, sync::Arc, vec,
 };
 
-use crate::superfile::{
-    BuildError, FtsError, SuperfileReader,
-    fts::{fst_value::FstValue, positions::encode_run, reader::FtsReader},
+use crate::{
+    superfile::{
+        BuildError, FtsError, SuperfileReader,
+        fts::{positions::encode_run, reader::FtsReader},
+    },
+    utils::terms::FstValue,
 };
 
 /// Terms each input cursor reads from its dictionary at a time.
@@ -63,6 +66,7 @@ pub(crate) fn merge_column(
     let mut contributors: Vec<usize> = Vec::new();
     let mut postings: Vec<(u32, u32)> = Vec::new();
     let mut runs: Vec<u8> = Vec::new();
+    let mut positions_buf: Vec<u32> = Vec::new();
     while let Some(Reverse((term, first))) = heap.pop() {
         contributors.clear();
         contributors.push(first);
@@ -81,6 +85,7 @@ pub(crate) fn merge_column(
                 .for_each_posting_in(
                     column_id,
                     once((term.as_slice(), value)),
+                    &mut positions_buf,
                     |_, doc, tf, pos| {
                         if let Some(out_doc) = remap[doc as usize] {
                             postings.push((out_doc, tf));

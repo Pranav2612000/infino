@@ -1435,6 +1435,7 @@ impl FtsReader {
             entries
                 .iter()
                 .map(|(key, packed)| (&key[prefix_len..], *packed)),
+            &mut Vec::new(),
             emit,
         )
     }
@@ -1462,20 +1463,20 @@ impl FtsReader {
     }
 
     /// [`Self::for_each_term_posting`] over the given `(term, dictionary
-    /// value)` entries instead of the whole column.
+    /// value)` entries instead of the whole column. `positions_buf` is
+    /// scratch for the decoded position runs, owned by the caller so it
+    /// can be reused across calls.
     pub(crate) fn for_each_posting_in<'t>(
         &self,
         column_id: u32,
         entries: impl Iterator<Item = (&'t [u8], FstValue)>,
+        positions_buf: &mut Vec<u32>,
         mut emit: impl FnMut(&[u8], u32, u32, &[u32]) -> Result<(), FtsError>,
     ) -> Result<(), FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let positional = col_meta.positions;
         let region_base = self.postings_range.start;
         let positions_region = self.positions_range.clone();
-
-        // Reused across (term, doc) to hold the decoded position run.
-        let mut positions_buf: Vec<u32> = Vec::new();
 
         for (term, packed) in entries {
             match packed {
@@ -1542,13 +1543,13 @@ impl FtsReader {
                                 Some(bytes) => {
                                     positions_buf.clear();
                                     group
-                                        .run_positions(bytes.as_ref(), i, t[i], &mut positions_buf)
+                                        .run_positions(bytes.as_ref(), i, t[i], positions_buf)
                                         .ok_or_else(|| {
                                             FtsError::Read(ReadError::MalformedVersion(
                                                 "position run overflowing in merge read".into(),
                                             ))
                                         })?;
-                                    &positions_buf
+                                    positions_buf.as_slice()
                                 }
                                 None => &[],
                             };
@@ -1619,24 +1620,24 @@ impl FtsReader {
                                             bytes.as_ref(),
                                             cursor.pos,
                                             tf,
-                                            &mut positions_buf,
+                                            positions_buf,
                                         )
                                         .ok_or_else(|| {
                                             FtsError::Read(ReadError::MalformedVersion(
                                                 "position run overflowing in merge read".into(),
                                             ))
                                         })?;
-                                    &positions_buf
+                                    positions_buf.as_slice()
                                 }
                                 Some(bytes) => {
                                     positions_buf.clear();
-                                    decode_run(bytes.as_ref(), &mut pos_at, tf, &mut positions_buf)
+                                    decode_run(bytes.as_ref(), &mut pos_at, tf, positions_buf)
                                         .ok_or_else(|| {
                                             FtsError::Read(ReadError::MalformedVersion(
                                                 "truncated position run in merge read".into(),
                                             ))
                                         })?;
-                                    &positions_buf
+                                    positions_buf.as_slice()
                                 }
                                 None => &[],
                             };
