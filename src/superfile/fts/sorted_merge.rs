@@ -23,7 +23,10 @@ use crate::{
         fts::{positions::encode_run, reader::FtsReader},
         id_space::FtsDocId,
     },
-    utils::terms::FstValue,
+    utils::{
+        terms::FstValue,
+        trace::{Stopwatch, record},
+    },
 };
 
 /// Terms each input cursor reads from its dictionary at a time.
@@ -41,6 +44,11 @@ pub(crate) struct SortedInput {
 /// `postings` are `(output_doc_id, tf)`, doc ids ascending; `runs` holds
 /// each posting's encoded positions back to back (empty for a
 /// non-positional column).
+///
+/// Under `detailed-tracing`, records where the time went on the enclosing
+/// span: `dict_ms`, `read_ms`, `sort_ms` and `emit_ms`, plus the
+/// `postings`, `term_inputs`, `sorted_terms`, `sorted_postings` and
+/// `position_bytes` counts.
 pub(crate) fn merge_column(
     inputs: &[SortedInput],
     column_id: u32,
@@ -75,7 +83,22 @@ pub(crate) fn merge_column(
     let mut run_starts: Vec<usize> = Vec::new();
     let mut sorted_postings: Vec<(u32, u32)> = Vec::new();
     let mut sorted_runs: Vec<u8> = Vec::new();
-    while let Some(Reverse((term, first))) = heap.pop() {
+    // Walking the dictionaries and the heap; decoding and remapping the
+    // postings; sorting a term whose postings arrive out of order; and
+    // encoding and writing the term.
+    let mut dict = Stopwatch::default();
+    let mut read = Stopwatch::default();
+    let mut sort = Stopwatch::default();
+    let mut emit_time = Stopwatch::default();
+    let (mut n_postings, mut n_term_inputs, mut n_sorted_terms, mut n_sorted_postings) =
+        (0u64, 0u64, 0u64, 0u64);
+    let mut n_position_bytes = 0u64;
+    loop {
+        let started = Stopwatch::start();
+        let Some(Reverse((term, first))) = heap.pop() else {
+            dict.stop(started);
+            break;
+        };
         contributors.clear();
         contributors.push(first);
         while heap.peek().is_some_and(|Reverse((t, _))| *t == term) {
@@ -83,12 +106,15 @@ pub(crate) fn merge_column(
                 contributors.push(i);
             }
         }
+        dict.stop(started);
+        n_term_inputs += contributors.len() as u64;
 
         postings.clear();
         runs.clear();
         run_starts.clear();
         let mut ascending = true;
         for &i in &contributors {
+            let started = Stopwatch::start();
             let value = values[i].ok_or(BuildError::BatchReadError)?;
             let remap = &inputs[i].remap;
             readers[i]
@@ -108,12 +134,17 @@ pub(crate) fn merge_column(
                     },
                 )
                 .map_err(read_error)?;
+            read.stop(started);
+            let started = Stopwatch::start();
             let next = cursors[i].next().map_err(read_error)?;
             values[i] = next.as_ref().map(|(_, value)| *value);
             if let Some((next_term, _)) = next {
                 heap.push(Reverse((next_term, i)));
             }
+            dict.stop(started);
         }
+        n_postings += postings.len() as u64;
+        n_position_bytes += runs.len() as u64;
 
         let term = from_utf8(&term)
             .map_err(|_| BuildError::Io(Error::other("fts sorted merge: non-utf8 term")))?;
@@ -122,11 +153,16 @@ pub(crate) fn merge_column(
             continue;
         }
         if ascending {
+            let started = Stopwatch::start();
             emit(term, &postings, &runs)?;
+            emit_time.stop(started);
             continue;
         }
         // Sort this term's postings by output doc id, moving each
         // posting's run with it.
+        n_sorted_terms += 1;
+        n_sorted_postings += postings.len() as u64;
+        let started = Stopwatch::start();
         run_starts.push(runs.len());
         let mut order: Vec<usize> = (0..postings.len()).collect();
         order.sort_unstable_by_key(|&k| postings[k].0);
@@ -136,8 +172,20 @@ pub(crate) fn merge_column(
             sorted_postings.push(postings[k]);
             sorted_runs.extend_from_slice(&runs[run_starts[k]..run_starts[k + 1]]);
         }
+        sort.stop(started);
+        let started = Stopwatch::start();
         emit(term, &sorted_postings, &sorted_runs)?;
+        emit_time.stop(started);
     }
+    record("dict_ms", dict.ms());
+    record("read_ms", read.ms());
+    record("sort_ms", sort.ms());
+    record("emit_ms", emit_time.ms());
+    record("postings", n_postings);
+    record("term_inputs", n_term_inputs);
+    record("sorted_terms", n_sorted_terms);
+    record("sorted_postings", n_sorted_postings);
+    record("position_bytes", n_position_bytes);
     Ok(())
 }
 

@@ -827,6 +827,7 @@ impl Supertable {
                 stale_seal_timeout,
                 max_retries,
             )
+            .instrument(detail_span!("compaction_seal_input"))
             .await
             {
                 Ok(v) => v,
@@ -922,6 +923,7 @@ impl Supertable {
                 &mut pending_storage_replaces,
                 &term_contributions,
             )
+            .instrument(detail_span!("compaction_commit_attempt", attempt = attempt))
             .await
             {
                 Ok(new_manifest) => {
@@ -957,6 +959,7 @@ impl Supertable {
                         &entries_to_remove,
                         pending_cache_inserts,
                     )
+                    .instrument(detail_span!("compaction_finalize"))
                     .await;
                     return Ok(());
                 }

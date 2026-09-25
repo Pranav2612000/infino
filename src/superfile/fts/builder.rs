@@ -178,7 +178,7 @@ type DocPosHeadMap = HbHashMap<&'static str, u32, FxBuildHasher>;
 /// (`FtsBuilder::doc_pos_chain`): no previous occurrence.
 const CHAIN_END: u32 = u32::MAX;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct FinishProfile {
     enabled: bool,
     /// Set once any posting block is emitted in the bitset encoding, so
@@ -196,6 +196,9 @@ struct FinishProfile {
     encode_skip_write: Duration,
     encode_block_write: Duration,
     fst_insert: Duration,
+    /// Turning a term's position runs into the layout written, in both
+    /// the short and the long form.
+    encode_positions: Duration,
     // Per-column phase totals (summed across columns; printed in the
     // [fts-finish] summary line at the end of finish_to).
     partition_flush: Duration,
@@ -213,7 +216,8 @@ struct FinishProfile {
 impl FinishProfile {
     fn from_config() -> Self {
         Self {
-            enabled: crate::config::global().diagnostics.fts_profile,
+            enabled: crate::config::global().diagnostics.fts_profile
+                || cfg!(feature = "detailed-tracing"),
             ..Self::default()
         }
     }
@@ -3044,8 +3048,27 @@ impl FtsBuilder {
                     column = col_name.as_str(),
                     inputs = sorted_inputs.len(),
                     terms = tracing::field::Empty,
+                    dict_ms = tracing::field::Empty,
+                    read_ms = tracing::field::Empty,
+                    sort_ms = tracing::field::Empty,
+                    emit_ms = tracing::field::Empty,
+                    postings = tracing::field::Empty,
+                    term_inputs = tracing::field::Empty,
+                    sorted_terms = tracing::field::Empty,
+                    sorted_postings = tracing::field::Empty,
+                    position_bytes = tracing::field::Empty,
+                    encode_positions_ms = tracing::field::Empty,
+                    block_build_ms = tracing::field::Empty,
+                    meta_write_ms = tracing::field::Empty,
+                    skip_write_ms = tracing::field::Empty,
+                    block_write_ms = tracing::field::Empty,
+                    fst_insert_ms = tracing::field::Empty,
+                    short_terms = tracing::field::Empty,
+                    long_terms = tracing::field::Empty,
+                    inline_terms = tracing::field::Empty,
                 )
                 .entered();
+                let profile_before = finish_profile.clone();
                 let mut n_emitted: usize = 0;
                 merge_column(&sorted_inputs, orig_col_idx as u32, |term, pairs, runs| {
                     n_emitted += 1;
@@ -3071,6 +3094,7 @@ impl FtsBuilder {
                 })?;
                 n_terms_total_usize += n_emitted;
                 record("terms", n_emitted as u64);
+                record_encode_profile(&profile_before, &finish_profile);
                 drop(merge_span);
             } else {
                 match posting_state {
@@ -3855,6 +3879,36 @@ fn assemble_and_write_blob<W: Write>(
     Ok(())
 }
 
+/// Record how one column's term encoding split, as the difference between
+/// two profile snapshots, on the enclosing span.
+fn record_encode_profile(before: &FinishProfile, after: &FinishProfile) {
+    let ms = |a: Duration, b: Duration| (a - b).as_millis() as u64;
+    record(
+        "encode_positions_ms",
+        ms(after.encode_positions, before.encode_positions),
+    );
+    record(
+        "block_build_ms",
+        ms(after.encode_block_build, before.encode_block_build),
+    );
+    record(
+        "meta_write_ms",
+        ms(after.encode_meta_write, before.encode_meta_write),
+    );
+    record(
+        "skip_write_ms",
+        ms(after.encode_skip_write, before.encode_skip_write),
+    );
+    record(
+        "block_write_ms",
+        ms(after.encode_block_write, before.encode_block_write),
+    );
+    record("fst_insert_ms", ms(after.fst_insert, before.fst_insert));
+    record("short_terms", after.encode_short - before.encode_short);
+    record("long_terms", after.encode_pfor - before.encode_pfor);
+    record("inline_terms", after.encode_df1 - before.encode_df1);
+}
+
 #[inline]
 fn map_fst_err(e: fst::Error) -> BuildError {
     BuildError::Io(Error::new(ErrorKind::InvalidData, e))
@@ -4145,6 +4199,7 @@ fn encode_and_emit_term<W: Write>(
         // exactly as a long term's do; the body's trailer says where.
         profile.encode_short += 1;
         let metadata_offset = *postings_len;
+        let positions_start = profile.enabled.then(Instant::now);
         let positions = match term_positions.as_ref() {
             Some((_, runs)) => {
                 // The whole term is one position group, inline in the body:
@@ -4168,6 +4223,9 @@ fn encode_and_emit_term<W: Write>(
             }
             None => None,
         };
+        if let Some(start) = positions_start {
+            profile.encode_positions += start.elapsed();
+        }
         let term_buf = &mut scratch.term_buf;
         term_buf.clear();
         encode_short(term_buf, pairs, positions);
@@ -4319,6 +4377,7 @@ fn encode_and_emit_term<W: Write>(
         // — those runs regrouped per block into `scratch.pos_out`.
         let pos_out = &mut scratch.pos_out;
         pos_out.clear();
+        let positions_start = profile.enabled.then(Instant::now);
         if let Some((_, runs)) = &term_positions {
             debug_assert!(
                 runs.len() <= u32::MAX as usize,
@@ -4370,6 +4429,9 @@ fn encode_and_emit_term<W: Write>(
                 subindex_size,
                 "sub-index must hold entries_per_block offsets per block"
             );
+        }
+        if let Some(start) = positions_start {
+            profile.encode_positions += start.elapsed();
         }
 
         debug_assert!(df <= u32::MAX as u64, "df overflows u32");

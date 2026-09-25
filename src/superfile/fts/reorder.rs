@@ -34,9 +34,14 @@
 //! Nothing here reads or writes a blob. It takes term sets and returns
 //! an order, so it can be tested against the cost it claims to lower.
 
-use std::sync::{Mutex, PoisonError};
+use std::sync::{
+    Mutex, PoisonError,
+    atomic::{AtomicU64, Ordering},
+};
 
 use rayon::{join, prelude::*};
+
+use crate::utils::trace::{Stopwatch, detail_span, record};
 
 /// Documents below this per-partition size are left in the order they
 /// already have. Splitting further costs more than the grouping is
@@ -110,6 +115,11 @@ impl ForwardIndex {
         }
     }
 
+    /// Term ids held across all documents.
+    pub(crate) fn n_entries(&self) -> usize {
+        self.terms.len()
+    }
+
     /// Documents in the index.
     pub(crate) fn len(&self) -> usize {
         self.starts.len().saturating_sub(1)
@@ -128,6 +138,9 @@ impl ForwardIndex {
 ///
 /// The identity when there is nothing to gain, which is a corpus too
 /// small to split or one whose documents share no terms.
+///
+/// Under `detailed-tracing`, records on the enclosing span how many
+/// scratch `states` the parallel splits created.
 pub(crate) fn bisect_order(fwd: &ForwardIndex) -> Vec<u32> {
     let n = fwd.len();
     let mut order: Vec<u32> = (0..n as u32).collect();
@@ -137,8 +150,10 @@ pub(crate) fn bisect_order(fwd: &ForwardIndex) -> Vec<u32> {
     let pool = StatePool {
         n_terms: fwd.n_terms,
         free: Mutex::new(Vec::new()),
+        created: AtomicU64::new(0),
     };
     split_parallel(fwd, &mut order, 0, &pool);
+    record("states", pool.created.load(Ordering::Relaxed));
     order
 }
 
@@ -146,6 +161,7 @@ pub(crate) fn bisect_order(fwd: &ForwardIndex) -> Vec<u32> {
 /// of a large partition in parallel.
 fn split_parallel(fwd: &ForwardIndex, order: &mut [u32], depth: u32, pool: &StatePool) {
     if order.len() < PARALLEL_MIN_PARTITION {
+        let _span = detail_span!("bisect_subtree", depth = depth, docs = order.len()).entered();
         pool.with_state(|state| state.split(fwd, order, depth));
         return;
     }
@@ -153,7 +169,23 @@ fn split_parallel(fwd: &ForwardIndex, order: &mut [u32], depth: u32, pool: &Stat
         return;
     }
     let mid = order.len() / 2;
+    let split_span = detail_span!(
+        "bisect_split",
+        depth = depth,
+        docs = order.len(),
+        terms = tracing::field::Empty,
+        rounds = tracing::field::Empty,
+        hit_round_limit = tracing::field::Empty,
+        swaps = tracing::field::Empty,
+        count_ms = tracing::field::Empty,
+        gains_ms = tracing::field::Empty,
+        rank_ms = tracing::field::Empty,
+        sort_ms = tracing::field::Empty,
+        swap_ms = tracing::field::Empty,
+    )
+    .entered();
     pool.with_state(|state| state.refine(fwd, order, mid, true));
+    drop(split_span);
     let (left, right) = order.split_at_mut(mid);
     join(
         || split_parallel(fwd, left, depth + 1, pool),
@@ -166,6 +198,8 @@ fn split_parallel(fwd: &ForwardIndex, order: &mut [u32], depth: u32, pool: &Stat
 struct StatePool {
     n_terms: usize,
     free: Mutex<Vec<BisectState>>,
+    /// States made so far, for tracing.
+    created: AtomicU64,
 }
 
 impl StatePool {
@@ -177,7 +211,10 @@ impl StatePool {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .pop();
-        let mut state = taken.unwrap_or_else(|| BisectState::new(self.n_terms));
+        let mut state = taken.unwrap_or_else(|| {
+            self.created.fetch_add(1, Ordering::Relaxed);
+            BisectState::new(self.n_terms)
+        });
         let out = f(&mut state);
         self.free
             .lock()
@@ -238,24 +275,49 @@ impl BisectState {
     /// Move documents across the split while it lowers the cost, then
     /// leave the two halves in `order`. `parallel` spreads each round's
     /// gains and sorts across threads.
+    ///
+    /// A parallel split records, under `detailed-tracing`, its rounds,
+    /// swaps and where its time went on the enclosing span. The many
+    /// small serial splits are not timed.
     fn refine(&mut self, fwd: &ForwardIndex, order: &mut [u32], mid: usize, parallel: bool) {
+        let start = || match parallel {
+            true => Stopwatch::start(),
+            false => None,
+        };
+        let mut count = Stopwatch::default();
+        let mut gains = Stopwatch::default();
+        let mut rank = Stopwatch::default();
+        let mut sort = Stopwatch::default();
+        let mut swap = Stopwatch::default();
+        let (mut n_rounds, mut n_swaps, mut last_moved) = (0u64, 0u64, 0usize);
+
+        let started = start();
         self.count_degrees(fwd, order, mid);
         let n_left = mid as f32;
         let n_right = (order.len() - mid) as f32;
         fill_cost_table(&mut self.cost_left, n_left);
         fill_cost_table(&mut self.cost_right, n_right);
+        count.stop(started);
 
         for _ in 0..MAX_ROUNDS {
+            n_rounds += 1;
             // A document's gain is what the cost drops by if it moves:
             // its terms get one rarer on this side and one commoner on
             // the other. Positive means the move is worth making.
             let moved = {
+                let started = start();
                 self.compute_move_gains(n_left, n_right);
+                gains.stop(started);
                 let (left, right) = order.split_at_mut(mid);
+                let started = start();
                 let mut left_gains = rank_by_gain(fwd, left, &self.move_gain_left, parallel);
                 let mut right_gains = rank_by_gain(fwd, right, &self.move_gain_right, parallel);
+                rank.stop(started);
+                let started = start();
                 sort_by_gain(&mut left_gains, parallel);
                 sort_by_gain(&mut right_gains, parallel);
+                sort.stop(started);
+                let started = start();
 
                 // Swap in pairs so the halves keep their sizes. Both
                 // lists are sorted by gain, so once a pair does not pay
@@ -280,11 +342,30 @@ impl BisectState {
                     left[li] = rd;
                     right[ri] = ld;
                 }
+                swap.stop(started);
                 swaps
             };
+            n_swaps += moved as u64;
+            last_moved = moved;
             if moved == 0 {
                 break;
             }
+        }
+        if parallel {
+            record("terms", self.touched.len() as u64);
+            record("rounds", n_rounds);
+            // Every round still moved documents: the split stopped at
+            // the cap, not because it had settled.
+            record(
+                "hit_round_limit",
+                n_rounds == MAX_ROUNDS as u64 && last_moved > 0,
+            );
+            record("swaps", n_swaps);
+            record("count_ms", count.ms());
+            record("gains_ms", gains.ms());
+            record("rank_ms", rank.ms());
+            record("sort_ms", sort.ms());
+            record("swap_ms", swap.ms());
         }
         self.clear_degrees();
     }

@@ -31,6 +31,8 @@
 //! engine-side code. The engine's job is only to never orphan the chain
 //! — see the thread hand-off helpers in `runtime_bridge`.
 
+use std::time::{Duration, Instant};
+
 use tracing::{Span, field::Value};
 
 /// What kind of operation a span's work is being done for.
@@ -178,6 +180,33 @@ pub(crate) use detail_span;
 pub(crate) fn record<V: Value>(field: &'static str, value: V) {
     if cfg!(feature = "detailed-tracing") {
         Span::current().record(field, value);
+    }
+}
+
+/// Time summed over a section that runs too often for a span of its
+/// own, such as once per term, and recorded as a millisecond field on
+/// the enclosing span. Reads no clock without `detailed-tracing`.
+#[derive(Default)]
+pub(crate) struct Stopwatch(Duration);
+
+impl Stopwatch {
+    /// When one timed run of the section began, or `None` when not
+    /// tracing.
+    #[inline]
+    pub(crate) fn start() -> Option<Instant> {
+        cfg!(feature = "detailed-tracing").then(Instant::now)
+    }
+
+    /// Add the time since `started`.
+    #[inline]
+    pub(crate) fn stop(&mut self, started: Option<Instant>) {
+        if let Some(t) = started {
+            self.0 += t.elapsed();
+        }
+    }
+
+    pub(crate) fn ms(&self) -> u64 {
+        self.0.as_millis() as u64
     }
 }
 

@@ -125,7 +125,10 @@ use crate::{
             rerank_codec::RerankCodec,
         },
     },
-    utils::{terms::validate_column_name, trace::detail_span},
+    utils::{
+        terms::validate_column_name,
+        trace::{detail_span, record},
+    },
 };
 
 /// Merges below this many surviving documents keep arrival order: a
@@ -1992,7 +1995,15 @@ impl SuperfileBuilder {
         // document groups nothing and a term in most of them separates
         // nothing, so this is what makes a term eligible, and among the
         // eligible it is what makes one more informative than another.
-        let count_span = detail_span!("merge_order_count_terms").entered();
+        let count_span = detail_span!(
+            "merge_order_count_terms",
+            postings = tracing::field::Empty,
+            deleted_postings = tracing::field::Empty,
+            positions = tracing::field::Empty,
+            eligible_buckets = tracing::field::Empty,
+        )
+        .entered();
+        let (mut n_postings, mut n_deleted, mut n_positions) = (0u64, 0u64, 0u64);
         let n_buckets = 1usize << REORDER_TERM_BUCKET_BITS;
         let mut df: Vec<u32> = vec![0; n_buckets];
         let rows_by_blob: Vec<Vec<Option<RowId>>> = readers
@@ -2003,9 +2014,12 @@ impl SuperfileBuilder {
         for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
             let fts = reader.fts().expect("checked above");
             for column_id in 0..n_fts_columns {
-                fts.for_each_term_posting(column_id, |term, local_doc, _tf, _pos| {
-                    if rows[local_doc as usize].is_some() {
-                        df[term_bucket(term) as usize] += 1;
+                fts.for_each_term_posting(column_id, |term, local_doc, _tf, pos| {
+                    n_postings += 1;
+                    n_positions += pos.len() as u64;
+                    match rows[local_doc as usize].is_some() {
+                        true => df[term_bucket(term) as usize] += 1,
+                        false => n_deleted += 1,
                     }
                     Ok(())
                 })
@@ -2016,18 +2030,36 @@ impl SuperfileBuilder {
                 })?;
             }
         }
-        drop(count_span);
         let too_common = (n_out_docs / 2).max(2);
         let eligible = |t: u32| -> bool {
             let d = df[t as usize];
             d >= 2 && d <= too_common
         };
+        record("postings", n_postings);
+        record("deleted_postings", n_deleted);
+        record("positions", n_positions);
+        record(
+            "eligible_buckets",
+            (0..n_buckets as u32).filter(|&t| eligible(t)).count() as u64,
+        );
+        drop(count_span);
 
         // Pass two: keep each document's most selective terms, in a
         // fixed number of slots per document. `worst` tracks the slot
         // holding the least selective term kept so far, so a posting
         // that cannot displace it costs one comparison.
-        let pick_span = detail_span!("merge_order_pick_terms").entered();
+        // `ineligible_postings` were decoded only to be thrown away, and
+        // `displaced` counts the kept terms that later lost their slot.
+        let pick_span = detail_span!(
+            "merge_order_pick_terms",
+            postings = tracing::field::Empty,
+            ineligible_postings = tracing::field::Empty,
+            kept = tracing::field::Empty,
+            displaced = tracing::field::Empty,
+        )
+        .entered();
+        let (mut n_postings, mut n_ineligible, mut n_kept, mut n_displaced) =
+            (0u64, 0u64, 0u64, 0u64);
         let n = n_out_docs as usize;
         let mut slots: Vec<u32> = vec![0; n * REORDER_TERMS_PER_DOC];
         let mut filled: Vec<u8> = vec![0; n];
@@ -2036,11 +2068,13 @@ impl SuperfileBuilder {
             let fts = reader.fts().expect("checked above");
             for column_id in 0..n_fts_columns {
                 fts.for_each_term_posting(column_id, |term, local_doc, _tf, _pos| {
+                    n_postings += 1;
                     let Some(row) = rows[local_doc as usize] else {
                         return Ok(());
                     };
                     let t = term_bucket(term);
                     if !eligible(t) {
+                        n_ineligible += 1;
                         return Ok(());
                     }
                     let row = row.get() as usize;
@@ -2054,6 +2088,7 @@ impl SuperfileBuilder {
                             worst[row] = used as u8;
                         }
                         filled[row] = (used + 1) as u8;
+                        n_kept += 1;
                         return Ok(());
                     }
                     let worst_slot = slot_base + worst[row] as usize;
@@ -2061,6 +2096,7 @@ impl SuperfileBuilder {
                         return Ok(());
                     }
                     slots[worst_slot] = t;
+                    n_displaced += 1;
                     // The worst moved; find it again over the fixed,
                     // small slot count.
                     let mut w = 0usize;
@@ -2080,8 +2116,13 @@ impl SuperfileBuilder {
             }
         }
         drop(df);
+        record("postings", n_postings);
+        record("ineligible_postings", n_ineligible);
+        record("kept", n_kept);
+        record("displaced", n_displaced);
         drop(pick_span);
 
+        let forward_span = detail_span!("merge_order_forward_index").entered();
         let docs: Vec<&[u32]> = (0..n)
             .map(|row| {
                 let lo = row * REORDER_TERMS_PER_DOC;
@@ -2094,7 +2135,15 @@ impl SuperfileBuilder {
         let fwd = ForwardIndex::from_docs(&docs);
         drop(docs);
         drop(slots);
-        let _bisect_span = detail_span!("merge_order_bisect", docs = n).entered();
+        drop(forward_span);
+        let _bisect_span = detail_span!(
+            "merge_order_bisect",
+            docs = n,
+            entries = tracing::field::Empty,
+            states = tracing::field::Empty,
+        )
+        .entered();
+        record("entries", fwd.n_entries() as u64);
         Ok(Some(bisect_order(&fwd)))
     }
 

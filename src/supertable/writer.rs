@@ -88,7 +88,7 @@ use tokio::{
     sync::mpsc::{Receiver, Sender, channel},
     time::sleep,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{
@@ -118,6 +118,7 @@ use super::{
 };
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
+use crate::utils::trace::{Stopwatch, detail_span, record};
 use crate::{
     InfinoError,
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
@@ -3079,6 +3080,18 @@ pub(in crate::supertable) fn build_term_contribution(
 /// dictionary yields its terms sorted, so the contribution is in the
 /// ascending key order the merge requires. A superfile with no text index
 /// contributes no terms but is still listed by the index.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(
+        skip_all,
+        fields(
+            terms = tracing::field::Empty,
+            walk_ms = tracing::field::Empty,
+            facts_ms = tracing::field::Empty,
+            push_ms = tracing::field::Empty,
+        )
+    )
+)]
 async fn write_superfile_terms(
     reader: &SuperfileReader,
     writer: &mut term_index::ContributionWriter,
@@ -3088,7 +3101,14 @@ async fn write_superfile_terms(
     };
     let mut columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
     columns.sort();
+    // Listing the dictionary's terms; reading each term's facts; and
+    // appending them to the contribution.
+    let mut walk = Stopwatch::default();
+    let mut facts_time = Stopwatch::default();
+    let mut push = Stopwatch::default();
+    let mut n_terms = 0u64;
     for column in &columns {
+        let started = Stopwatch::start();
         let term_bytes = fts
             .iter_column_terms(column)
             .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
@@ -3096,11 +3116,16 @@ async fn write_superfile_terms(
             .iter()
             .map(|t| from_utf8(t).map_err(|_| TermIndexError::Build("non-utf8 term".into())))
             .collect::<Result<_, _>>()?;
+        walk.stop(started);
+        n_terms += terms.len() as u64;
         for chunk in terms.chunks(TERM_INDEX_BATCH_TERMS) {
+            let started = Stopwatch::start();
             let facts = reader
                 .term_index_facts(column, chunk)
                 .await
                 .map_err(|e| TermIndexError::Build(format!("term facts: {e}")))?;
+            facts_time.stop(started);
+            let started = Stopwatch::start();
             for (term, fact) in chunk.iter().zip(facts) {
                 // A term the dictionary lists but no cursor could describe
                 // keeps its presence and is given the ceiling that prunes
@@ -3115,8 +3140,13 @@ async fn write_superfile_terms(
                 };
                 writer.push(&make_key(column, term), df, bound, location)?;
             }
+            push.stop(started);
         }
     }
+    record("terms", n_terms);
+    record("walk_ms", walk.ms());
+    record("facts_ms", facts_time.ms());
+    record("push_ms", push.ms());
     Ok(())
 }
 
@@ -3196,12 +3226,17 @@ pub(super) fn prepare_superfile_named(
     // what removes the 100GB OOM trap (the in-memory cache doesn't
     // evict, so a long-running writer with cache + storage would
     // otherwise accumulate every superfile's bytes in RAM forever).
+    let open_span = detail_span!("prepare_open_reader").entered();
     let reader =
         SuperfileReader::open_with(shard.bytes.clone(), inner.options.superfile_open_options())
             .map_err(|e| BuildError::Store(format!("opening superfile for summary: {e}")))?;
+    drop(open_span);
 
+    let fts_summary_span = detail_span!("prepare_fts_summary").entered();
     let fts_summary = build_fts_summary(&reader, &inner.options);
+    drop(fts_summary_span);
 
+    let _vector_summary_span = detail_span!("prepare_vector_summary").entered();
     let mut vector_summary: HashMap<String, VectorSummary> = HashMap::new();
     if let Some(vec_reader) = reader.vec() {
         for vc in &inner.options.vector_columns {
@@ -3252,8 +3287,10 @@ pub(super) fn prepare_superfile_named(
     });
 
     let storage_key = entry.storage_path();
+    let term_contribution_span = detail_span!("prepare_term_contribution").entered();
     let term_contribution =
         build_term_contribution(&reader, &inner.options, entry.superfile_id, entry.id_min)?;
+    drop(term_contribution_span);
     Ok(Some(PreparedSuperfile {
         entry,
         bytes_for_store: bytes_for_store.map(|b| (uri, b)),
@@ -9595,6 +9632,7 @@ where
 /// artifact always describes the post-merge superfile set. Safe to lose
 /// to contention — queries fall back to the fused query-time gather
 /// until the next maintenance pass republishes.
+#[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 pub(in crate::supertable) async fn stamp_term_stats(
     inner: &SupertableInner,
 ) -> Result<(), BuildError> {
@@ -9658,6 +9696,7 @@ pub(in crate::supertable) async fn stamp_term_stats(
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
             let reference = term_stats::write(storage.as_ref(), bytes)
+                .instrument(detail_span!("term_stats_write"))
                 .await
                 .map_err(|e| BuildError::Store(e.to_string()))?;
             if old.term_stats_blob() == Some(&reference) {
@@ -9679,6 +9718,7 @@ pub(in crate::supertable) async fn stamp_term_stats(
 ///
 /// Every posting carries the term's score ceiling in that superfile, at the
 /// superfile's own statistics; the query rescales it.
+#[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 pub(in crate::supertable) async fn stamp_term_index(
     inner: &SupertableInner,
 ) -> Result<(), BuildError> {
@@ -9710,6 +9750,7 @@ pub(in crate::supertable) async fn stamp_term_index(
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
             let reference = term_index::write_built(storage.as_ref(), built)
+                .instrument(detail_span!("term_index_write"))
                 .await
                 .map_err(|e| BuildError::Store(e.to_string()))?;
             if old.term_index_ref() == Some(&reference) {
@@ -9724,6 +9765,7 @@ pub(in crate::supertable) async fn stamp_term_index(
 /// Walk every superfile's dictionary once, spilling a contribution per
 /// superfile into one scratch directory, then merge them into slices. The
 /// scratch directory goes with the contributions when this returns.
+#[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 async fn collect_and_build_term_index(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
@@ -9736,6 +9778,7 @@ async fn collect_and_build_term_index(
     let mut contributions = Vec::with_capacity(entries.len());
     for entry in entries {
         let reader = open_reader(store, disk_cache, opt_storage, entry, ReadIntent::Stream)
+            .instrument(detail_span!("term_index_open_reader"))
             .await
             .map_err(|e| TermIndexError::Build(e.to_string()))?;
         let mut writer = term_index::ContributionWriter::create(
@@ -9747,6 +9790,7 @@ async fn collect_and_build_term_index(
         contributions.push(writer.finish()?);
         drop(reader);
     }
+    let _build_span = detail_span!("term_index_build", superfiles = contributions.len()).entered();
     term_index::build(&contributions, &term_index::BuildPolicy::default())
 }
 

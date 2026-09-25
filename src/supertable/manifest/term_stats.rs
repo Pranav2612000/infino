@@ -36,7 +36,10 @@ use crate::{
     storage::StorageProvider,
     superfile::SuperfileReader,
     supertable::manifest::{RoutingRef, SuperfileEntry, part::ContentHash},
-    utils::terms::{DictBuilder, make_key},
+    utils::{
+        terms::{DictBuilder, make_key},
+        trace::{Stopwatch, record},
+    },
 };
 
 /// Object-store directory prefix for term-stats artifacts, sibling to
@@ -148,6 +151,22 @@ fn encode(covered: &[Uuid], entries: &BTreeMap<Vec<u8>, u64>) -> Vec<u8> {
 /// 30,000-superfile table it reached roughly 100 GB and could not run at all.
 /// Entries are still visited in order and one at a time, so throughput is
 /// unchanged; only the lifetime is.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(
+        name = "term_stats_build",
+        skip_all,
+        fields(
+            superfiles = entries.len(),
+            terms = tracing::field::Empty,
+            open_ms = tracing::field::Empty,
+            walk_ms = tracing::field::Empty,
+            df_ms = tracing::field::Empty,
+            merge_ms = tracing::field::Empty,
+            encode_ms = tracing::field::Empty,
+        )
+    )
+)]
 pub(crate) async fn build<F, Fut>(
     entries: &[Arc<SuperfileEntry>],
     mut open: F,
@@ -158,12 +177,22 @@ where
 {
     let mut merged: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
     let mut covered: Vec<Uuid> = Vec::with_capacity(entries.len());
+    // Opening each reader; listing its terms; fetching their dfs; and
+    // folding them into the table-wide map.
+    let mut open_time = Stopwatch::default();
+    let mut walk = Stopwatch::default();
+    let mut df_time = Stopwatch::default();
+    let mut merge = Stopwatch::default();
+    let mut n_terms = 0u64;
     for entry in entries {
         covered.push(entry.superfile_id);
+        let started = Stopwatch::start();
         let reader = open(entry).await?;
+        open_time.stop(started);
         let Some(fts) = reader.fts() else { continue };
         let columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
         for column in &columns {
+            let started = Stopwatch::start();
             let term_bytes = fts
                 .iter_column_terms(column)
                 .map_err(|e| TermStatsError::Build(format!("term walk: {e}")))?;
@@ -171,19 +200,35 @@ where
                 .iter()
                 .map(|t| from_utf8(t).map_err(|_| TermStatsError::Build("non-utf8 term".into())))
                 .collect::<Result<_, _>>()?;
+            walk.stop(started);
+            n_terms += terms.len() as u64;
             for chunk in terms.chunks(BUILD_DF_BATCH_TERMS) {
+                let started = Stopwatch::start();
                 let (dfs, _work) = reader
                     .term_dfs(column, chunk)
                     .await
                     .map_err(|e| TermStatsError::Build(format!("df batch: {e}")))?;
+                df_time.stop(started);
+                let started = Stopwatch::start();
                 for (term, df) in chunk.iter().zip(dfs) {
                     *merged.entry(make_key(column, term)).or_insert(0) += df;
                 }
+                merge.stop(started);
             }
         }
     }
     covered.sort_unstable();
-    Ok(encode(&covered, &merged))
+    let started = Stopwatch::start();
+    let bytes = encode(&covered, &merged);
+    let mut encode_time = Stopwatch::default();
+    encode_time.stop(started);
+    record("terms", n_terms);
+    record("open_ms", open_time.ms());
+    record("walk_ms", walk.ms());
+    record("df_ms", df_time.ms());
+    record("merge_ms", merge.ms());
+    record("encode_ms", encode_time.ms());
+    Ok(bytes)
 }
 
 /// Content-address and persist artifact bytes; returns the manifest
