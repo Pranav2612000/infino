@@ -8,7 +8,8 @@
 //! the merged postings of a term are each input's postings for it, joined
 //! in input order — already sorted by output doc id. A k-way merge over the
 //! inputs' dictionaries yields the output in final order, with no
-//! accumulator, spill or sort.
+//! corpus-sized accumulator and no sort; peak memory is one term's
+//! postings across all inputs.
 
 use std::{
     cmp::Reverse, collections::BinaryHeap, io::Error, iter::once, str::from_utf8, sync::Arc, vec,
@@ -49,9 +50,9 @@ pub(crate) fn merge_column(
         .iter()
         .map(|input| input.reader.fts().ok_or(BuildError::BatchReadError))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut cursors: Vec<TermCursor> = readers
+    let mut cursors: Vec<TermChunks> = readers
         .iter()
-        .map(|fts| TermCursor::new(fts, column_id))
+        .map(|fts| TermChunks::new(fts, column_id))
         .collect::<Result<_, _>>()
         .map_err(read_error)?;
 
@@ -91,6 +92,12 @@ pub(crate) fn merge_column(
                     &mut positions_buf,
                     |_, doc, tf, pos| {
                         if let Some(out_doc) = remap[doc as usize] {
+                            // Nothing sorts these postings, so a remap that
+                            // goes down would write a wrong posting list.
+                            debug_assert!(
+                                postings.last().is_none_or(|&(d, _)| d < out_doc),
+                                "sorted merge: output doc ids must ascend"
+                            );
                             postings.push((out_doc, tf));
                             encode_run(&mut runs, pos);
                         }
@@ -105,19 +112,19 @@ pub(crate) fn merge_column(
             }
         }
 
+        let term = from_utf8(&term)
+            .map_err(|_| BuildError::Io(Error::other("fts sorted merge: non-utf8 term")))?;
         // A term whose every posting was deleted leaves the output.
         if postings.is_empty() {
             continue;
         }
-        let term = from_utf8(&term)
-            .map_err(|_| BuildError::Io(Error::other("fts sorted merge: non-utf8 term")))?;
         emit(term, &postings, &runs)?;
     }
     Ok(())
 }
 
 /// Walks one input column's dictionary in term order, a chunk at a time.
-struct TermCursor<'a> {
+struct TermChunks<'a> {
     fts: &'a FtsReader,
     /// The input's dictionary, fetched once rather than per chunk.
     fst_bytes: Bytes,
@@ -129,7 +136,7 @@ struct TermCursor<'a> {
     done: bool,
 }
 
-impl<'a> TermCursor<'a> {
+impl<'a> TermChunks<'a> {
     fn new(fts: &'a FtsReader, column_id: u32) -> Result<Self, FtsError> {
         Ok(Self {
             fts,

@@ -1425,8 +1425,7 @@ impl FtsReader {
         // Column-scoped FST keys are `column_name <FST_SEPARATOR> term`;
         // `iter_prefix` yields `(key, packed_value)` in lex term order, so we
         // read the posting metadata straight from the value — no re-lookup.
-        let mut column_prefix = column_name.as_bytes().to_vec();
-        column_prefix.push(FST_SEPARATOR);
+        let column_prefix = make_key(column_name, "");
         let prefix_len = column_prefix.len();
 
         let entries = dict.iter_prefix(&column_prefix);

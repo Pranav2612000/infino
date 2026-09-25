@@ -126,6 +126,17 @@ use crate::{
     utils::{terms::validate_column_name, trace::detail_span},
 };
 
+/// How an FTS merge carries its inputs' postings into the output.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PostingMerge {
+    /// Merge term by term across the inputs' dictionaries.
+    TermByTerm,
+    /// Feed every posting through the accumulator. Tests only, to check
+    /// both paths write identical bytes.
+    #[cfg(test)]
+    Accumulator,
+}
+
 /// Per-column FTS configuration. The `column` must exist in
 /// `BuilderOptions.schema` and be `LargeUtf8` (an unstored column may
 /// be absent — the merge-source shape).
@@ -1831,8 +1842,8 @@ impl SuperfileBuilder {
     /// dense, so it aligns row-for-row with the concatenated Parquet body. At
     /// finish, each FTS column is merged term by term across the inputs'
     /// dictionaries, already in output order, so postings are never
-    /// accumulated, spilled or sorted. Doc-lengths are read from each input and
-    /// concatenated — never recomputed from tokens.
+    /// accumulated corpus-wide or sorted. Doc-lengths are read from each
+    /// input and concatenated — never recomputed from tokens.
     ///
     /// Requires FTS/scalar inputs (no vector index); vector-bearing merges use
     /// [`build_from_sq8_ivf_readers`](Self::build_from_sq8_ivf_readers).
@@ -1849,20 +1860,18 @@ impl SuperfileBuilder {
         fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
-        Self::fts_merge_to(readers, fts_corpus, output, true)
+        Self::fts_merge_to(readers, fts_corpus, output, PostingMerge::TermByTerm)
     }
 
     /// [`Self::build_from_readers_fts_merge_to`] with the posting path
-    /// chosen: `sorted` merges term by term, otherwise through the
-    /// accumulator. Only tests pass `false`, to check both write identical
-    /// bytes.
+    /// chosen by `merge`.
     // TODO: remove the accumulator path once the term-by-term merge has
     // proven itself in production.
     fn fts_merge_to<W: Write>(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
         fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
-        sorted: bool,
+        merge: PostingMerge,
     ) -> Result<SuperfileStats, BuildError> {
         let first = readers.first().ok_or(BuildError::BatchReadError)?;
         let builder_opts =
@@ -1922,9 +1931,9 @@ impl SuperfileBuilder {
             // Carry the input's prebuilt postings + doc-lengths across,
             // remapped densely onto the output rows this batch is about to
             // append (so it must run before `next_local_doc_id` advances).
-            // The sorted path carries only doc-lengths now; the finish merges
-            // the postings.
-            if sorted {
+            // The term-by-term path carries only doc-lengths now; the finish
+            // merges the postings.
+            if merge == PostingMerge::TermByTerm {
                 if let Some(remap) =
                     superfile_builder.carry_fts_doc_lengths(reader, deleted.as_deref())?
                 {
@@ -4303,11 +4312,21 @@ mod tests {
         }
 
         let mut accumulator = Vec::new();
-        SuperfileBuilder::fts_merge_to(&inputs, &HashMap::new(), &mut accumulator, false)
-            .expect("accumulator merge");
+        SuperfileBuilder::fts_merge_to(
+            &inputs,
+            &HashMap::new(),
+            &mut accumulator,
+            PostingMerge::Accumulator,
+        )
+        .expect("accumulator merge");
         let mut sorted = Vec::new();
-        SuperfileBuilder::fts_merge_to(&inputs, &HashMap::new(), &mut sorted, true)
-            .expect("sorted merge");
+        SuperfileBuilder::fts_merge_to(
+            &inputs,
+            &HashMap::new(),
+            &mut sorted,
+            PostingMerge::TermByTerm,
+        )
+        .expect("sorted merge");
         assert!(!sorted.is_empty(), "merge wrote a superfile");
         assert!(
             accumulator == sorted,
