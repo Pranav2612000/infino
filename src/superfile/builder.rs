@@ -1992,6 +1992,7 @@ impl SuperfileBuilder {
         // document groups nothing and a term in most of them separates
         // nothing, so this is what makes a term eligible, and among the
         // eligible it is what makes one more informative than another.
+        let count_span = detail_span!("merge_order_count_terms").entered();
         let n_buckets = 1usize << REORDER_TERM_BUCKET_BITS;
         let mut df: Vec<u32> = vec![0; n_buckets];
         let rows_by_blob: Vec<Vec<Option<RowId>>> = readers
@@ -2015,6 +2016,7 @@ impl SuperfileBuilder {
                 })?;
             }
         }
+        drop(count_span);
         let too_common = (n_out_docs / 2).max(2);
         let eligible = |t: u32| -> bool {
             let d = df[t as usize];
@@ -2025,6 +2027,7 @@ impl SuperfileBuilder {
         // fixed number of slots per document. `worst` tracks the slot
         // holding the least selective term kept so far, so a posting
         // that cannot displace it costs one comparison.
+        let pick_span = detail_span!("merge_order_pick_terms").entered();
         let n = n_out_docs as usize;
         let mut slots: Vec<u32> = vec![0; n * REORDER_TERMS_PER_DOC];
         let mut filled: Vec<u8> = vec![0; n];
@@ -2077,6 +2080,7 @@ impl SuperfileBuilder {
             }
         }
         drop(df);
+        drop(pick_span);
 
         let docs: Vec<&[u32]> = (0..n)
             .map(|row| {
@@ -2090,6 +2094,7 @@ impl SuperfileBuilder {
         let fwd = ForwardIndex::from_docs(&docs);
         drop(docs);
         drop(slots);
+        let _bisect_span = detail_span!("merge_order_bisect", docs = n).entered();
         Ok(Some(bisect_order(&fwd)))
     }
 
