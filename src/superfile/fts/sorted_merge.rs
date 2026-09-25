@@ -26,7 +26,7 @@ use crate::{
 };
 
 /// Terms each input cursor reads from its dictionary at a time.
-const TERMS_PER_CHUNK: usize = 4096;
+pub(crate) const TERMS_PER_CHUNK: usize = 4096;
 
 /// One merge input: a superfile and where its rows land in the output.
 pub(crate) struct SortedInput {

@@ -2684,7 +2684,11 @@ mod tests {
         runtime_bridge::bridge_sync_to_async,
         superfile::{
             format::footer::read_kv_metadata,
-            fts::{builder::RADIX_SORT_MIN_TRIPLES, reader::BoolMode},
+            fts::{
+                builder::{BlobEra, RADIX_SORT_MIN_TRIPLES},
+                reader::BoolMode,
+                sorted_merge::TERMS_PER_CHUNK,
+            },
             vector::rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
         },
         test_helpers::{decimal128_ids, default_vector_config},
@@ -4249,30 +4253,58 @@ mod tests {
     /// Docs in each sorted-merge test input. The fully tombstoned case
     /// reuses these sizes.
     const SORTED_MERGE_INPUT_DOCS: [u32; 4] = [300, 50, 200, 300];
-    /// Doc-unique tokens per doc: enough that each input has more terms than
-    /// one term-cursor chunk, so chunk refills are exercised.
-    const SORTED_MERGE_UNIQUE_TOKENS: u32 = 20;
+    /// Doc-unique tokens per doc: enough that every input's `title` spans at
+    /// least two term chunks (the 50-doc input has 4,515 terms), so chunk
+    /// refills are exercised on every input.
+    const SORTED_MERGE_UNIQUE_TOKENS: u32 = 90;
+    /// Every `n`th doc of an edge-case input is tombstoned.
+    const EDGE_DELETE_STEP: usize = 7;
 
-    /// Build one sorted-merge input. Covers every posting form: `common`
-    /// sits in every doc (long lists), `w*` / `b*` in some (short lists),
-    /// `u*` in one doc (inline), `only{input}` in one input, and `gone`
-    /// only in doc 5 of input 0 (so tombstoning that doc removes the term).
-    fn sorted_merge_input(opts: &BuilderOptions, input: u32, first_id: u32, docs: u32) -> Vec<u8> {
-        let mut titles = Vec::new();
-        let mut bodies = Vec::new();
-        for d in 0..docs {
-            let id = first_id + d;
-            let mut title = format!("common common w{} w{} only{input}", d % 7, d % 13);
-            for k in 0..SORTED_MERGE_UNIQUE_TOKENS {
-                title.push_str(&format!(" u{id}x{k}"));
-            }
-            if input == 0 && d == 5 {
-                title.push_str(" gone");
-            }
-            titles.push(title);
-            bodies.push(format!("b{} b{} z{id}", d % 5, d % 3));
-        }
-        let ids = decimal128_ids((first_id..first_id + docs).map(u64::from));
+    /// Build one sorted-merge input's `(title, body)` docs. Covers every
+    /// posting form: `common` sits in every doc (long lists), `w*` / `b*` in
+    /// some (short lists), `u*` in one doc (inline), `only{input}` in one
+    /// input, and `gone` only in doc 5 of input 0 (so tombstoning that doc
+    /// removes the term).
+    fn sorted_merge_docs(input: u32, first_id: u32, docs: u32) -> Vec<(String, String)> {
+        (0..docs)
+            .map(|d| {
+                let id = first_id + d;
+                let mut title = format!("common common w{} w{} only{input}", d % 7, d % 13);
+                for k in 0..SORTED_MERGE_UNIQUE_TOKENS {
+                    title.push_str(&format!(" u{id}x{k}"));
+                }
+                if input == 0 && d == 5 {
+                    title.push_str(" gone");
+                }
+                (title, format!("b{} b{} z{id}", d % 5, d % 3))
+            })
+            .collect()
+    }
+
+    /// Positional (or not) `title` plus a non-positional `body`.
+    fn sorted_merge_opts(positions: bool) -> BuilderOptions {
+        BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![
+                FtsConfig::new("title").positions(positions),
+                FtsConfig::new("body"),
+            ],
+            vec![],
+        )
+    }
+
+    /// One merge input over `(title, body)` docs with ids from `first_id`,
+    /// its FTS blob written in `era`.
+    fn merge_input(
+        opts: &BuilderOptions,
+        first_id: u32,
+        docs: &[(String, String)],
+        era: BlobEra,
+    ) -> Arc<SuperfileReader> {
+        let ids = decimal128_ids((first_id..first_id + docs.len() as u32).map(u64::from));
+        let (titles, bodies): (Vec<&str>, Vec<&str>) =
+            docs.iter().map(|(t, b)| (t.as_str(), b.as_str())).unzip();
         let batch = RecordBatch::try_new(
             opts.schema.clone(),
             vec![
@@ -4283,37 +4315,20 @@ mod tests {
         )
         .expect("build RecordBatch");
         let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        b.fts_builder.as_mut().expect("fts builder").era = era;
         b.add_batch(&batch, &[]).expect("add_batch");
-        b.finish().expect("finish input")
+        let bytes = b.finish().expect("finish input");
+        Arc::new(SuperfileReader::open(Bytes::from(bytes)).expect("open input"))
     }
 
     /// Merging term by term must write exactly the bytes the accumulator
-    /// path writes, for the whole superfile.
-    fn assert_sorted_merge_matches_accumulator(positions: bool, deletes: &[&[u32]]) {
-        let opts = BuilderOptions::new(
-            schema_with_fts(),
-            "doc_id",
-            vec![
-                FtsConfig::new("title").positions(positions),
-                FtsConfig::new("body"),
-            ],
-            vec![],
-        );
-        let mut first_id = 0;
-        let mut inputs = Vec::new();
-        for (i, &docs) in SORTED_MERGE_INPUT_DOCS.iter().enumerate() {
-            let bytes = sorted_merge_input(&opts, i as u32, first_id, docs);
-            first_id += docs;
-            let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open input");
-            inputs.push((
-                Arc::new(reader),
-                tombstones(deletes.get(i).copied().unwrap_or(&[])),
-            ));
-        }
-
+    /// path writes, and hold the same rows and FTS content as a re-index of
+    /// the same inputs. The re-index is the check that stays once the
+    /// accumulator path is removed.
+    fn assert_merges_agree(inputs: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)]) {
         let mut accumulator = Vec::new();
         SuperfileBuilder::fts_merge_to(
-            &inputs,
+            inputs,
             &HashMap::new(),
             &mut accumulator,
             PostingMerge::Accumulator,
@@ -4321,7 +4336,7 @@ mod tests {
         .expect("accumulator merge");
         let mut sorted = Vec::new();
         SuperfileBuilder::fts_merge_to(
-            &inputs,
+            inputs,
             &HashMap::new(),
             &mut sorted,
             PostingMerge::TermByTerm,
@@ -4332,6 +4347,72 @@ mod tests {
             accumulator == sorted,
             "sorted merge must match the accumulator byte for byte"
         );
+
+        let (reindex, _) = SuperfileBuilder::build_from_readers(inputs).expect("re-index build");
+        let reindex = SuperfileReader::open(Bytes::from(reindex)).expect("open re-index");
+        let merged = SuperfileReader::open(Bytes::from(sorted)).expect("open merge");
+        assert_eq!(
+            reindex.get_record_batch(None).expect("re-index batch"),
+            merged.get_record_batch(None).expect("merge batch"),
+            "merged rows must match the re-index"
+        );
+        assert_eq!(
+            collect_fts_content(&reindex),
+            collect_fts_content(&merged),
+            "merged FTS content must match the re-index"
+        );
+    }
+
+    fn assert_sorted_merge_matches_accumulator(positions: bool, deletes: &[&[u32]]) {
+        let opts = sorted_merge_opts(positions);
+        let mut first_id = 0;
+        let mut inputs = Vec::new();
+        for (i, &docs) in SORTED_MERGE_INPUT_DOCS.iter().enumerate() {
+            let docs_text = sorted_merge_docs(i as u32, first_id, docs);
+            inputs.push((
+                merge_input(&opts, first_id, &docs_text, BlobEra::V7),
+                tombstones(deletes.get(i).copied().unwrap_or(&[])),
+            ));
+            first_id += docs;
+        }
+        assert_merges_agree(&inputs);
+    }
+
+    /// Docs giving input `input` a vocabulary of exactly `n_terms` in both
+    /// `title` and `body`: one unique term per doc plus `common` in every doc.
+    fn vocab_docs(input: usize, n_terms: usize) -> Vec<(String, String)> {
+        (0..n_terms - 1)
+            .map(|d| {
+                (
+                    format!("common t{input}x{d:05}"),
+                    format!("common b{input}x{d:05}"),
+                )
+            })
+            .collect()
+    }
+
+    /// Inputs of the given vocabulary sizes, every `EDGE_DELETE_STEP`th doc
+    /// of the last one tombstoned.
+    fn vocab_inputs(
+        sizes: &[usize],
+        era: BlobEra,
+    ) -> Vec<(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)> {
+        let opts = sorted_merge_opts(true);
+        let mut first_id = 0;
+        let mut inputs = Vec::new();
+        for (i, &n) in sizes.iter().enumerate() {
+            let docs = vocab_docs(i, n);
+            let deleted: Vec<u32> = match i + 1 == sizes.len() {
+                true => (0..docs.len() as u32).step_by(EDGE_DELETE_STEP).collect(),
+                false => Vec::new(),
+            };
+            inputs.push((
+                merge_input(&opts, first_id, &docs, era),
+                tombstones(&deleted),
+            ));
+            first_id += docs.len() as u32;
+        }
+        inputs
     }
 
     #[test]
@@ -4343,13 +4424,12 @@ mod tests {
             vec![],
         );
         let docs = SORTED_MERGE_INPUT_DOCS[1];
-        let input = SuperfileReader::open(Bytes::from(sorted_merge_input(&opts, 0, 0, docs)))
-            .expect("open input");
+        let input = merge_input(&opts, 0, &sorted_merge_docs(0, 0, docs), BlobEra::V7);
         let mut fb = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
         fb.register_column("title".into(), false).expect("register");
         fb.add_doc(0, 0, "hello").expect("add doc");
         fb.set_sorted_inputs(vec![SortedInput {
-            reader: Arc::new(input),
+            reader: input,
             remap: vec![None; docs as usize],
         }]);
         assert!(
@@ -4380,6 +4460,79 @@ mod tests {
                 &[&[5, 7, 100], &all_of_input_1, &[], &every_third],
             );
         }
+    }
+
+    /// Vocabularies one short of a chunk, exactly one and two chunks, one
+    /// past, and more than three, in a positional and a non-positional
+    /// column, in both dictionary layouts (`V2ToV4` writes the FST one).
+    #[test]
+    fn sorted_merge_handles_vocabularies_on_and_across_chunk_edges() {
+        let sizes = [
+            TERMS_PER_CHUNK - 1,
+            TERMS_PER_CHUNK,
+            TERMS_PER_CHUNK + 1,
+            2 * TERMS_PER_CHUNK,
+            3 * TERMS_PER_CHUNK + 1,
+        ];
+        for era in [BlobEra::V7, BlobEra::V2ToV4] {
+            let inputs = vocab_inputs(&sizes, era);
+            for ((reader, _), &n) in inputs.iter().zip(&sizes) {
+                let fts = reader.fts().expect("fts");
+                let dict = fts.dict_bytes().expect("dict");
+                for column_id in 0..2 {
+                    let terms = fts
+                        .column_terms_from(&dict, column_id, b"", n + 1)
+                        .expect("terms");
+                    assert_eq!(
+                        terms.len(),
+                        n,
+                        "premise: column {column_id} holds {n} terms"
+                    );
+                }
+            }
+            assert_merges_agree(&inputs);
+        }
+    }
+
+    #[test]
+    fn sorted_merge_handles_a_single_input() {
+        assert_merges_agree(&vocab_inputs(&[2 * TERMS_PER_CHUNK + 1], BlobEra::V7));
+    }
+
+    /// `mid` is the last term of input 0's first chunk, so its next chunk
+    /// resumes on it, while in input 1 it sits mid-chunk. Both inputs'
+    /// postings for it must land exactly once.
+    #[test]
+    fn sorted_merge_handles_a_shared_term_on_a_chunk_edge() {
+        const TAIL_TERMS: usize = 10;
+        let input_docs = |n_leading: usize| -> Vec<(String, String)> {
+            (0..n_leading)
+                .map(|d| format!("a{d:05}"))
+                .chain(["mid".to_string()])
+                .chain((0..TAIL_TERMS).map(|d| format!("z{d}")))
+                .map(|title| (title, "body".to_string()))
+                .collect()
+        };
+        let opts = sorted_merge_opts(true);
+        let first = input_docs(TERMS_PER_CHUNK - 1);
+        let second = input_docs(TAIL_TERMS);
+        let inputs = vec![
+            (merge_input(&opts, 0, &first, BlobEra::V7), None),
+            (
+                merge_input(&opts, first.len() as u32, &second, BlobEra::V7),
+                None,
+            ),
+        ];
+        let fts = inputs[0].0.fts().expect("fts");
+        let chunk = fts
+            .column_terms_from(&fts.dict_bytes().expect("dict"), 0, b"", TERMS_PER_CHUNK)
+            .expect("first chunk");
+        assert_eq!(
+            chunk.last().map(|(term, _)| term.as_slice()),
+            Some(&b"mid"[..]),
+            "premise: `mid` ends input 0's first chunk"
+        );
+        assert_merges_agree(&inputs);
     }
 
     #[test]
