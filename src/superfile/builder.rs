@@ -3052,6 +3052,7 @@ mod tests {
     use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, UInt64Array};
     use arrow_schema::Field;
     use bytes::Bytes;
+    use rayon::ThreadPoolBuilder;
     use roaring::RoaringBitmap;
 
     use super::*;
@@ -5159,6 +5160,16 @@ mod tests {
         positions: bool,
         deletes: &[&[u32]],
     ) {
+        assert_merges_agree(&merge_inputs_of_sizes(sizes, positions, deletes));
+    }
+
+    /// Inputs of `sizes` docs each over [`sorted_merge_docs`], input `i`
+    /// losing the docs in `deletes[i]`.
+    fn merge_inputs_of_sizes(
+        sizes: &[u32],
+        positions: bool,
+        deletes: &[&[u32]],
+    ) -> Vec<(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)> {
         let opts = sorted_merge_opts(positions);
         let mut first_id = 0;
         let mut inputs = Vec::new();
@@ -5170,7 +5181,7 @@ mod tests {
             ));
             first_id += docs;
         }
-        assert_merges_agree(&inputs);
+        inputs
     }
 
     /// Docs giving input `input` a vocabulary of exactly `n_terms` in both
@@ -5272,6 +5283,37 @@ mod tests {
             assert_merge_of_sizes_matches_accumulator(&SIZES, positions, &[]);
             assert_merge_of_sizes_matches_accumulator(&SIZES, positions, &[&[3, 9], &every_fifth]);
         }
+    }
+
+    /// Terms are merged on however many threads the pool has, and the
+    /// bytes must not depend on how many that is.
+    #[test]
+    fn a_sorted_merge_writes_the_same_bytes_on_any_number_of_threads() {
+        const MANY_THREADS: usize = 4;
+        let inputs = merge_inputs_of_sizes(&[2_500, 1_000, 1_700], true, &[&[3, 9]]);
+        let merge_on = |threads: usize| -> Vec<u8> {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool");
+            let mut out = Vec::new();
+            pool.install(|| {
+                SuperfileBuilder::fts_merge_to(
+                    &inputs,
+                    &HashMap::new(),
+                    &mut out,
+                    PostingMerge::TermByTerm,
+                )
+            })
+            .expect("sorted merge");
+            out
+        };
+        let one = merge_on(1);
+        assert!(!one.is_empty(), "merge wrote a superfile");
+        assert!(
+            one == merge_on(MANY_THREADS),
+            "bytes must not depend on the thread count"
+        );
     }
 
     /// Vocabularies one short of a chunk, exactly one and two chunks, one

@@ -208,6 +208,11 @@ impl Stopwatch {
     pub(crate) fn ms(&self) -> u64 {
         self.0.as_millis() as u64
     }
+
+    /// Add another stopwatch's total, such as one kept by another thread.
+    pub(crate) fn add(&mut self, other: &Stopwatch) {
+        self.0 += other.0;
+    }
 }
 
 #[cfg(test)]
