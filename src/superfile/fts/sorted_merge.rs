@@ -20,7 +20,7 @@ use bytes::Bytes;
 use crate::{
     superfile::{
         BuildError, FtsError, SuperfileReader,
-        fts::{positions::encode_run, reader::FtsReader},
+        fts::{positions::TermRuns, reader::FtsReader},
         id_space::FtsDocId,
     },
     utils::{
@@ -42,17 +42,17 @@ pub(crate) struct SortedInput {
 /// Merge `column_id` across `inputs` and call `emit(term, postings, runs)`
 /// once per term that still has a surviving posting, in term order.
 /// `postings` are `(output_doc_id, tf)`, doc ids ascending; `runs` holds
-/// each posting's encoded positions back to back (empty for a
-/// non-positional column).
+/// each posting's position run, decoded (empty for a non-positional
+/// column).
 ///
 /// Under `detailed-tracing`, records where the time went on the enclosing
 /// span: `dict_ms`, `read_ms`, `sort_ms` and `emit_ms`, plus the
 /// `postings`, `term_inputs`, `sorted_terms`, `sorted_postings` and
-/// `position_bytes` counts.
+/// `run_values` counts.
 pub(crate) fn merge_column(
     inputs: &[SortedInput],
     column_id: u32,
-    mut emit: impl FnMut(&str, &[(u32, u32)], &[u8]) -> Result<(), BuildError>,
+    mut emit: impl FnMut(&str, &[(u32, u32)], TermRuns<'_>) -> Result<(), BuildError>,
 ) -> Result<(), BuildError> {
     let readers = inputs
         .iter()
@@ -77,12 +77,13 @@ pub(crate) fn merge_column(
 
     let mut contributors: Vec<usize> = Vec::new();
     let mut postings: Vec<(u32, u32)> = Vec::new();
-    let mut runs: Vec<u8> = Vec::new();
-    let mut positions_buf: Vec<u32> = Vec::new();
-    // Where each posting's run starts in `runs`, kept for the sort below.
+    // Every posting's run values back to back, and where each run starts.
+    // A sort reorders the starts and leaves the values where they are.
+    let mut runs: Vec<u32> = Vec::new();
     let mut run_starts: Vec<usize> = Vec::new();
+    let mut positions_buf: Vec<u32> = Vec::new();
     let mut sorted_postings: Vec<(u32, u32)> = Vec::new();
-    let mut sorted_runs: Vec<u8> = Vec::new();
+    let mut sorted_starts: Vec<usize> = Vec::new();
     // Walking the dictionaries and the heap; decoding and remapping the
     // postings; sorting a term whose postings arrive out of order; and
     // encoding and writing the term.
@@ -92,7 +93,7 @@ pub(crate) fn merge_column(
     let mut emit_time = Stopwatch::default();
     let (mut n_postings, mut n_term_inputs, mut n_sorted_terms, mut n_sorted_postings) =
         (0u64, 0u64, 0u64, 0u64);
-    let mut n_position_bytes = 0u64;
+    let mut n_run_values = 0u64;
     loop {
         let started = Stopwatch::start();
         let Some(Reverse((term, first))) = heap.pop() else {
@@ -128,7 +129,7 @@ pub(crate) fn merge_column(
                             ascending &= postings.last().is_none_or(|&(d, _)| d < out_doc);
                             postings.push((out_doc, tf));
                             run_starts.push(runs.len());
-                            encode_run(&mut runs, pos);
+                            push_run_values(&mut runs, pos);
                         }
                         Ok(())
                     },
@@ -144,7 +145,7 @@ pub(crate) fn merge_column(
             dict.stop(started);
         }
         n_postings += postings.len() as u64;
-        n_position_bytes += runs.len() as u64;
+        n_run_values += runs.len() as u64;
 
         let term = from_utf8(&term)
             .map_err(|_| BuildError::Io(Error::other("fts sorted merge: non-utf8 term")))?;
@@ -154,27 +155,34 @@ pub(crate) fn merge_column(
         }
         if ascending {
             let started = Stopwatch::start();
-            emit(term, &postings, &runs)?;
+            let term_runs = TermRuns::Values {
+                values: &runs,
+                starts: &run_starts,
+            };
+            emit(term, &postings, term_runs)?;
             emit_time.stop(started);
             continue;
         }
-        // Sort this term's postings by output doc id, moving each
-        // posting's run with it.
+        // Sort this term's postings by output doc id, taking each
+        // posting's run start with it.
         n_sorted_terms += 1;
         n_sorted_postings += postings.len() as u64;
         let started = Stopwatch::start();
-        run_starts.push(runs.len());
         let mut order: Vec<usize> = (0..postings.len()).collect();
         order.sort_unstable_by_key(|&k| postings[k].0);
         sorted_postings.clear();
-        sorted_runs.clear();
+        sorted_starts.clear();
         for k in order {
             sorted_postings.push(postings[k]);
-            sorted_runs.extend_from_slice(&runs[run_starts[k]..run_starts[k + 1]]);
+            sorted_starts.push(run_starts[k]);
         }
         sort.stop(started);
         let started = Stopwatch::start();
-        emit(term, &sorted_postings, &sorted_runs)?;
+        let term_runs = TermRuns::Values {
+            values: &runs,
+            starts: &sorted_starts,
+        };
+        emit(term, &sorted_postings, term_runs)?;
         emit_time.stop(started);
     }
     record("dict_ms", dict.ms());
@@ -185,8 +193,20 @@ pub(crate) fn merge_column(
     record("term_inputs", n_term_inputs);
     record("sorted_terms", n_sorted_terms);
     record("sorted_postings", n_sorted_postings);
-    record("position_bytes", n_position_bytes);
+    record("run_values", n_run_values);
     Ok(())
+}
+
+/// Append one document's positions to `out` as run values: the first
+/// position, then the gap to each next one. The same values a LEB128 run
+/// holds, without the encoding.
+fn push_run_values(out: &mut Vec<u32>, positions: &[u32]) {
+    let mut prev = 0u32;
+    for (i, &p) in positions.iter().enumerate() {
+        debug_assert!(i == 0 || p > prev, "positions must be strictly increasing");
+        out.push(p - prev);
+        prev = p;
+    }
 }
 
 /// Walks one input column's dictionary in term order, a chunk at a time.

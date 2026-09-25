@@ -3236,7 +3236,7 @@ pub(super) fn prepare_superfile_named(
     let fts_summary = build_fts_summary(&reader, &inner.options);
     drop(fts_summary_span);
 
-    let _vector_summary_span = detail_span!("prepare_vector_summary").entered();
+    let vector_summary_span = detail_span!("prepare_vector_summary").entered();
     let mut vector_summary: HashMap<String, VectorSummary> = HashMap::new();
     if let Some(vec_reader) = reader.vec() {
         for vc in &inner.options.vector_columns {
@@ -3245,6 +3245,7 @@ pub(super) fn prepare_superfile_named(
             }
         }
     }
+    drop(vector_summary_span);
 
     // capture `(total_size, vec_off/len, fts_off/len)`
     // from the freshly-written bytes' parquet KV metadata. Caching
