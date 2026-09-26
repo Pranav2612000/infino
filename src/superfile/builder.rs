@@ -1999,11 +1999,10 @@ impl SuperfileBuilder {
             "merge_order_count_terms",
             postings = tracing::field::Empty,
             deleted_postings = tracing::field::Empty,
-            positions = tracing::field::Empty,
             eligible_buckets = tracing::field::Empty,
         )
         .entered();
-        let (mut n_postings, mut n_deleted, mut n_positions) = (0u64, 0u64, 0u64);
+        let (mut n_postings, mut n_deleted) = (0u64, 0u64);
         let n_buckets = 1usize << REORDER_TERM_BUCKET_BITS;
         let mut df: Vec<u32> = vec![0; n_buckets];
         let rows_by_blob: Vec<Vec<Option<RowId>>> = readers
@@ -2014,15 +2013,17 @@ impl SuperfileBuilder {
         for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
             let fts = reader.fts().expect("checked above");
             for column_id in 0..n_fts_columns {
-                fts.for_each_term_posting(column_id, |term, local_doc, _tf, pos| {
-                    n_postings += 1;
-                    n_positions += pos.len() as u64;
-                    match rows[local_doc as usize].is_some() {
-                        true => df[term_bucket(term) as usize] += 1,
-                        false => n_deleted += 1,
-                    }
-                    Ok(())
-                })
+                fts.for_each_term_doc(
+                    column_id,
+                    |term| Some(term_bucket(term)),
+                    |&t, local_doc| {
+                        n_postings += 1;
+                        match rows[local_doc as usize].is_some() {
+                            true => df[t as usize] += 1,
+                            false => n_deleted += 1,
+                        }
+                    },
+                )
                 .map_err(|e| {
                     BuildError::Io(Error::other(format!(
                         "fts merge: counting terms for the document order failed: {e}"
@@ -2037,7 +2038,6 @@ impl SuperfileBuilder {
         };
         record("postings", n_postings);
         record("deleted_postings", n_deleted);
-        record("positions", n_positions);
         record(
             "eligible_buckets",
             (0..n_buckets as u32).filter(|&t| eligible(t)).count() as u64,
@@ -2048,18 +2048,17 @@ impl SuperfileBuilder {
         // fixed number of slots per document. `worst` tracks the slot
         // holding the least selective term kept so far, so a posting
         // that cannot displace it costs one comparison.
-        // `ineligible_postings` were decoded only to be thrown away, and
+        // An ineligible term is skipped before its postings are read, and
         // `displaced` counts the kept terms that later lost their slot.
         let pick_span = detail_span!(
             "merge_order_pick_terms",
             postings = tracing::field::Empty,
-            ineligible_postings = tracing::field::Empty,
+            skipped_terms = tracing::field::Empty,
             kept = tracing::field::Empty,
             displaced = tracing::field::Empty,
         )
         .entered();
-        let (mut n_postings, mut n_ineligible, mut n_kept, mut n_displaced) =
-            (0u64, 0u64, 0u64, 0u64);
+        let (mut n_postings, mut n_skipped, mut n_kept, mut n_displaced) = (0u64, 0u64, 0u64, 0u64);
         let n = n_out_docs as usize;
         let mut slots: Vec<u32> = vec![0; n * REORDER_TERMS_PER_DOC];
         let mut filled: Vec<u8> = vec![0; n];
@@ -2067,16 +2066,17 @@ impl SuperfileBuilder {
         for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
             let fts = reader.fts().expect("checked above");
             for column_id in 0..n_fts_columns {
-                fts.for_each_term_posting(column_id, |term, local_doc, _tf, _pos| {
+                let on_term = |term: &[u8]| {
+                    let t = term_bucket(term);
+                    let keep = eligible(t);
+                    n_skipped += u64::from(!keep);
+                    keep.then_some(t)
+                };
+                fts.for_each_term_doc(column_id, on_term, |&t, local_doc| {
                     n_postings += 1;
                     let Some(row) = rows[local_doc as usize] else {
-                        return Ok(());
+                        return;
                     };
-                    let t = term_bucket(term);
-                    if !eligible(t) {
-                        n_ineligible += 1;
-                        return Ok(());
-                    }
                     let row = row.get() as usize;
                     let slot_base = row * REORDER_TERMS_PER_DOC;
                     let used = filled[row] as usize;
@@ -2089,11 +2089,11 @@ impl SuperfileBuilder {
                         }
                         filled[row] = (used + 1) as u8;
                         n_kept += 1;
-                        return Ok(());
+                        return;
                     }
                     let worst_slot = slot_base + worst[row] as usize;
                     if df[t as usize] >= df[slots[worst_slot] as usize] {
-                        return Ok(());
+                        return;
                     }
                     slots[worst_slot] = t;
                     n_displaced += 1;
@@ -2106,7 +2106,6 @@ impl SuperfileBuilder {
                         }
                     }
                     worst[row] = w as u8;
-                    Ok(())
                 })
                 .map_err(|e| {
                     BuildError::Io(Error::other(format!(
@@ -2117,7 +2116,7 @@ impl SuperfileBuilder {
         }
         drop(df);
         record("postings", n_postings);
-        record("ineligible_postings", n_ineligible);
+        record("skipped_terms", n_skipped);
         record("kept", n_kept);
         record("displaced", n_displaced);
         drop(pick_span);
