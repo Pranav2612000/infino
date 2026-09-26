@@ -1175,7 +1175,7 @@ impl FtsReader {
     /// zero-copy for in-memory / warm sources; for a cold `Lazy`
     /// source it `await`s the object-store range on the caller's
     /// runtime (no sync bridge).
-    pub(super) async fn dict_bytes_async(&self) -> Result<Bytes, FtsError> {
+    pub(crate) async fn dict_bytes_async(&self) -> Result<Bytes, FtsError> {
         self.source
             .range_async(self.fst_range.clone())
             .await

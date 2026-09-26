@@ -3086,7 +3086,6 @@ pub(in crate::supertable) fn build_term_contribution(
         skip_all,
         fields(
             terms = tracing::field::Empty,
-            walk_ms = tracing::field::Empty,
             facts_ms = tracing::field::Empty,
             push_ms = tracing::field::Empty,
         )
@@ -3101,32 +3100,33 @@ async fn write_superfile_terms(
     };
     let mut columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
     columns.sort();
-    // Listing the dictionary's terms; reading each term's facts; and
-    // appending them to the contribution.
-    let mut walk = Stopwatch::default();
+    let fst_bytes = fts
+        .dict_bytes_async()
+        .await
+        .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
+    // Walking the dictionary and reading each term's facts; and appending
+    // them to the contribution.
     let mut facts_time = Stopwatch::default();
     let mut push = Stopwatch::default();
     let mut n_terms = 0u64;
     for column in &columns {
-        let started = Stopwatch::start();
-        let term_bytes = fts
-            .iter_column_terms(column)
-            .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
-        let terms: Vec<&str> = term_bytes
-            .iter()
-            .map(|t| from_utf8(t).map_err(|_| TermIndexError::Build("non-utf8 term".into())))
-            .collect::<Result<_, _>>()?;
-        walk.stop(started);
-        n_terms += terms.len() as u64;
-        for chunk in terms.chunks(TERM_INDEX_BATCH_TERMS) {
+        let mut after: Option<Vec<u8>> = None;
+        loop {
             let started = Stopwatch::start();
-            let facts = reader
-                .term_index_facts(column, chunk)
+            let chunk = fts
+                .term_index_facts_after(
+                    &fst_bytes,
+                    column,
+                    after.as_deref(),
+                    TERM_INDEX_BATCH_TERMS,
+                )
                 .await
                 .map_err(|e| TermIndexError::Build(format!("term facts: {e}")))?;
             facts_time.stop(started);
             let started = Stopwatch::start();
-            for (term, fact) in chunk.iter().zip(facts) {
+            for (term, fact) in &chunk {
+                let term =
+                    from_utf8(term).map_err(|_| TermIndexError::Build("non-utf8 term".into()))?;
                 // A term the dictionary lists but no cursor could describe
                 // keeps its presence and is given the ceiling that prunes
                 // nothing rather than one that could be wrong.
@@ -3141,10 +3141,15 @@ async fn write_superfile_terms(
                 writer.push(&make_key(column, term), df, bound, location)?;
             }
             push.stop(started);
+            n_terms += chunk.len() as u64;
+            let done = chunk.len() < TERM_INDEX_BATCH_TERMS;
+            after = chunk.into_iter().last().map(|(term, _)| term);
+            if done {
+                break;
+            }
         }
     }
     record("terms", n_terms);
-    record("walk_ms", walk.ms());
     record("facts_ms", facts_time.ms());
     record("push_ms", push.ms());
     Ok(())
