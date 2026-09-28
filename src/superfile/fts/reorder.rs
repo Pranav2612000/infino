@@ -120,6 +120,8 @@ pub(crate) fn bisect_order(fwd: &ForwardIndex) -> Vec<u32> {
     let mut state = BisectState {
         deg_left: vec![0u32; fwd.n_terms],
         deg_right: vec![0u32; fwd.n_terms],
+        move_gain_left: vec![0f32; fwd.n_terms],
+        move_gain_right: vec![0f32; fwd.n_terms],
         gains: Vec::new(),
         touched: Vec::new(),
     };
@@ -132,6 +134,12 @@ pub(crate) fn bisect_order(fwd: &ForwardIndex) -> Vec<u32> {
 struct BisectState {
     deg_left: Vec<u32>,
     deg_right: Vec<u32>,
+    /// What moving any one left document lowers a term's cost by. It
+    /// depends only on the term's degrees, so it is computed once per
+    /// term per round rather than once per document carrying it.
+    move_gain_left: Vec<f32>,
+    /// The same for a document moving from the right.
+    move_gain_right: Vec<f32>,
     /// `(gain, document)` for one side, rebuilt each round.
     gains: Vec<(f32, u32)>,
     /// Term ids whose degree entries a split touched, so the tables can
@@ -164,9 +172,10 @@ impl BisectState {
             // its terms get one rarer on this side and one commoner on
             // the other. Positive means the move is worth making.
             let moved = {
+                self.compute_move_gains(n_left, n_right);
                 let (left, right) = order.split_at_mut(mid);
-                let mut left_gains = self.rank_by_gain(fwd, left, n_left, n_right, true);
-                let mut right_gains = self.rank_by_gain(fwd, right, n_right, n_left, false);
+                let mut left_gains = rank_by_gain(fwd, left, &self.move_gain_left);
+                let mut right_gains = rank_by_gain(fwd, right, &self.move_gain_right);
                 left_gains.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
                 right_gains.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
 
@@ -202,43 +211,34 @@ impl BisectState {
         self.clear_degrees();
     }
 
-    /// `(gain, position within the half)` for every document in `half`.
-    fn rank_by_gain(
-        &mut self,
-        fwd: &ForwardIndex,
-        half: &[u32],
-        here: f32,
-        there: f32,
-        from_left: bool,
-    ) -> Vec<(f32, u32)> {
-        let mut out = Vec::with_capacity(half.len());
-        for (i, &d) in half.iter().enumerate() {
-            let mut gain = 0.0f32;
-            for &t in fwd.doc(d) {
-                let (deg_here, deg_there) = match from_left {
-                    true => (self.deg_left[t as usize], self.deg_right[t as usize]),
-                    false => (self.deg_right[t as usize], self.deg_left[t as usize]),
-                };
-                gain += term_cost(deg_here, here) - term_cost(deg_here.saturating_sub(1), here)
-                    + term_cost(deg_there, there)
-                    - term_cost(deg_there + 1, there);
+    /// Fill the move gains of every term in the partition from its
+    /// current degrees. A side's gain is only read by documents on that
+    /// side carrying the term, so a side with no such document is skipped.
+    fn compute_move_gains(&mut self, n_left: f32, n_right: f32) {
+        for &t in &self.touched {
+            let t = t as usize;
+            let (dl, dr) = (self.deg_left[t], self.deg_right[t]);
+            if dl > 0 {
+                self.move_gain_left[t] = move_gain(dl, n_left, dr, n_right);
             }
-            out.push((gain, i as u32));
+            if dr > 0 {
+                self.move_gain_right[t] = move_gain(dr, n_right, dl, n_left);
+            }
         }
-        out
     }
 
     fn count_degrees(&mut self, fwd: &ForwardIndex, order: &[u32], mid: usize) {
         for (i, &d) in order.iter().enumerate() {
             let side_left = i < mid;
             for &t in fwd.doc(d) {
+                // Seen on neither side yet: first sight in this partition.
+                if self.deg_left[t as usize] == 0 && self.deg_right[t as usize] == 0 {
+                    self.touched.push(t);
+                }
                 let slot = match side_left {
                     true => &mut self.deg_left[t as usize],
                     false => &mut self.deg_right[t as usize],
                 };
-                if *slot == 0 {
-                    self.touched.push(t);
-                }
                 *slot += 1;
             }
         }
@@ -252,6 +252,30 @@ impl BisectState {
         self.touched.clear();
         self.gains.clear();
     }
+}
+
+/// `(gain, position within the half)` for every document in `half`:
+/// the sum of its terms' move gains for that side.
+fn rank_by_gain(fwd: &ForwardIndex, half: &[u32], move_gain: &[f32]) -> Vec<(f32, u32)> {
+    let mut out = Vec::with_capacity(half.len());
+    for (i, &d) in half.iter().enumerate() {
+        let mut gain = 0.0f32;
+        for &t in fwd.doc(d) {
+            gain += move_gain[t as usize];
+        }
+        out.push((gain, i as u32));
+    }
+    out
+}
+
+/// What the cost drops by when one document carrying a term moves from
+/// a half where `deg_here` of `here` documents carry it to one where
+/// `deg_there` of `there` do.
+#[inline]
+fn move_gain(deg_here: u32, here: f32, deg_there: u32, there: f32) -> f32 {
+    term_cost(deg_here, here) - term_cost(deg_here.saturating_sub(1), here)
+        + term_cost(deg_there, there)
+        - term_cost(deg_there + 1, there)
 }
 
 /// What a term carried by `deg` of a half's `size` documents
