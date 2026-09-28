@@ -75,6 +75,7 @@ use std::{
     io::{BufReader, BufWriter, Cursor, Error, Seek, SeekFrom, Write},
     str::from_utf8,
     sync::Arc,
+    time::Duration,
 };
 
 use arrow::compute::{concat_batches, take};
@@ -791,6 +792,16 @@ impl fmt::Debug for SuperfileBuilder {
             .field("next_local_doc_id", &self.next_local_doc_id)
             .finish()
     }
+}
+
+/// Track the duration of different operations in
+/// [`SuperfileBuilder::build_from_readers_fts_merge_to`]
+#[derive(Default, Debug)]
+struct FtsMergeTimings {
+    read_parquet: Duration,
+    stats_compute: Duration,
+    fts: Duration,
+    write_parquet: Duration,
 }
 
 pub struct SuperfileBuilder {
@@ -2240,7 +2251,16 @@ impl SuperfileBuilder {
         }
 
         let mut sorted_inputs = Vec::new();
-        let copy_span = detail_span!("merge_copy_rows").entered();
+
+        let mut timings = FtsMergeTimings::default();
+        let copy_span = detail_span!(
+            "merge_copy_rows",
+            read_parquet = 0,
+            stats_compute = 0,
+            fts = 0,
+            write_parquet = 0
+        )
+        .entered();
         for (idx, (reader, deleted)) in readers.iter().enumerate() {
             superfile_builder.opts.check_mergeability(
                 reader.id_column(),
@@ -2252,16 +2272,21 @@ impl SuperfileBuilder {
                     .vec()
                     .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
             )?;
-
+            let start = std::time::Instant::now();
             let record_batch = reader.get_record_batch(deleted.clone()).map_err(|e| {
                 BuildError::Io(Error::other(format!(
                     "fts merge input {idx}: read RecordBatch failed: {e}"
                 )))
             })?;
+            timings.read_parquet += start.elapsed();
+
+            let start = std::time::Instant::now();
             stats_collector.push(SuperfileStats::try_compute_from_record_batch(
                 &record_batch,
             )?);
+            timings.stats_compute += start.elapsed();
 
+            let start = std::time::Instant::now();
             // Carry the input's prebuilt postings + doc-lengths across,
             // remapped onto the output this batch is about to append (so
             // it must run before `next_local_doc_id` advances).
@@ -2310,13 +2335,17 @@ impl SuperfileBuilder {
                     }
                 }
             }
+            timings.fts += start.elapsed();
 
             // Stream this input's surviving rows straight into the Parquet body
             // and drop the batch — the corpus is never accumulated in RAM. The
             // FTS index for these rows was already fed above from the input's
             // prebuilt postings.
             let n_rows = record_batch.num_rows() as u32;
+            let start = std::time::Instant::now();
             body_encoder.write_batch(&record_batch)?;
+            timings.write_parquet += start.elapsed();
+
             // Sidecar from the same rows, same order, before the batch is
             // dropped. Read from `record_batch` (not the FTS remap) so it
             // aligns with the body exactly.
@@ -2328,6 +2357,12 @@ impl SuperfileBuilder {
             drop(record_batch);
             superfile_builder.next_local_doc_id += n_rows;
         }
+        copy_span.record("read_parquet", timings.read_parquet.as_millis());
+        copy_span.record("fts", timings.fts.as_millis());
+        copy_span.record("write_parquet", timings.write_parquet.as_millis());
+        copy_span.record("stats_compute", timings.stats_compute.as_millis());
+        drop(copy_span);
+
         if let Some(order) = order {
             append_doc_lengths(
                 superfile_builder
@@ -2342,7 +2377,6 @@ impl SuperfileBuilder {
                 fb.doc_map = Some(order);
             }
         }
-        drop(copy_span);
         if let Some(fb) = superfile_builder.fts_builder.as_mut() {
             fb.set_sorted_inputs(sorted_inputs);
         }
