@@ -25,6 +25,7 @@ use std::{
     ops::Range,
     str::from_utf8,
     sync::{Arc, Mutex, PoisonError},
+    time::Duration,
     vec,
 };
 
@@ -39,7 +40,7 @@ use crate::{
     },
     utils::{
         terms::FstValue,
-        trace::{Stopwatch, record},
+        trace::{Stopwatch, detail_span, record},
     },
 };
 
@@ -81,7 +82,10 @@ pub(crate) struct SortedInput {
 /// span: `dict_ms` and `write_ms` on this thread and `parallel_ms` for the
 /// batches' wall time; `read_ms`, `sort_ms` and `encode_ms` summed across
 /// threads; plus the `postings`, `term_inputs`, `sorted_terms`,
-/// `sorted_postings` and `run_values` counts.
+/// `sorted_postings` and `run_values` counts. `batches` counts the
+/// batches and `slowest_terms_ms` sums each batch's slowest term, the
+/// least `parallel_ms` could be with the terms as they are. Each batch
+/// also gets an `fts_merge_batch` span of its own.
 pub(crate) fn merge_column<S: Send, T: Send>(
     inputs: &[SortedInput],
     column_id: u32,
@@ -126,8 +130,7 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         output: PhantomData,
     };
     let mut dict = Stopwatch::default();
-    let mut parallel = Stopwatch::default();
-    let mut write_time = Stopwatch::default();
+    let mut times = BatchTimes::default();
     let mut n_term_inputs = 0u64;
     let mut batch = Batch::default();
     loop {
@@ -167,11 +170,11 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         });
         dict.stop(started);
         if batch.terms.len() >= BATCH_TERMS || batch.posting_bytes >= BATCH_POSTING_BYTES {
-            work.run(&batch, &mut parallel, &mut write_time, &mut write)?;
+            work.run(&batch, &mut times, &mut write)?;
             batch.clear();
         }
     }
-    work.run(&batch, &mut parallel, &mut write_time, &mut write)?;
+    work.run(&batch, &mut times, &mut write)?;
 
     let workers = work
         .workers
@@ -183,8 +186,10 @@ pub(crate) fn merge_column<S: Send, T: Send>(
     }
     *states = workers.into_iter().map(|(_, s)| s).collect();
     record("dict_ms", dict.ms());
-    record("parallel_ms", parallel.ms());
-    record("write_ms", write_time.ms());
+    record("parallel_ms", times.parallel.ms());
+    record("write_ms", times.write.ms());
+    record("batches", times.n_batches);
+    record("slowest_terms_ms", times.slowest_terms.as_millis() as u64);
     record("read_ms", totals.read.ms());
     record("sort_ms", totals.sort.ms());
     record("encode_ms", totals.encode.ms());
@@ -201,6 +206,27 @@ pub(crate) fn merge_column<S: Send, T: Send>(
 struct PendingTerm {
     term: Range<usize>,
     inputs: Range<usize>,
+}
+
+/// Where one column's batches spent their time, on this thread.
+#[derive(Default)]
+struct BatchTimes {
+    /// The batches' parallel parts, wall time.
+    parallel: Stopwatch,
+    /// Writing the merged terms in term order.
+    write: Stopwatch,
+    /// Each batch's slowest term, summed.
+    slowest_terms: Duration,
+    n_batches: u64,
+}
+
+/// One task's merged terms, and how long it and its slowest term took.
+struct MergedChunk<T> {
+    outputs: Vec<Option<T>>,
+    took: Duration,
+    slowest_term: Duration,
+    /// Postings in the slowest term.
+    slowest_term_postings: u64,
 }
 
 /// Terms walked off the dictionaries, waiting to be merged together.
@@ -277,23 +303,55 @@ where
     E: Fn(&mut S, &[(u32, u32)], TermRuns<'_>) -> Result<T, BuildError> + Sync,
 {
     /// Merge a batch's terms in parallel, then write them in term order.
+    ///
+    /// Under `detailed-tracing`, the parallel part gets an `fts_merge_batch`
+    /// span: the batch's `terms` and `posting_bytes`, its tasks' summed
+    /// `cpu_us`, its `slowest_task_us`, and its `slowest_term_us` with that
+    /// term's `slowest_term_postings`.
     fn run(
         &self,
         batch: &Batch,
-        parallel: &mut Stopwatch,
-        write_time: &mut Stopwatch,
+        times: &mut BatchTimes,
         write: &mut impl FnMut(&str, T) -> Result<(), BuildError>,
     ) -> Result<(), BuildError> {
+        let batch_span = detail_span!(
+            "fts_merge_batch",
+            terms = batch.terms.len(),
+            posting_bytes = batch.posting_bytes,
+            cpu_us = tracing::field::Empty,
+            slowest_task_us = tracing::field::Empty,
+            slowest_term_us = tracing::field::Empty,
+            slowest_term_postings = tracing::field::Empty,
+        )
+        .entered();
         let started = Stopwatch::start();
         let merged = batch
             .terms
             .par_chunks(TASK_TERMS)
             .map(|chunk| self.merge_chunk(batch, chunk))
             .collect::<Result<Vec<_>, _>>()?;
-        parallel.stop(started);
+        times.parallel.stop(started);
+        let mut cpu = Duration::ZERO;
+        let mut slowest_task = Duration::ZERO;
+        let mut slowest_term = (Duration::ZERO, 0u64);
+        for chunk in &merged {
+            cpu += chunk.took;
+            slowest_task = slowest_task.max(chunk.took);
+            if chunk.slowest_term > slowest_term.0 {
+                slowest_term = (chunk.slowest_term, chunk.slowest_term_postings);
+            }
+        }
+        times.slowest_terms += slowest_term.0;
+        times.n_batches += 1;
+        record("cpu_us", cpu.as_micros() as u64);
+        record("slowest_task_us", slowest_task.as_micros() as u64);
+        record("slowest_term_us", slowest_term.0.as_micros() as u64);
+        record("slowest_term_postings", slowest_term.1);
+        drop(batch_span);
 
         let started = Stopwatch::start();
-        for (pending, output) in batch.terms.iter().zip(merged.into_iter().flatten()) {
+        let outputs = merged.into_iter().flat_map(|chunk| chunk.outputs);
+        for (pending, output) in batch.terms.iter().zip(outputs) {
             let term = from_utf8(&batch.term_bytes[pending.term.clone()])
                 .map_err(|_| BuildError::Io(Error::other("fts sorted merge: non-utf8 term")))?;
             // A term whose every posting was deleted leaves the output.
@@ -301,7 +359,7 @@ where
                 write(term, output)?;
             }
         }
-        write_time.stop(started);
+        times.write.stop(started);
         Ok(())
     }
 
@@ -310,7 +368,7 @@ where
         &self,
         batch: &Batch,
         chunk: &[PendingTerm],
-    ) -> Result<Vec<Option<T>>, BuildError> {
+    ) -> Result<MergedChunk<T>, BuildError> {
         let taken = self
             .workers
             .lock()
@@ -318,19 +376,38 @@ where
             .pop();
         let (mut work, mut state) =
             taken.unwrap_or_else(|| (TermWork::default(), (self.new_state)()));
-        let merged = chunk
-            .iter()
-            .map(|pending| {
-                let term = &batch.term_bytes[pending.term.clone()];
-                let inputs = &batch.inputs[pending.inputs.clone()];
-                self.merge_term(term, inputs, &mut work, &mut state)
-            })
-            .collect();
+        let mut merged = MergedChunk {
+            outputs: Vec::with_capacity(chunk.len()),
+            took: Duration::ZERO,
+            slowest_term: Duration::ZERO,
+            slowest_term_postings: 0,
+        };
+        let mut failed = None;
+        for pending in chunk {
+            let term = &batch.term_bytes[pending.term.clone()];
+            let inputs = &batch.inputs[pending.inputs.clone()];
+            let started = Stopwatch::start();
+            match self.merge_term(term, inputs, &mut work, &mut state) {
+                Ok(output) => merged.outputs.push(output),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+            if let Some(started) = started {
+                let took = started.elapsed();
+                merged.took += took;
+                if took > merged.slowest_term {
+                    merged.slowest_term = took;
+                    merged.slowest_term_postings = work.postings.len() as u64;
+                }
+            }
+        }
         self.workers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((work, state));
-        merged
+        failed.map_or(Ok(merged), Err)
     }
 
     /// Read one term's postings from its inputs, remapped to output doc

@@ -3091,6 +3091,8 @@ impl FtsBuilder {
                     encode_ms = tracing::field::Empty,
                     parallel_ms = tracing::field::Empty,
                     write_ms = tracing::field::Empty,
+                    batches = tracing::field::Empty,
+                    slowest_terms_ms = tracing::field::Empty,
                     postings = tracing::field::Empty,
                     term_inputs = tracing::field::Empty,
                     sorted_terms = tracing::field::Empty,
