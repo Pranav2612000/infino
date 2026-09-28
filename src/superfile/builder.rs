@@ -2143,12 +2143,14 @@ impl SuperfileBuilder {
         Ok(Some(bisect_order(&fwd)))
     }
 
-    pub(crate) fn build_from_readers_fts_merge_to<W: Write>(
+    test_visible! {
+    fn build_from_readers_fts_merge_to<W: Write>(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
         fts_corpus: &HashMap<String, ColumnLengthStats>,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
         Self::fts_merge_to(readers, fts_corpus, output, PostingMerge::TermByTerm)
+    }
     }
 
     /// [`Self::build_from_readers_fts_merge_to`] with the posting path
