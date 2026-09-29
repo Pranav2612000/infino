@@ -53,7 +53,7 @@ use crate::{
             builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
             positions::{GroupIndex, decode_run},
             posting::{BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
-            short::decode_short,
+            short::{SHORT_MAX_DF, decode_short},
             tokenize::{Phrase, Tokenizer},
         },
         id_space::{DocMap, FtsDocId, RowId},
@@ -1121,6 +1121,24 @@ impl FtsReader {
 
     pub(crate) fn dict_bytes(&self) -> Result<Bytes, FtsError> {
         fetch_source_range(&self.source, self.fst_range.clone(), "fts/dict")
+    }
+
+    /// Most postings the term at `value` holds: exact for a long term,
+    /// read from its header, and the form's limit for a short one.
+    pub(crate) fn term_postings_at_most(&self, value: FstValue) -> Result<u32, FtsError> {
+        match value {
+            FstValue::Inline { .. } => Ok(1),
+            FstValue::Pfor { short: true, .. } => Ok(SHORT_MAX_DF as u32),
+            FstValue::Pfor {
+                metadata_offset, ..
+            } => {
+                let start =
+                    self.postings_range.start + metadata_offset as usize + term_meta::DF_OFF;
+                let df =
+                    fetch_source_range(&self.source, start..start + U32_BYTES, "fts/merge df")?;
+                Ok(read_u32_le(&df))
+            }
+        }
     }
 
     /// Open the term dictionary over fetched FST bytes, mapping an FST
