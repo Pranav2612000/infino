@@ -137,7 +137,7 @@ pub enum DiskCacheError {
     /// parse. The source [`crate::superfile::ReadError`] chain is
     /// preserved so callers that want variant-level detail can
     /// match on it instead of a stringified message.
-    #[error("superfile reader failed to open bytes")]
+    #[error("superfile reader failed to open bytes: {0}")]
     SuperfileOpenRead(#[from] crate::superfile::ReadError),
     /// Eviction could not free enough space: every cached entry is pinned, or the incoming
     /// superfile alone exceeds the budget. [`DiskCacheStore::open_for_query`] degrades to an
