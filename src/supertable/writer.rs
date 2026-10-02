@@ -9910,7 +9910,7 @@ async fn collect_and_build_term_index(
     term_index::build(&contributions, &term_index::BuildPolicy::default())
 }
 
-/// Terms per batched dictionary read during the term-index build.
+/// Terms per batch of facts read during the term-index build.
 const TERM_INDEX_BATCH_TERMS: usize = 4096;
 
 /// Publish/refresh the slow-CAS serving state (Commit B, "settle").
