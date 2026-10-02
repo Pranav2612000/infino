@@ -226,6 +226,8 @@ impl DiskCacheStore {
             .remove_if(uri, |_, entry| !entry.has_whole_file())
         {
             self.release_entry_accounting(&removed);
+            // A whole copy usually replaces this entry
+            self.drop_block_file(uri);
         }
     }
 
@@ -891,6 +893,50 @@ mod tests {
             store.stats().current_bytes,
             charged - lazy_size,
             "only the lazy entry's charge came back"
+        );
+        store.assert_budget_consistent();
+    }
+
+    /// A Load that replaces a lazy entry deletes its `.blocks` file. Left behind, the file would
+    /// sit on disk with no charge, where eviction cannot see it.
+    #[tokio::test]
+    async fn load_over_a_lazy_entry_drops_its_block_file() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+
+        let reader = store
+            .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Stream)
+            .await
+            .expect("lazy open");
+        let source = Arc::clone(
+            store
+                .cached
+                .get(&uri)
+                .expect("entry cached")
+                .block_source()
+                .expect("a Stream entry is Paged"),
+        );
+        source.range(0, 1).await.expect("range read fills a block");
+        drop(source);
+        drop(reader);
+        assert!(
+            store.blocks_path(&uri).exists(),
+            "the read made a block file"
+        );
+
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("Load fetches the whole file");
+
+        assert!(
+            store.is_mmap_promoted(&uri),
+            "the whole file replaced the lazy entry"
+        );
+        assert!(
+            !store.blocks_path(&uri).exists(),
+            "and its block file is gone"
         );
         store.assert_budget_consistent();
     }
