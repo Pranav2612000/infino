@@ -323,11 +323,6 @@ impl DiskCacheStore {
         }
     }
 
-    /// Reserve bytes for block-cache growth.
-    pub(crate) async fn reserve_block_bytes(&self, bytes: u64) -> Result<(), DiskCacheError> {
-        self.reserve_manual(bytes).await
-    }
-
     /// Reserve `bytes` only if the budget has room now, never evicting. For a caller that cannot
     /// wait, such as an install under a shard lock.
     pub(crate) fn try_reserve_without_evicting(&self, bytes: u64) -> bool {
@@ -405,6 +400,16 @@ impl DiskCacheStore {
             bytes,
             committed: false,
         })
+    }
+
+    /// Like [`Self::reserve`], but only from free space: `None` instead of evicting.
+    pub(crate) fn try_reserve(&self, bytes: u64) -> Option<Reservation<'_>> {
+        self.try_reserve_without_evicting(bytes)
+            .then(|| Reservation {
+                store: self,
+                bytes,
+                committed: false,
+            })
     }
 
     /// Drive the eviction policy until either `bytes_needed`
