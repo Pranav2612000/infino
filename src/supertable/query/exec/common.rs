@@ -15,23 +15,36 @@
 //!
 //! [`SuperfileReader::take_by_local_doc_ids`]: crate::superfile::SuperfileReader::take_by_local_doc_ids
 
-use std::{collections::HashSet, future::Future, ops::Range, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    fmt,
+    future::Future,
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use arrow::compute::{concat_batches, filter_record_batch, interleave_record_batch, take};
 use arrow_array::{
     ArrayRef, BooleanArray, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::{
+    catalog::{Session, TableProvider},
     common::{
-        Column, DFSchema,
+        Column, DFSchema, TableReference,
         runtime::SpawnedTask,
         tree_node::{Transformed, TreeNode},
     },
+    datasource::provider_as_source,
     error::{DataFusionError, Result as DfResult},
     execution::{TaskContext, context::ExecutionProps},
-    logical_expr::Expr,
+    logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, TableType},
     physical_expr::{PhysicalExpr, create_physical_expr},
     physical_plan::{ExecutionPlan, collect},
     scalar::ScalarValue,
@@ -93,6 +106,18 @@ where
     .instrument(span)
 }
 
+/// Catalog the per-call scans of [`scope_to_call`] are named under. No
+/// user table lives in it, so a call's scan can never share a name — and
+/// with it plan equality — with a scan of a real table.
+const CALL_SCOPE_CATALOG: &str = "__infino_internal";
+
+/// Schema, inside [`CALL_SCOPE_CATALOG`], of the per-call scans.
+const CALL_SCOPE_SCHEMA: &str = "search_tvf_call";
+
+/// Numbers the search table-function calls, so each call's scan gets a
+/// name no other call shares (see [`scope_to_call`]).
+static SEARCH_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Multiply a search's `k` by this each time the exact predicate leaves
 /// fewer than `k` rows standing (see [`fill_top_k`]). Doubling bounds the
 /// total work at about twice the final round's, whatever the predicate's
@@ -127,6 +152,85 @@ fn over_fetch_ceiling(k: usize, total: usize) -> usize {
         .clamp(OVER_FETCH_MIN_CEILING, OVER_FETCH_MAX_HITS)
         .max(k)
         .min(total)
+}
+
+/// Give one search table-function call a scan name of its own, so
+/// DataFusion never merges two calls.
+///
+/// - DataFusion names every table-function scan after the function alone
+///   (`token_match()`) and compares scans without their arguments, so two
+///   calls with different arguments looked equal and both returned the
+///   first call's rows.
+/// - The returned provider swaps in a scan of `provider` named
+///   `__infino_internal.search_tvf_call.token_match#7`, unique per call,
+///   under the function's own alias, so column names don't change.
+/// - Identical calls are not merged either; they now run twice.
+pub(crate) fn scope_to_call(
+    function: &str,
+    provider: Arc<dyn TableProvider>,
+) -> DfResult<Arc<dyn TableProvider>> {
+    let seq = SEARCH_CALL_SEQ.fetch_add(1, Ordering::Relaxed);
+    let plan = LogicalPlanBuilder::scan(
+        TableReference::full(
+            CALL_SCOPE_CATALOG,
+            CALL_SCOPE_SCHEMA,
+            format!("{function}#{seq}"),
+        ),
+        provider_as_source(Arc::clone(&provider)),
+        None,
+    )?
+    .build()?;
+    Ok(Arc::new(CallScopedTable {
+        inner: provider,
+        plan,
+    }))
+}
+
+/// One search table-function call with a scan of its own; built by
+/// [`scope_to_call`]. Everything but the logical plan is the wrapped
+/// call's, so a planner that scans this provider directly instead of
+/// inlining its plan still runs the same search.
+struct CallScopedTable {
+    inner: Arc<dyn TableProvider>,
+    plan: LogicalPlan,
+}
+
+impl fmt::Debug for CallScopedTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.inner, f)
+    }
+}
+
+#[async_trait]
+impl TableProvider for CallScopedTable {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
+
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
+        Some(Cow::Borrowed(&self.plan))
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        self.inner.scan(state, projection, filters, limit).await
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
 }
 
 /// Map a search TVF's `QueryError` into a DataFusion error at the
@@ -1233,6 +1337,8 @@ pub(crate) mod test_support {
         prelude::SessionContext,
     };
 
+    use super::CallScopedTable;
+
     /// Invoke a table function's `call_with_args` with a throwaway session.
     /// The search TVFs read only the argument exprs, not the session, so a
     /// fresh empty context is enough to satisfy the DataFusion 54 signature.
@@ -1243,6 +1349,16 @@ pub(crate) mod test_support {
         let ctx = SessionContext::new();
         let state = ctx.state();
         func.call_with_args(TableFunctionArgs::new(exprs, &state))
+    }
+
+    /// The call's own provider beneath the per-call scope every search
+    /// table function returns (see [`super::scope_to_call`]).
+    pub(crate) fn scoped_inner(table: &Arc<dyn TableProvider>) -> &dyn TableProvider {
+        table
+            .downcast_ref::<CallScopedTable>()
+            .expect("search table functions return a call-scoped provider")
+            .inner
+            .as_ref()
     }
 }
 
