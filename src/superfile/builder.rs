@@ -2240,12 +2240,15 @@ impl SuperfileBuilder {
         for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
             let fts = reader.fts().expect("checked above");
             for column_id in 0..n_fts_columns {
-                fts.for_each_term_posting(column_id, |term, local_doc, _tf, _pos| {
-                    if rows[local_doc as usize].is_some() {
-                        df[term_bucket(term) as usize] += 1;
-                    }
-                    Ok(())
-                })
+                fts.for_each_term_doc(
+                    column_id,
+                    |term| Some(term_bucket(term)),
+                    |&t, local_doc| {
+                        if rows[local_doc as usize].is_some() {
+                            df[t as usize] += 1;
+                        }
+                    },
+                )
                 .map_err(|e| {
                     BuildError::Io(Error::other(format!(
                         "fts merge: counting terms for the document order failed: {e}"
@@ -2264,6 +2267,8 @@ impl SuperfileBuilder {
         // fixed number of slots per document. `worst` tracks the slot
         // holding the least selective term kept so far, so a posting
         // that cannot displace it costs one comparison.
+        // An ineligible term is skipped before its postings are read, and
+        // `displaced` counts the kept terms that later lost their slot.
         let pick_span = detail_span!("merge_order_pick_terms").entered();
         let n = n_out_docs as usize;
         let mut slots: Vec<u32> = vec![0; n * REORDER_TERMS_PER_DOC];
@@ -2272,14 +2277,15 @@ impl SuperfileBuilder {
         for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
             let fts = reader.fts().expect("checked above");
             for column_id in 0..n_fts_columns {
-                fts.for_each_term_posting(column_id, |term, local_doc, _tf, _pos| {
-                    let Some(row) = rows[local_doc as usize] else {
-                        return Ok(());
-                    };
+                let on_term = |term: &[u8]| {
                     let t = term_bucket(term);
-                    if !eligible(t) {
-                        return Ok(());
-                    }
+                    let keep = eligible(t);
+                    keep.then_some(t)
+                };
+                fts.for_each_term_doc(column_id, on_term, |&t, local_doc| {
+                    let Some(row) = rows[local_doc as usize] else {
+                        return;
+                    };
                     let row = row.get() as usize;
                     let slot_base = row * REORDER_TERMS_PER_DOC;
                     let used = filled[row] as usize;
@@ -2291,13 +2297,14 @@ impl SuperfileBuilder {
                             worst[row] = used as u8;
                         }
                         filled[row] = (used + 1) as u8;
-                        return Ok(());
+                        return;
                     }
                     let worst_slot = slot_base + worst[row] as usize;
                     if df[t as usize] >= df[slots[worst_slot] as usize] {
-                        return Ok(());
+                        return;
                     }
                     slots[worst_slot] = t;
+
                     // The worst moved; find it again over the fixed,
                     // small slot count.
                     let mut w = 0usize;
@@ -2307,7 +2314,6 @@ impl SuperfileBuilder {
                         }
                     }
                     worst[row] = w as u8;
-                    Ok(())
                 })
                 .map_err(|e| {
                     BuildError::Io(Error::other(format!(
