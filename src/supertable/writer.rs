@@ -9856,7 +9856,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                 .get_all_superfiles_loaded()
                 .await
                 .map_err(|e| BuildError::Store(e.to_string()))?;
-            if entries.is_empty() {
+            if !old.needs_term_index_rebuild(&entries).await {
                 return Ok(None);
             }
             let store = Arc::clone(&old.options.store);
