@@ -6954,6 +6954,114 @@ mod tests {
         assert_eq!(hits[0].0, 0, "top hit for axis-0 query must be doc 0");
     }
 
+    /// Inputs trained on their own k-means only share cluster *numbers*, not
+    /// cluster meanings: one file's cluster 0 can sit where another's
+    /// cluster 1 does. Averaging centroid c across inputs then puts the
+    /// merged centroids between unrelated groups, and a one-probe search
+    /// misses a row both source files route to correctly. Regression: the
+    /// splice averaged centroids by index with no check that the inputs
+    /// share a grid.
+    #[tokio::test]
+    async fn sq8_merge_of_separately_trained_inputs_keeps_routing() {
+        const DIM: usize = 16;
+        const N_CENT: usize = 2;
+        const ONE_PROBE: usize = 1;
+        const ALL_PROBES: usize = N_CENT;
+        const RERANK_MULT: usize = 100;
+        let axis = |a: usize| {
+            let mut v = vec![0.0f32; DIM];
+            v[a] = 1.0;
+            v
+        };
+        // A unit axis with a small tag on another axis, so each row is distinct.
+        let tagged = |a: usize, tag: usize, w: f32| {
+            let mut v = axis(a);
+            v[tag] = w;
+            v
+        };
+        let make_file = |ids: Vec<u64>, centroids: Vec<Vec<f32>>, rows: Vec<Vec<f32>>| {
+            let centroids: Vec<f32> = centroids.concat();
+            let opts = BuilderOptions::new(
+                schema_with_fts(),
+                "doc_id",
+                vec![],
+                vec![
+                    default_vector_config("emb", 7)
+                        .with_rerank_codec(RerankCodec::Sq16)
+                        .with_provided_centroids(Some(Arc::from(centroids))),
+                ],
+            );
+            let n = ids.len();
+            let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+            let batch = RecordBatch::try_new(
+                b.opts.schema.clone(),
+                vec![
+                    Arc::new(decimal128_ids(ids)),
+                    Arc::new(LargeStringArray::from(vec!["t"; n])),
+                    Arc::new(LargeStringArray::from(vec!["b"; n])),
+                ],
+            )
+            .expect("batch");
+            b.add_batch(&batch, &[rows.concat().as_slice()])
+                .expect("add_batch");
+            Arc::new(SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open"))
+        };
+
+        // File A: cluster 0 is axis 0 (three rows), cluster 1 is axis 1 (one row).
+        let r_a = make_file(
+            vec![10, 11, 12, 13],
+            vec![axis(0), axis(1)],
+            vec![
+                tagged(0, 4, 0.1),
+                tagged(0, 5, 0.1),
+                tagged(0, 6, 0.1),
+                tagged(1, 7, 0.3),
+            ],
+        );
+        // File B: the same two groups with the labels swapped, as an
+        // independent k-means run may number them.
+        let r_b = make_file(
+            vec![20, 21],
+            vec![axis(1), axis(0)],
+            vec![tagged(1, 8, 0.3), tagged(0, 9, 0.3)],
+        );
+
+        // The query is B's axis-1 row (id 20, merged local 4).
+        let query = tagged(1, 8, 0.3);
+        let src_hits = r_b
+            .vec()
+            .expect("source vector index")
+            .search("emb", &query, 1, ONE_PROBE, RERANK_MULT)
+            .await
+            .expect("source search");
+        assert_eq!(
+            src_hits[0].0, 0,
+            "source file finds its own row with one probe"
+        );
+
+        let (merged_bytes, _) =
+            SuperfileBuilder::build_from_sq8_ivf_readers(&[(r_a, None), (r_b, None)])
+                .expect("sq8 merge");
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
+        let vec_reader = merged.vec().expect("merged vector index");
+
+        // With every cluster probed the row is there: only routing can miss it.
+        let all = vec_reader
+            .search("emb", &query, 1, ALL_PROBES, RERANK_MULT)
+            .await
+            .expect("merged search, all probes");
+        assert_eq!(all[0].0, 4, "the row survives the merge");
+
+        let one = vec_reader
+            .search("emb", &query, 1, ONE_PROBE, RERANK_MULT)
+            .await
+            .expect("merged search, one probe");
+        assert_eq!(
+            one[0].0, 4,
+            "one probe must still route to the row's cluster after the merge"
+        );
+    }
+
     /// SQL-shaped tables carry FTS text columns *and* an Sq8 vector column.
     /// Compaction must take the Sq8 byte-splice path while still rebuilding
     /// the FTS blob from the scalar Parquet rows (regression: optimize on
