@@ -91,7 +91,7 @@ use tokio::{
     },
     time::sleep,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, Span, debug, error, info, warn};
 use uuid::Uuid;
 
 #[cfg(not(test))]
@@ -195,7 +195,10 @@ use crate::{
             },
         },
     },
-    utils::terms::make_key,
+    utils::{
+        terms::make_key,
+        trace::{detail_span, record},
+    },
 };
 
 /// Multipart chunk size for large superfile uploads.
@@ -4522,6 +4525,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             }))
             .buffered(read_concurrency)
             .collect::<Vec<_>>()
+            .instrument(detail_span!(
+                "drain_batch.open",
+                batch = batch_idx + 1,
+                superfiles = batch_sources.len(),
+            ))
             .await
             .into_iter()
             .collect::<Result<Vec<_>, BuildError>>()?;
@@ -4652,13 +4660,27 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     ))
                     .buffered(commit_write_concurrency().get())
                     .collect::<Vec<_>>()
+                    .instrument(detail_span!(
+                        "drain_batch.materialize",
+                        batch = batch_idx + 1,
+                        superfiles = readers.len(),
+                    ))
                     .await
                     .into_iter()
                     .collect::<Result<Vec<_>, BuildError>>()?;
                 let t_mat = batch_t0.elapsed().as_secs_f64() * 1e3;
 
+                let assign_spill_span = detail_span!(
+                    "drain_batch.assign_spill",
+                    batch = batch_idx + 1,
+                    rows = tracing::field::Empty,
+                    distinct_rows = tracing::field::Empty,
+                    spill_files = tracing::field::Empty,
+                )
+                .entered();
                 let all_rows: Vec<MaterializedIvfRow> = row_sets.into_iter().flatten().collect();
                 let n_batch_rows = all_rows.len();
+                record("rows", n_batch_rows);
                 for writer in cell_spills.values_mut() {
                     writer.begin_batch();
                 }
@@ -4676,6 +4698,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     .iter()
                     .filter(|row| seen_stable_ids.insert(row.stable_id))
                     .collect();
+                record("distinct_rows", distinct_rows.len());
                 if assign_skip
                     && drain_replica_extra_budget(distinct_rows.len(), replica_target) == 0
                 {
@@ -4714,6 +4737,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     let use_graph_assign = drain_graph_assign
                         && metric == Metric::Cosine
                         && (clusters_ref.n_cent as usize) >= opann::GRAPH_ASSIGN_MIN_N_CENT;
+                    let assign_span = detail_span!(
+                        "drain_batch.assign",
+                        rows = distinct_rows.len(),
+                        graph = use_graph_assign,
+                    )
+                    .entered();
                     let assign_t0 = std::time::Instant::now();
                     let assignments: Vec<opann::BoundaryAssignment> = if distinct_rows.is_empty() {
                         // No rows to assign: never build the router (skip-empty).
@@ -4777,6 +4806,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         })
                     };
                     let assign_ms = assign_t0.elapsed().as_secs_f64() * 1e3;
+                    drop(assign_span);
                     drain_assign_total_ms += assign_ms;
                     if drain_timers {
                         debug!(
@@ -4844,6 +4874,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     );
                 }
                 local_checkpoint.spills = checkpointed_spills;
+                record("spill_files", cell_spills.len());
+                drop(assign_spill_span);
                 let t_spill = batch_t0.elapsed().as_secs_f64() * 1e3;
                 drain_mat_total_ms += t_mat;
                 drain_assign_spill_total_ms += t_spill - t_mat;
@@ -4864,7 +4896,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
 
         local_checkpoint.batches_done = batch_idx + 1;
         local_checkpoint.added_per_cell = added_per_cell.clone();
-        save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)?;
+        {
+            let _span = detail_span!("drain_batch.checkpoint", batch = batch_idx + 1).entered();
+            save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)?;
+        }
         #[cfg(test)]
         maybe_fail_drain_for_test(
             &remote_state.checkpoint.epoch_id,
@@ -4995,19 +5030,49 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
         freeze_ms += freeze_t0.elapsed().as_secs_f64() * 1e3;
         let width_law_ref = width_law.as_ref();
+        let cell_build_span = detail_span!(
+            "drain_cell_build",
+            shards = shard_sources.len(),
+            workers = hidden_inner.options.writer_pool.current_num_threads(),
+        )
+        .entered();
         let prepared_shards: Vec<PreparedSuperfile> = fanout_shards(
             &hidden_inner.options.writer_pool,
             &shard_sources,
             |(shard_id, cells)| {
+                let _shard_span = detail_span!(
+                    "drain_shard",
+                    parent: &cell_build_span,
+                    shard = *shard_id,
+                    cells = cells.len(),
+                )
+                .entered();
                 let mut packed = Vec::with_capacity(cells.len());
                 for (cell_id, source) in cells {
                     let cell = match source {
                         DrainCellSource::Packed(cell) => cell.clone(),
                         DrainCellSource::Rows(spill) => {
+                            let _cell_span = detail_span!(
+                                "drain_cell",
+                                cell = *cell_id,
+                                rows = spill.n_rows(),
+                                score_ms = tracing::field::Empty,
+                                sample_ms = tracing::field::Empty,
+                                train_ms = tracing::field::Empty,
+                                n_cent = tracing::field::Empty,
+                                bucket_ms = tracing::field::Empty,
+                                fsync_ms = tracing::field::Empty,
+                                write_ms = tracing::field::Empty,
+                                crc_ms = tracing::field::Empty,
+                                checkpoint_ms = tracing::field::Empty,
+                            )
+                            .entered();
                             // Calibration reads the spill the pack pass is
                             // about to read anyway (before remove_files).
                             if let Some(cal) = width_law_ref {
+                                let score_t0 = time::Instant::now();
                                 cal.score_cell(*cell_id, spill)?;
+                                record("score_ms", score_t0.elapsed().as_millis() as u64);
                             }
                             let cell = build_spilled_packed_cell_from_rows(
                                 scratch,
@@ -5015,6 +5080,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 spill,
                                 &vector_config,
                             )?;
+                            let checkpoint_t0 = time::Instant::now();
                             {
                                 let mut state = checkpoint.lock().map_err(|_| {
                                     BuildError::Store("drain checkpoint lock poisoned".into())
@@ -5030,14 +5096,17 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 );
                                 save_drain_local_checkpoint(&drain_scratch, &state)?;
                             }
+                            record("checkpoint_ms", checkpoint_t0.elapsed().as_millis() as u64);
                             spill.remove_files();
                             cell
                         }
                     };
                     packed.push((*cell_id, cell));
                 }
-                let prepared: PreparedSuperfile =
-                    build_prepared_from_spilled_cells(&hidden_inner, scratch, *shard_id, &packed)?;
+                let prepared: PreparedSuperfile = {
+                    let _span = detail_span!("drain_shard.assemble").entered();
+                    build_prepared_from_spilled_cells(&hidden_inner, scratch, *shard_id, &packed)?
+                };
                 // Depth-law observation: fine clusters exist only now that
                 // the shard is packed; record each surviving candidate's
                 // fine-centroid rank from the shard's own bytes.
@@ -5071,6 +5140,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 Ok::<_, BuildError>(prepared)
             },
         )?;
+        drop(cell_build_span);
         local_checkpoint = checkpoint
             .lock()
             .map_err(|_| BuildError::Store("drain checkpoint lock poisoned".into()))?
@@ -7287,6 +7357,7 @@ fn plan_split_wave(
     metric: Metric,
     modality_d: f64,
 ) -> Vec<Result<PlannedCellSplit, u32>> {
+    let wave_span = Span::current();
     plan_inputs
         .into_par_iter()
         .map(|extracted| {
@@ -7295,12 +7366,21 @@ fn plan_split_wave(
                 parent_ids,
                 rows,
             } = extracted;
+            let _span = detail_span!(
+                "split_cell_plan",
+                parent: &wave_span,
+                cell = cell,
+                rows = rows.len(),
+                k = tracing::field::Empty,
+            )
+            .entered();
             let split_refs: Vec<&EncodedCellRow> = rows.iter().map(|r| &r.encoded).collect();
             let Some((k, self_tune)) =
                 opann::cell_split_plan(&split_refs, clusters.dim as usize, cell, modality_d)
             else {
                 return Err(cell);
             };
+            record("k", k);
             let (sub_centroids, assign) =
                 opann::plan_sq8_split_kway(&split_refs, clusters, cell, metric, k, self_tune);
             drop(split_refs);
@@ -7850,6 +7930,20 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
 /// its hooks ride this pass (offer at wave routing, score at shard pack,
 /// finish + stamp inside the commit; REPLACE semantics) — seams marked
 /// below.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(
+        name = "split_repack",
+        skip_all,
+        fields(
+            candidates = candidates.len(),
+            budget_mb = split_batch_memory_budget_bytes() / MIB as u64,
+            waves = tracing::field::Empty,
+            cells_split = tracing::field::Empty,
+            children = tracing::field::Empty,
+        )
+    )
+)]
 pub(in crate::supertable) async fn split_repack_bulk(
     inner: &Arc<SupertableInner>,
     manifest: &ManifestSnapshot,
@@ -7923,6 +8017,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
     // stall on one oversized cell).
     let cell_bytes: HashMap<u32, u64> = candidates.iter().copied().collect();
     let mut queue: Vec<(u32, u64)> = candidates;
+    let mut wave = 0usize;
     while !queue.is_empty() {
         let mut wave_cells: Vec<u32> = Vec::new();
         let mut wave_bytes = 0u64;
@@ -7982,8 +8077,23 @@ pub(in crate::supertable) async fn split_repack_bulk(
             );
         }
 
+        wave += 1;
         let jobs = live_split_extraction_jobs(&wave_cells, parents_by_cell, superseded_map);
-        let extracted = extract_split_cell_rows(inner, &column, now, jobs).await?;
+        let extract_span = detail_span!(
+            "split_wave.extract",
+            wave = wave,
+            cells = wave_cells.len(),
+            parents = jobs.iter().map(|(_, parents)| parents.len()).sum::<usize>(),
+            estimated_mb = wave_bytes / MIB as u64,
+            rows = tracing::field::Empty,
+        );
+        let extracted = extract_split_cell_rows(inner, &column, now, jobs)
+            .instrument(extract_span.clone())
+            .await?;
+        extract_span.record(
+            "rows",
+            extracted.iter().map(|item| item.rows.len()).sum::<usize>(),
+        );
         let mut plan_inputs: Vec<ExtractedCellRows> = Vec::new();
         for item in extracted {
             if item.rows.len() < MIN_ROWS_TO_SPLIT_CELL {
@@ -7996,10 +8106,12 @@ pub(in crate::supertable) async fn split_repack_bulk(
             continue;
         }
         let plan_clusters = running_clusters.clone();
+        let plan_span = detail_span!("split_wave.plan", wave = wave, cells = plan_inputs.len());
         let planned_or_noop: Vec<Result<PlannedCellSplit, u32>> =
             run_on_pool(Some(maint_pool()?), "repack wave planning", move || {
                 plan_split_wave(plan_inputs, &plan_clusters, metric, modality_d)
             })
+            .instrument(plan_span)
             .await
             .map_err(|e| BuildError::Store(format!("repack wave planning: {e}")))?;
         let mut planned: Vec<PlannedCellSplit> = Vec::new();
@@ -8035,8 +8147,10 @@ pub(in crate::supertable) async fn split_repack_bulk(
         let wave_cfg = base_cfg.clone();
         let build_jobs: Vec<(PlannedCellSplit, Vec<u32>)> =
             planned.into_iter().zip(ids_per_split).collect();
+        let pack_span = detail_span!("split_wave.pack", wave = wave, cells = build_jobs.len());
         let repacked: Vec<RepackedSplit> =
             run_on_pool(Some(maint_pool()?), "repack wave child packs", move || {
+                let wave_span = Span::current();
                 build_jobs
                     .into_par_iter()
                     .map(|(split, child_ids)| {
@@ -8047,6 +8161,14 @@ pub(in crate::supertable) async fn split_repack_bulk(
                             assign,
                             ..
                         } = split;
+                        let _span = detail_span!(
+                            "split_cell_pack",
+                            parent: &wave_span,
+                            cell = cell,
+                            rows = rows.len(),
+                            children = child_ids.len(),
+                        )
+                        .entered();
                         let mut groups: Vec<Vec<MaterializedIvfRow>> =
                             (0..child_ids.len()).map(|_| Vec::new()).collect();
                         for (row, &side) in rows.into_iter().zip(assign.iter()) {
@@ -8104,6 +8226,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
                     })
                     .collect::<Result<Vec<RepackedSplit>, BuildError>>()
             })
+            .instrument(pack_span)
             .await
             .map_err(|e| BuildError::Store(format!("repack wave child packs: {e}")))??;
 
@@ -8133,6 +8256,9 @@ pub(in crate::supertable) async fn split_repack_bulk(
             packed_children.extend(split.packed);
         }
     }
+    record("waves", wave);
+    record("cells_split", committed_cells.len());
+    record("children", packed_children.len());
     if packed_children.is_empty() {
         return Ok(SplitBatchOutcome::no_op_cells(noop_cells));
     }
@@ -8163,6 +8289,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         .collect();
     // Join by shard id, not position: the cell → entry pairing must not
     // depend on the parallel collect preserving bucket order.
+    let assemble_span = detail_span!("split_repack.assemble", shards = buckets.len());
     let prepared: Vec<(u32, PreparedSuperfile)> =
         run_on_pool(Some(maint_pool()?), "repack shard assembly", move || {
             buckets
@@ -8173,6 +8300,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
                 })
                 .collect::<Result<Vec<(u32, PreparedSuperfile)>, BuildError>>()
         })
+        .instrument(assemble_span)
         .await
         .map_err(|e| BuildError::Store(format!("repack shard assembly: {e}")))??;
     let mut new_entries_by_cell: Vec<(u32, Arc<SuperfileEntry>)> = Vec::new();
@@ -8202,6 +8330,14 @@ pub(in crate::supertable) async fn split_repack_bulk(
     // them (abandon-based recovery).
     pin_uploaded_superfiles(inner, new_entries.clone(), true).await?;
     let multipart_threshold = inner.options.put_multipart_threshold_bytes;
+    let upload_span = detail_span!(
+        "split_repack.upload",
+        superfiles = pending_storage_writes.len(),
+        bytes = pending_storage_writes
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>(),
+    );
     let uploads = pending_storage_writes
         .into_iter()
         .map(|(storage_key, bytes)| {
@@ -8213,7 +8349,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
             }
         });
     let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency().get());
-    while let Some(landed) = in_flight.next().await {
+    while let Some(landed) = in_flight.next().instrument(upload_span.clone()).await {
         if let Err(error) = landed {
             drop(in_flight);
             return Err(unpin_after_failed_publish(inner, error).await);
@@ -8248,6 +8384,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         list_metadata,
         term_contributions,
     )
+    .instrument(detail_span!("split_repack.commit"))
     .await
     {
         Ok(manifest) => manifest,

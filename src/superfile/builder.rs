@@ -131,7 +131,10 @@ use crate::{
             rerank_codec::RerankCodec,
         },
     },
-    utils::{terms::validate_column_name, trace::detail_span},
+    utils::{
+        terms::validate_column_name,
+        trace::{detail_span, record},
+    },
 };
 
 /// Merges below this many surviving documents keep arrival order: a
@@ -1571,6 +1574,10 @@ impl SuperfileBuilder {
     /// [`build_from_sq8_ivf_readers`](Self::build_from_sq8_ivf_readers): writes
     /// the merged superfile to `output` instead of returning a `Vec<u8>`, so
     /// the compaction caller can stream to a temp file.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "sq8_merge", skip_all, fields(inputs = readers.len()))
+    )]
     pub(crate) fn build_from_sq8_ivf_readers_to<W: Write>(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
         fts_corpus: &HashMap<String, ColumnLengthStats>,
@@ -1594,6 +1601,12 @@ impl SuperfileBuilder {
             Vec::with_capacity(readers.len());
         let mut local_base = 0u32;
 
+        let read_span = detail_span!(
+            "sq8_merge.read_inputs",
+            rows = tracing::field::Empty,
+            deleted_rows = tracing::field::Empty,
+        )
+        .entered();
         for (idx, (reader, deleted)) in readers.iter().enumerate() {
             // Compaction opens its inputs eagerly (see
             // `query::dispatch::open_compaction_input`), so `get_record_batch`
@@ -1619,10 +1632,20 @@ impl SuperfileBuilder {
             superfile_builder.add_batch_ids_only(&record_batch)?;
             local_base += record_batch.num_rows() as u32;
         }
+        record("rows", local_base);
+        record(
+            "deleted_rows",
+            readers
+                .iter()
+                .filter_map(|(_, d)| d.as_ref().map(|d| d.len()))
+                .sum::<u64>(),
+        );
+        drop(read_span);
 
         let merged_sub = merge_sq8_ivf_subsections(&merge_inputs)?;
         superfile_builder.set_prebuilt_ivf_subsection(0, merged_sub)?;
 
+        let _write_span = detail_span!("sq8_merge.write").entered();
         superfile_builder.finish_to(output)?;
         Ok(SuperfileStats::from_children(stats_collector.as_slice()))
     }

@@ -42,7 +42,7 @@ use uuid::Uuid;
 use crate::{
     config::{CompactionSettings, RecalibratePolicy, global},
     runtime_bridge::{bridge_on_runtime, run_on_pool},
-    runtime_metrics::rss::memory_budget,
+    runtime_metrics::rss::{available_memory_bytes, memory_budget},
     superfile::{
         builder::SuperfileBuilder,
         fts::reader::ColumnLengthStats,
@@ -72,7 +72,7 @@ use crate::{
             try_commit_attempt, write_superfile_list,
         },
     },
-    utils::trace::{detail_span, record},
+    utils::trace::{RegionUsage, detail_span, record},
 };
 
 /// Held for as long as one process is reshaping superfiles, and released
@@ -206,8 +206,8 @@ impl SuperfileMerge for CompactionMerge {
 
 pub(crate) mod plan;
 
-use plan::split_stats_at_drain_watermark;
 pub(crate) use plan::{CompactionJob, SuperfileStats, select};
+use plan::{MIB, split_stats_at_drain_watermark};
 
 /// Cap on compaction input opens in flight, counted across the whole process
 /// rather than per merge. Several merges run at once, and it is their combined
@@ -685,6 +685,17 @@ impl Supertable {
             Some(maint_pool()?),
             "compaction merge",
             move || -> Result<(Bytes, _), BuildError> {
+                let _span = detail_span!(
+                    "merge_build",
+                    output_bytes = tracing::field::Empty,
+                    cpu_ms = tracing::field::Empty,
+                    rss_anon_mb_before = tracing::field::Empty,
+                    rss_anon_mb_after = tracing::field::Empty,
+                    mem_available_mb_before = tracing::field::Empty,
+                    mem_available_mb_after = tracing::field::Empty,
+                )
+                .entered();
+                let usage = RegionUsage::begin();
                 // Every merge kind streams its output to a temp file and mmaps it
                 // back, so the corpus-sized merge output is never held as an anon
                 // Vec — the allocation that OOMs compaction on a memory-tight host.
@@ -711,6 +722,8 @@ impl Supertable {
                 };
                 let bytes = mmap_readonly_bytes(output.path())
                     .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
+                record("output_bytes", bytes.len() as u64);
+                usage.finish();
                 Ok((bytes, stats))
             },
         )
@@ -1298,6 +1311,9 @@ impl Supertable {
         // shorter than the settle a restarting timer would never elapse at all
         // and the width would collapse to one.
         let mut next_admission = time::Instant::now() + MERGE_ADMIT_SETTLE;
+        // Admission checks the host refused since the last merge started, so
+        // the admit log shows how long memory held the next merge back.
+        let mut held_back = 0u64;
 
         while !queued.is_empty() || !merging.is_empty() {
             // Nothing running: start one without consulting the host. A table
@@ -1339,7 +1355,17 @@ impl Supertable {
                         host_has_room_for_another_merge(),
                     ) {
                         let (plan_index, job) = queued.pop_front().expect("guarded above");
+                        info!(
+                            in_flight = merging.len(),
+                            queued = queued.len(),
+                            held_back,
+                            mem_available_mb = available_memory_bytes().map(|b| b / MIB),
+                            "compaction merge admitted"
+                        );
+                        held_back = 0;
                         self.spawn_merge(&mut merging, plan_index, job, stale_seal_timeout);
+                    } else {
+                        held_back += 1;
                     }
                     // Advanced whether or not the host had room: a deadline
                     // left in the past would re-fire immediately and spin on
