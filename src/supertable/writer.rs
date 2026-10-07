@@ -790,7 +790,7 @@ fn split_buffer_into_superfile_inputs(
 /// after the grace, delete exactly those keys (see [`reclaim`]). Never a listing sweep, so a file
 /// whose commit is still in flight cannot be taken for garbage. Deleting inline instead would race
 /// readers still pinned to the manifest the commit replaced.
-fn schedule_background_storage_reclaim(inner: Arc<SupertableInner>) {
+pub(super) fn schedule_background_storage_reclaim(inner: Arc<SupertableInner>) {
     // Unit tests take the recorded keys and call `reclaim` themselves; spawning here from a
     // `current_thread` tokio test runtime panics in `block_in_place`.
     #[cfg(not(test))]
@@ -3654,7 +3654,7 @@ fn finish_superfile_entry(
 }
 
 /// Collected superfile entries + pending storage/cache writes for one publish.
-struct SuperfilePublishBatch {
+pub(super) struct SuperfilePublishBatch {
     new_entries: Vec<Arc<SuperfileEntry>>,
     to_remove: Vec<Arc<SuperfileEntry>>,
     pending_storage_writes: Vec<(String, Bytes)>,
@@ -3666,6 +3666,15 @@ struct SuperfilePublishBatch {
     /// One per superfile with an FTS index; published as a term-index delta
     /// in the same CAS as the entries.
     term_contributions: Vec<TermContribution>,
+}
+
+impl SuperfilePublishBatch {
+    /// Skip the in-memory reader-cache fill. Only for a storage-backed table,
+    /// where the bytes are durable and reads fetch them from storage; a bulk
+    /// load would otherwise keep every superfile it wrote in RAM.
+    pub(super) fn skip_memory_fill(&mut self) {
+        self.pending_store_inserts.clear();
+    }
 }
 
 fn collect_prepared_superfiles(
@@ -3764,7 +3773,7 @@ fn commit_target_object_bytes() -> u64 {
 /// function of the shard split, which follows the writer pool's width, so
 /// pricing off them would make the same append cost different amounts on
 /// different hosts. See [`buffered_payload_bytes`].
-fn planned_data_objects(payload_bytes: u64) -> u64 {
+pub(super) fn planned_data_objects(payload_bytes: u64) -> u64 {
     if payload_bytes == 0 {
         return 0;
     }
@@ -3845,7 +3854,7 @@ pub(crate) fn commit_built_superfile(st: &Supertable, bytes: Bytes) -> Result<()
     ))
 }
 
-fn commit_output_stats(batch: &SuperfilePublishBatch) -> (u64, u64, u64) {
+pub(super) fn commit_output_stats(batch: &SuperfilePublishBatch) -> (u64, u64, u64) {
     let superfiles = batch.new_entries.len() as u64;
     let bytes: u64 = batch
         .new_entries
@@ -3913,7 +3922,7 @@ fn prepare_user_superfile_batch_in_scope(
 /// `stem` is the source name the commit's superfiles are keyed under, when
 /// the caller gave one (`append_named`); every superfile the commit produces
 /// carries it, since they all come from that one source.
-fn prepare_user_superfile_batch(
+pub(super) fn prepare_user_superfile_batch(
     inner: &SupertableInner,
     manifest: &ManifestSnapshot,
     outputs: Vec<ShardOutput>,
@@ -3926,7 +3935,7 @@ fn prepare_user_superfile_batch(
         .install(|| prepare_user_superfile_batch_in_scope(inner, manifest, outputs, hints, stem))
 }
 
-async fn persist_superfile_publish_batch_async(
+pub(super) async fn persist_superfile_publish_batch_async(
     inner: &SupertableInner,
     batch: SuperfilePublishBatch,
     list_metadata: CommitListMetadata,

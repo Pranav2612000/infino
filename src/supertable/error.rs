@@ -15,6 +15,7 @@
 
 use std::{error::Error, fmt::Display, path::PathBuf};
 
+use arrow_schema::ArrowError;
 use datafusion::error::DataFusionError;
 use thiserror::Error;
 
@@ -34,6 +35,22 @@ use crate::{
 pub enum BuildError {
     #[error("no documents to build")]
     NoDocsToBuild,
+
+    #[error(
+        "hydrate requires a SQL-only table with no index; this table declares \
+         {fts} full-text and {vector} vector column(s). Use `append` for an \
+         indexed table."
+    )]
+    HydrateRequiresNoIndex { fts: usize, vector: usize },
+
+    #[error("hydrate target_rows must be at least 1")]
+    HydrateZeroTargetRows,
+
+    #[error("a hydrate chunk has {rows} rows; one superfile holds at most {max}")]
+    HydrateChunkTooLarge { rows: usize, max: u32 },
+
+    #[error("reading a hydrate input batch: {0}")]
+    HydrateInputRead(#[source] ArrowError),
 
     #[error("schema is missing the declared id_column {0:?}")]
     MissingIdColumn(String),
