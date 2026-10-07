@@ -168,7 +168,7 @@ const REORDER_TERM_BUCKET_BITS: u32 = 22;
 /// document lengths and the chosen order are all indexed by the number
 /// this returns, so two copies drifting apart would put a posting under
 /// the wrong document.
-fn survivor_rows(
+pub(crate) fn survivor_rows(
     n_local: u32,
     deleted: Option<&RoaringBitmap>,
     base: u32,
@@ -1653,7 +1653,7 @@ impl SuperfileBuilder {
     /// average over everything that remains beside it.
     ///
     /// Merge Sq8 IVF superfiles without fp32 corpus decode — byte-splices
-    /// per-cluster IVF blocks and remaps doc ids.
+    /// per-cluster IVF blocks, drops tombstoned rows and remaps doc ids.
     pub fn build_from_sq8_ivf_readers(
         readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
@@ -1689,7 +1689,8 @@ impl SuperfileBuilder {
         let column = vec_col.name.clone();
 
         let mut stats_collector = Vec::with_capacity(inputs.len());
-        let mut merge_inputs: Vec<(&VectorReader, String, u32)> = Vec::with_capacity(inputs.len());
+        let mut merge_inputs: Vec<(&VectorReader, &str, u32, Option<Arc<RoaringBitmap>>)> =
+            Vec::with_capacity(inputs.len());
         let mut local_base = 0u32;
 
         for input in inputs {
@@ -1703,7 +1704,7 @@ impl SuperfileBuilder {
             stats_collector.push(stats);
 
             let v = reader.vec().ok_or(BuildError::VectorReadError)?;
-            merge_inputs.push((v, column.clone(), local_base));
+            merge_inputs.push((v, column.as_str(), local_base, deleted.clone()));
 
             // FTS rides out of band like the vector blob: carry the input's
             // prebuilt postings (aligned with the surviving rows the batch
@@ -1713,11 +1714,7 @@ impl SuperfileBuilder {
             local_base += record_batch.num_rows() as u32;
         }
 
-        let merge_refs: Vec<(&VectorReader, &str, u32)> = merge_inputs
-            .iter()
-            .map(|(v, col, off)| (*v, col.as_str(), *off))
-            .collect();
-        let merged_sub = merge_sq8_ivf_subsections(&merge_refs)?;
+        let merged_sub = merge_sq8_ivf_subsections(&merge_inputs)?;
         superfile_builder.set_prebuilt_ivf_subsection(0, merged_sub)?;
 
         superfile_builder.finish_to(output)?;
@@ -7353,6 +7350,215 @@ mod tests {
             .expect("vector search on merged Sq8 superfile");
         assert!(!hits.is_empty(), "search should return at least one result");
         assert_eq!(hits[0].0, 0, "top hit for axis-0 query must be doc 0");
+    }
+
+    /// Tombstones drop rows from the merged Parquet body, so the spliced
+    /// vector index must drop the same rows: every surviving vector has to
+    /// resolve to its own row's `_id`, and a deleted vector must not come
+    /// back. Regression: the splice copied every vector row and offset later
+    /// inputs by the surviving row count, so ids after a delete pointed at
+    /// the wrong rows, or past the last row when the last input had deletes.
+    #[tokio::test]
+    async fn sq8_merge_drops_tombstoned_vectors_with_their_rows() {
+        const DIM: usize = 16;
+        /// Probe every cluster, so only the doc-id mapping decides the hit.
+        const ALL_PROBES: usize = 64;
+        const RERANK_MULT: usize = 100;
+        /// The axes are orthogonal, so a self-match and a hit on another axis
+        /// score a full cosine apart; half of that separates them.
+        const MIN_SCORE_GAP: f32 = 0.5;
+        // r1: id 10 on axis 0, id 11 on axis 1. r2: id 20 on axis 2, id 21 on axis 3.
+        const IDS: [(usize, i128); 4] = [(0, 10), (1, 11), (2, 20), (3, 21)];
+
+        let make_file = |codec: RerankCodec, id0: u64, axis0: usize| {
+            let opts = BuilderOptions::new(
+                schema_with_fts(),
+                "doc_id",
+                vec![],
+                vec![default_vector_config("emb", 7).with_rerank_codec(codec)],
+            );
+            let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+            let batch = RecordBatch::try_new(
+                b.opts.schema.clone(),
+                vec![
+                    Arc::new(decimal128_ids(vec![id0, id0 + 1])),
+                    Arc::new(LargeStringArray::from(vec!["a", "b"])),
+                    Arc::new(LargeStringArray::from(vec!["c", "d"])),
+                ],
+            )
+            .expect("batch");
+            // Each row's vector is a unit axis, so a self-query has one exact hit.
+            let mut v = vec![0.0f32; 2 * DIM];
+            v[axis0] = 1.0;
+            v[DIM + axis0 + 1] = 1.0;
+            b.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+            Arc::new(SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open"))
+        };
+
+        for codec in [
+            RerankCodec::Sq16,
+            RerankCodec::Sq16Adaptive,
+            RerankCodec::Sq8Residual,
+            RerankCodec::Sq8FixedResidual,
+        ] {
+            // Delete the first row of the first input (later rows of that
+            // input shift onto the next one), then of the last input (its
+            // later rows shift past the end).
+            for (r1_deleted, r2_deleted, deleted_id) in
+                [(&[0u32][..], &[][..], 10i128), (&[], &[0], 20)]
+            {
+                let case = format!("{codec:?}, deleted _id {deleted_id}");
+                let (merged_bytes, stats) = SuperfileBuilder::build_from_sq8_ivf_readers(&[
+                    (make_file(codec, 10, 0), tombstones(r1_deleted)),
+                    (make_file(codec, 20, 2), tombstones(r2_deleted)),
+                ])
+                .expect("sq8 merge with a tombstoned input");
+                assert_eq!(stats.n_docs, 3, "{case}");
+
+                let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
+                assert_eq!(
+                    merged.n_docs(),
+                    3,
+                    "{case}: merged Parquet keeps the 3 live rows"
+                );
+                let vec_reader = merged.vec().expect("vector index present");
+                let col = vec_reader
+                    .vector_columns_config()
+                    .next()
+                    .expect("has column");
+                assert_eq!(
+                    col.n_docs, 3,
+                    "{case}: vector index keeps the same 3 live rows"
+                );
+
+                let full = merged.get_record_batch(None).expect("full batch");
+                let idx = full.schema().index_of("doc_id").expect("doc_id column");
+                let ids = full
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("decimal ids");
+
+                let mut self_score = None;
+                let mut deleted_score = None;
+                for (axis, id) in IDS {
+                    let mut query = vec![0.0f32; DIM];
+                    query[axis] = 1.0;
+                    let hits = vec_reader
+                        .search("emb", &query, 1, ALL_PROBES, RERANK_MULT)
+                        .await
+                        .expect("vector search on merged superfile");
+                    let (local, score) = *hits.first().expect("one hit");
+                    let local = local as usize;
+                    assert!(
+                        local < ids.len(),
+                        "{case}: hit {local} is past the last Parquet row"
+                    );
+                    if id == deleted_id {
+                        deleted_score = Some(score);
+                    } else {
+                        self_score = Some(score);
+                        assert_eq!(
+                            ids.value(local),
+                            id,
+                            "{case}: axis-{axis} vector must resolve to its own row's _id"
+                        );
+                    }
+                }
+                // A deleted vector left in the index would self-match its
+                // axis, under whatever live row its doc id points at.
+                let (self_score, deleted_score) = (
+                    self_score.expect("live axes"),
+                    deleted_score.expect("deleted axis"),
+                );
+                assert!(
+                    (deleted_score - self_score).abs() > MIN_SCORE_GAP,
+                    "{case}: the deleted vector came back (score {deleted_score}, \
+                     self-match {self_score})"
+                );
+            }
+        }
+    }
+
+    /// A fully tombstoned input contributes no vector rows, and the next
+    /// input's rows keep their own `_id`s. With every input tombstoned the
+    /// merge is empty (0 docs), which compaction turns into "remove the
+    /// inputs, write nothing".
+    #[tokio::test]
+    async fn sq8_merge_drops_a_fully_tombstoned_input() {
+        const ALL_PROBES: usize = 64;
+        const RERANK_MULT: usize = 100;
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("emb", 7).with_rerank_codec(RerankCodec::Sq16)],
+        );
+        let dim = opts.vector_columns[0].dim;
+        // Rows `id0` and `id0 + 1` on unit axes `axis0` and `axis0 + 1`.
+        let make_file = |id0: u64, axis0: usize| {
+            let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+            let batch = RecordBatch::try_new(
+                b.opts.schema.clone(),
+                vec![
+                    Arc::new(decimal128_ids(vec![id0, id0 + 1])),
+                    Arc::new(LargeStringArray::from(vec!["a", "b"])),
+                    Arc::new(LargeStringArray::from(vec!["c", "d"])),
+                ],
+            )
+            .expect("batch");
+            let mut v = vec![0.0f32; 2 * dim];
+            v[axis0] = 1.0;
+            v[dim + axis0 + 1] = 1.0;
+            b.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+            Arc::new(SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open"))
+        };
+
+        let (merged_bytes, stats) = SuperfileBuilder::build_from_sq8_ivf_readers(&[
+            (make_file(10, 0), tombstones(&[0, 1])),
+            (make_file(20, 2), None),
+        ])
+        .expect("sq8 merge with a fully tombstoned input");
+        assert_eq!(stats.n_docs, 2);
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
+        let vec_reader = merged.vec().expect("vector index present");
+        let col = vec_reader
+            .vector_columns_config()
+            .next()
+            .expect("has column");
+        assert_eq!(
+            col.n_docs, 2,
+            "vector index keeps only the live input's rows"
+        );
+        let full = merged.get_record_batch(None).expect("full batch");
+        let idx = full.schema().index_of("doc_id").expect("doc_id column");
+        let ids = full
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal ids");
+        for (axis, want_id) in [(2usize, 20i128), (3, 21)] {
+            let mut query = vec![0.0f32; dim];
+            query[axis] = 1.0;
+            let hits = vec_reader
+                .search("emb", &query, 1, ALL_PROBES, RERANK_MULT)
+                .await
+                .expect("vector search on merged superfile");
+            let local = hits.first().expect("one hit").0 as usize;
+            assert_eq!(
+                ids.value(local),
+                want_id,
+                "axis-{axis} vector must resolve to its own row's _id"
+            );
+        }
+
+        let (merged_bytes, stats) = SuperfileBuilder::build_from_sq8_ivf_readers(&[
+            (make_file(10, 0), tombstones(&[0, 1])),
+            (make_file(20, 2), tombstones(&[0, 1])),
+        ])
+        .expect("an all-deleted merge is not an error");
+        assert_eq!(stats.n_docs, 0);
+        assert!(merged_bytes.is_empty(), "nothing to write");
     }
 
     /// SQL-shaped tables carry FTS text columns *and* an Sq8 vector column.
