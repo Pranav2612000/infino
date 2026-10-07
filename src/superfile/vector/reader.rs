@@ -2652,6 +2652,7 @@ impl VectorReader {
             scale,
             offset,
             stable_ids,
+            survivors: None,
         })
     }
 
