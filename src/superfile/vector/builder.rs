@@ -18,6 +18,7 @@ use std::{
     mem::size_of,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use rayon::prelude::*;
@@ -54,7 +55,7 @@ use crate::{
             sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row, update_min_max},
         },
     },
-    utils::terms::validate_column_name,
+    utils::{terms::validate_column_name, trace::record},
 };
 
 /// Outer-header size (magic + version + n_columns + n_docs + dir_offset).
@@ -2236,6 +2237,13 @@ pub(crate) fn build_cell_subsection_from_source(
         partition_kmeans_sample_size(effective_n_cent, n_docs).min(n_docs)
     };
     let chunk_rows = materialized_chunk_rows_for_dim(dim);
+    // Each phase's wall time is recorded on the caller's span; only a span
+    // that declares these fields keeps them (the drain's per-cell span does).
+    let mut phase = Instant::now();
+    let mut end_phase = |field: &'static str| {
+        record(field, phase.elapsed().as_millis() as u64);
+        phase = Instant::now();
+    };
     let sample = match &source {
         CellPackSource::Spilled(spill) => {
             sample_spilled_materialized_rows(spill, sample_size, chunk_rows, cfg.rot_seed)?
@@ -2247,9 +2255,12 @@ pub(crate) fn build_cell_subsection_from_source(
             sample_fp32_rows(vectors, sample_size, dim, cfg.rot_seed)
         }
     };
+    end_phase("sample_ms");
     let (n_cent, centroids) = build_phase_timers::timed(&build_phase_timers::TRAIN_US, || {
         materialized_centroids(&cfg, requested_n_cent, n_docs, &sample)
     });
+    end_phase("train_ms");
+    record("n_cent", n_cent);
     let summary_centroid = mean_f32_cluster_major(&centroids, dim, n_cent);
     let code_bytes = dim.div_ceil(u8::BITS as usize);
     let bucket_dir = tempdir_in(scratch)?;
@@ -2309,6 +2320,7 @@ pub(crate) fn build_cell_subsection_from_source(
             min_max,
         ),
     })?;
+    end_phase("bucket_ms");
     stable_ids.flush()?;
     if durable {
         stable_ids.get_ref().sync_all()?;
@@ -2321,6 +2333,7 @@ pub(crate) fn build_cell_subsection_from_source(
             .into_inner()
             .map_err(|error| BuildError::Io(error.into_error()))?;
     }
+    end_phase("fsync_ms");
     let quantizers: Vec<(Vec<f32>, Vec<f32>)> = if fit_quantizer {
         (0..n_cent)
             .map(|centroid| {
@@ -2432,6 +2445,7 @@ pub(crate) fn build_cell_subsection_from_source(
         )?;
     }
     output.flush()?;
+    end_phase("write_ms");
     output.seek(SeekFrom::Start(0))?;
     let mut remaining = layout.total_size_before_crc;
     let mut crc = 0u32;
@@ -2448,6 +2462,7 @@ pub(crate) fn build_cell_subsection_from_source(
     if durable {
         output.sync_all()?;
     }
+    end_phase("crc_ms");
     Ok(StreamedIvfSubsection {
         n_docs: n_docs as u32,
         rerank_codec: codec,
