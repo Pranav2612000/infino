@@ -5,7 +5,12 @@
 //!
 //! Every document is flattened to dot paths and every path is given one
 //! Arrow type from its values: `Boolean`, `Int64`, `Float64`, `LargeUtf8`,
-//! or a `List` of those for arrays. The mapper infers and never checks:
+//! or a `List` of those for arrays. The one exception is a path the table
+//! already stores as a struct: flattening stops there and the object fills
+//! the struct's declared fields, since `a.b` would otherwise become a
+//! second column beside the `a` the caller meant to fill.
+//!
+//! The mapper infers and never checks:
 //! the table's schema is consulted only to resolve an ambiguous literal
 //! (an integral number on a `Float64` path is a float, a string on a
 //! `Utf8` path is `Utf8`), so a batch that disagrees with the schema is
@@ -13,22 +18,32 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use arrow::buffer::{NullBuffer, OffsetBuffer};
-use arrow_array::{
-    ArrayRef, BooleanArray, Date32Array, Date64Array, FixedSizeListArray, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeListArray, LargeStringArray,
-    ListArray, RecordBatch, RecordBatchOptions, StringArray, StringViewArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+use arrow::{
+    buffer::{NullBuffer, OffsetBuffer},
+    datatypes::i256,
 };
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use arrow_array::{
+    ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array, Decimal256Array,
+    FixedSizeListArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    LargeListArray, LargeStringArray, ListArray, RecordBatch, RecordBatchOptions, StringArray,
+    StringViewArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array, timezone::Tz,
+};
+use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use serde_json::{Map, Value};
 
 use crate::supertable::schema::{TableSchema, error::SchemaError};
 
 /// Integers above this magnitude are not exactly representable as `f64`.
 const F64_EXACT_INT_BOUND: i128 = 1 << 53;
+/// Integers above this magnitude are not exactly representable as `f32`.
+const F32_EXACT_INT_BOUND: i128 = 1 << 24;
+/// The most significant digits a `Decimal128` holds.
+const DECIMAL128_DIGITS: u32 = 38;
+/// The most significant digits a `Decimal256` holds.
+const DECIMAL256_DIGITS: u32 = 76;
 /// Milliseconds in a day, for `Date64`.
 const MILLIS_PER_DAY: i64 = 86_400_000;
 
@@ -39,6 +54,10 @@ const MILLIS_PER_DAY: i64 = 86_400_000;
 enum Leaf<'a> {
     Scalar(&'a Value),
     List(Vec<Option<&'a Value>>),
+    /// A whole JSON object, kept unflattened because the path names a live
+    /// column whose type is a struct: its keys are that struct's fields, not
+    /// columns of their own.
+    Object(&'a Value),
 }
 
 /// The kind of value a path carries, before a type is chosen for it.
@@ -48,6 +67,10 @@ enum Kind {
     Int,
     Float,
     Str,
+    /// A JSON object filling a struct column. It never mixes with another
+    /// kind and never infers a type of its own — only a column the table
+    /// already declares as a struct takes one.
+    Object,
 }
 
 impl Kind {
@@ -68,6 +91,11 @@ impl Kind {
             Kind::Int => DataType::Int64,
             Kind::Float => DataType::Float64,
             Kind::Str => DataType::LargeUtf8,
+            // Unreachable in practice: a path only takes this kind when the
+            // table already names it a struct, and then the column's own type
+            // is used. Inferring a struct's shape from a document would make
+            // the fields of one row the schema for the rest.
+            Kind::Object => DataType::Struct(Fields::empty()),
         }
     }
 
@@ -121,6 +149,9 @@ impl<'a> Column<'a> {
             .flat_map(|leaf| match leaf {
                 Leaf::Scalar(v) => vec![*v],
                 Leaf::List(vs) => vs.iter().flatten().copied().collect(),
+                // A struct's own values are read per child field when the
+                // array is built, not through the column's scalars.
+                Leaf::Object(_) => Vec::new(),
             })
     }
 
@@ -139,7 +170,22 @@ impl<'a> Column<'a> {
             kinds
                 if matches!(target, Some(DataType::Timestamp(_, _)))
                     && kinds.iter().all(|k| matches!(k, Kind::Str | Kind::Int))
-                    && self.values().all(parses_as_time) =>
+                    && self.values().all(|v| parses_as_time_in(v, target)) =>
+            {
+                Ok(Kind::Str)
+            }
+            // A decimal takes a number or the string spelling of one, so one
+            // batch may carry both and they have to settle together: without
+            // this they are two kinds that do not join, and the batch is
+            // refused before the decimal arm of `resolve_type` is reached.
+            kinds
+                if matches!(
+                    target,
+                    Some(DataType::Decimal128(_, _) | DataType::Decimal256(_, _))
+                ) && kinds
+                    .iter()
+                    .all(|k| matches!(k, Kind::Str | Kind::Int | Kind::Float))
+                    && self.values().all(|v| decimal_fits_type(v, target)) =>
             {
                 Ok(Kind::Str)
             }
@@ -183,6 +229,14 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
     // more distinct keys than the table admits is refused before its
     // columns exist, not after they have been allocated.
     let live_fields = schema.fields().len() as u32;
+    // Whether `path` names a live column stored as a struct, which is what
+    // stops `flatten` descending into the object that fills it.
+    let is_struct_column = |path: &str| {
+        schema
+            .id_of(path)
+            .and_then(|id| schema.fields().iter().find(|f| f.id == id))
+            .is_some_and(|f| matches!(f.data_type, DataType::Struct(_)))
+    };
     let mut new_paths: Vec<String> = Vec::new();
     for (row, value) in rows.iter().enumerate() {
         let object = value.as_object().ok_or_else(|| SchemaError::InvalidRow {
@@ -190,7 +244,14 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
             reason: "a row is a JSON object".to_owned(),
         })?;
         let mut leaves = Vec::new();
-        flatten(object, "", 1, schema.max_depth(), &mut leaves)?;
+        flatten(
+            object,
+            "",
+            1,
+            schema.max_depth(),
+            &mut leaves,
+            &is_struct_column,
+        )?;
         for (path, leaf) in leaves {
             let index = match by_path.get(&path) {
                 Some(&i) => i,
@@ -247,10 +308,6 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
     let mut fields = Vec::with_capacity(columns.len());
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
     for column in &columns {
-        // A path that only ever carried empty arrays creates nothing.
-        if column.kinds.is_empty() {
-            continue;
-        }
         let metadata = HashMap::new();
         // A path the table already has is written in that column's type; a
         // path it does not is inferred from the values.
@@ -261,6 +318,21 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
                 .find(|f| f.id == id)
                 .map(|f| f.data_type.clone())
         });
+        if column.kinds.is_empty() {
+            // Only empty arrays. On a list column the table already has,
+            // that is a row of empty lists and the column's own type says
+            // what they are lists of. On a path the table does not have,
+            // there is no element type to infer and nothing is created.
+            match &target {
+                Some(list @ (DataType::List(_) | DataType::LargeList(_))) if column.list => {
+                    arrays.push(build_array(column, rows.len(), list)?);
+                    fields
+                        .push(Field::new(&column.path, list.clone(), true).with_metadata(metadata));
+                }
+                _ => {}
+            }
+            continue;
+        }
         let kind = column.settle_kind(target.as_ref())?;
         let data_type = resolve_type(column, kind, target.as_ref());
         // A path carrying both integers and floats is a float column, and
@@ -297,9 +369,28 @@ pub fn rows_to_batch(rows: &[Value], schema: &TableSchema) -> Result<RecordBatch
 /// path, every value is a scalar JSON kind, and the kinds seen are kept for
 /// [`Column::settle_kind`] once the column's target type is known.
 fn observe<'a>(column: &mut Column<'a>, leaf: &Leaf<'a>) -> Result<(), SchemaError> {
+    if let Leaf::Object(_) = leaf {
+        if column.list || column.kinds.iter().any(|k| *k != Kind::Object) {
+            return Err(SchemaError::MixedArray {
+                column: column.path.clone(),
+                types: vec!["object".to_owned(), "scalar".to_owned()],
+            });
+        }
+        if !column.kinds.contains(&Kind::Object) {
+            column.kinds.push(Kind::Object);
+        }
+        return Ok(());
+    }
+    if column.kinds.contains(&Kind::Object) {
+        return Err(SchemaError::MixedArray {
+            column: column.path.clone(),
+            types: vec!["object".to_owned(), "scalar".to_owned()],
+        });
+    }
     let (values, list): (Vec<&Value>, bool) = match leaf {
         Leaf::Scalar(v) => (vec![*v], false),
         Leaf::List(vs) => (vs.iter().flatten().copied().collect(), true),
+        Leaf::Object(_) => unreachable!("handled above"),
     };
     let seen_scalars = !column.kinds.is_empty() && !column.list;
     if (column.list && !list) || (seen_scalars && list) {
@@ -342,6 +433,7 @@ fn flatten<'a>(
     depth: u32,
     max_depth: u32,
     out: &mut Vec<(String, Leaf<'a>)>,
+    structs: &dyn Fn(&str) -> bool,
 ) -> Result<(), SchemaError> {
     for (key, value) in object {
         let path = if prefix.is_empty() {
@@ -352,16 +444,30 @@ fn flatten<'a>(
         match value {
             Value::Null => {}
             Value::Object(inner) => {
+                // A column the table declares a struct takes the object
+                // whole. Flattening past it would make `image.url` a second
+                // column beside `image` and leave the declared one null,
+                // which is what `live_prefix_of` refuses.
+                if structs(&path) {
+                    out.push((path, Leaf::Object(value)));
+                    continue;
+                }
                 if depth + 1 > max_depth {
                     return Err(SchemaError::DepthExceeded {
                         cap: max_depth,
                         path,
                     });
                 }
-                flatten(inner, &path, depth + 1, max_depth, out)?;
+                flatten(inner, &path, depth + 1, max_depth, out, structs)?;
             }
             Value::Array(items) => {
                 if items.is_empty() {
+                    // An empty list, which is not the same as no list: a
+                    // column whose only values were `[]` carries no kind to
+                    // type it from and is dropped in `rows_to_batch`, but a
+                    // column the table already has stores the empty list the
+                    // caller sent rather than a null.
+                    out.push((path, Leaf::List(Vec::new())));
                     continue;
                 }
                 if items.iter().all(Value::is_object) {
@@ -382,7 +488,7 @@ fn flatten<'a>(
                                 path,
                             });
                         }
-                        flatten(inner, &path, depth + 1, max_depth, &mut leaves)?;
+                        flatten(inner, &path, depth + 1, max_depth, &mut leaves, structs)?;
                         let before: Vec<usize> = per_path.iter().map(|(_, v)| v.len()).collect();
                         for (leaf_path, leaf) in leaves {
                             let values = match leaf {
@@ -394,7 +500,9 @@ fn flatten<'a>(
                                 // the leaves disagree about what a position
                                 // means, so it is refused rather than stored
                                 // misaligned.
-                                Leaf::List(_) => {
+                                // A struct inside an array of objects is a
+                                // position problem of the same kind.
+                                Leaf::List(_) | Leaf::Object(_) => {
                                     return Err(SchemaError::NestedArray { path: leaf_path });
                                 }
                             };
@@ -424,7 +532,11 @@ fn flatten<'a>(
                     let mut values = Vec::with_capacity(items.len());
                     for item in items {
                         match item {
-                            Value::Null => {}
+                            // A position, not an absence: dropping it would
+                            // shift every element after it one place left,
+                            // and the caller would read back a shorter list
+                            // than they sent.
+                            Value::Null => values.push(None),
                             Value::Array(_) | Value::Object(_) => {
                                 return Err(SchemaError::MixedArray {
                                     column: path,
@@ -434,9 +546,7 @@ fn flatten<'a>(
                             scalar => values.push(Some(scalar)),
                         }
                     }
-                    if !values.is_empty() {
-                        out.push((path, Leaf::List(values)));
-                    }
+                    out.push((path, Leaf::List(values)));
                 }
             }
             scalar => out.push((path, Leaf::Scalar(scalar))),
@@ -462,8 +572,14 @@ fn resolve_type(column: &Column<'_>, kind: Kind, target: Option<&DataType>) -> D
                     .iter()
                     .map(|(_, leaf)| leaf)
                     .all(|leaf| match leaf {
-                        Leaf::List(values) => values.len() == *dim as usize,
-                        Leaf::Scalar(_) => false,
+                        // An empty array is no vector at all and stores a
+                        // null, as it did before empty arrays were kept: a
+                        // vector column has one width and `[]` is not it.
+                        // A row of the right width still fixes the type for
+                        // the column, so one empty cell does not drag the
+                        // whole batch to a plain list.
+                        Leaf::List(values) => values.is_empty() || values.len() == *dim as usize,
+                        Leaf::Scalar(_) | Leaf::Object(_) => false,
                     })
                 && column.values().all(float_in_f32_range);
             if fits {
@@ -474,20 +590,45 @@ fn resolve_type(column: &Column<'_>, kind: Kind, target: Option<&DataType>) -> D
         Some(other) if !column.list => Some(other),
         _ => None,
     };
+    // A struct column's type is the table's: its fields are declared, never
+    // inferred from a document.
+    if kind == Kind::Object
+        && let Some(stored @ DataType::Struct(_)) = target
+    {
+        return stored.clone();
+    }
     let values = || column.values();
     let element = match (kind, scalar_target) {
         (Kind::Int, Some(t)) if is_integer_type(t) && values().all(|v| int_fits(v, t)) => t.clone(),
         (Kind::Int, Some(DataType::Float64)) if values().all(int_exact_in_f64) => DataType::Float64,
-        (Kind::Int | Kind::Float, Some(DataType::Float32)) if values().all(float_exact_in_f32) => {
+        // A float literal into an `f32` column is a request to round: that is
+        // what the narrower column is for, and refusing `0.1` because it is
+        // not a dyadic rational would leave the column unusable from JSON.
+        // Only a value narrowing destroys — one that saturates to an infinity
+        // or collapses to zero — is refused, by `float_in_f32_range`.
+        (Kind::Float, Some(DataType::Float32)) if values().all(float_in_f32_range) => {
             DataType::Float32
         }
+        // An integer is held to the stricter bar, as it is on `Float64`: a
+        // literal past the mantissa is a different integer once stored, not a
+        // coarser one, and the caller asked for the integer they wrote.
+        (Kind::Int, Some(DataType::Float32)) if values().all(int_exact_in_f32) => DataType::Float32,
         (Kind::Str, Some(t @ (DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View))) => {
             t.clone()
         }
-        (Kind::Str, Some(t @ DataType::Timestamp(_, _))) if values().all(parses_as_time) => {
+        (Kind::Int | Kind::Float | Kind::Str, Some(t @ DataType::Decimal128(precision, scale)))
+            if values().all(|v| decimal_fits(v, *precision, *scale, DECIMAL128_DIGITS)) =>
+        {
             t.clone()
         }
-        (Kind::Int, Some(t @ DataType::Timestamp(_, _))) if values().all(parses_as_time) => {
+        (Kind::Int | Kind::Float | Kind::Str, Some(t @ DataType::Decimal256(precision, scale)))
+            if values().all(|v| decimal_fits(v, *precision, *scale, DECIMAL256_DIGITS)) =>
+        {
+            t.clone()
+        }
+        (Kind::Str | Kind::Int, Some(t @ DataType::Timestamp(_, _)))
+            if values().all(|v| parses_as_time_in(v, Some(t))) =>
+        {
             t.clone()
         }
         (Kind::Str, Some(t @ (DataType::Date32 | DataType::Date64)))
@@ -530,6 +671,95 @@ fn as_i128(value: &Value) -> Option<i128> {
         .or_else(|| n.as_u64().map(i128::from))
 }
 
+/// The unscaled integer `value` names in a decimal column of `scale`, as a
+/// decimal string: `12.34` at scale 2 is `1234`. `None` when the value is not
+/// a number, needs more fractional digits than the column keeps, or does not
+/// fit `precision`.
+///
+/// Read from the decimal *text*, never by scaling through an `f64`: `12.34`
+/// has no exact binary form, so multiplying it by 100 as a float yields
+/// `1233.9999…` and truncates to `1233`.
+///
+/// How exact the text is depends on how the value was sent. A **string** is
+/// the digits the caller wrote, and is read exactly. A **number** has already
+/// been through an `f64` by the time it arrives — `serde_json` parses one
+/// without `arbitrary_precision`, so what is left is that `f64`'s shortest
+/// round-tripping form. That carries about 17 significant digits, and a
+/// decimal needing more has to be sent as a string: `12345678.1234567891`
+/// arrives as `12345678.12345679`, and no amount of care here can recover
+/// what the parser already dropped.
+fn decimal_unscaled(value: &Value, precision: u8, scale: i8, max_digits: u32) -> Option<i256> {
+    let text = match value {
+        Value::String(text) => text.trim().to_owned(),
+        Value::Number(number) => number.to_string(),
+        _ => return None,
+    };
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => (-1i32, rest),
+        None => (1i32, text.strip_prefix('+').unwrap_or(&text)),
+    };
+    // An exponent would have to be folded into the scale before the digits
+    // line up; a caller that wants one can send the expanded form.
+    if digits.is_empty() || digits.contains(['e', 'E']) {
+        return None;
+    }
+    let (whole, fraction) = match digits.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (digits, ""),
+    };
+    if !whole
+        .bytes()
+        .chain(fraction.bytes())
+        .all(|b| b.is_ascii_digit())
+        || whole.is_empty() && fraction.is_empty()
+    {
+        return None;
+    }
+    // Rounding is the caller's to do: a value with more fractional digits than
+    // the column keeps would be stored as a different number, silently.
+    let scale_digits = usize::try_from(scale).ok()?;
+    if fraction.len() > scale_digits {
+        return None;
+    }
+    let padded = format!(
+        "{whole}{fraction}{}",
+        "0".repeat(scale_digits - fraction.len())
+    );
+    if padded.len() as u32 > max_digits {
+        return None;
+    }
+    let unscaled = i256::from_string(&padded)?;
+    let unscaled = if sign < 0 {
+        unscaled.checked_neg()?
+    } else {
+        unscaled
+    };
+    // `precision` is the digit count the column declares; a value needing more
+    // is out of range for it.
+    let significant = padded.trim_start_matches('0').len();
+    if significant > usize::from(precision) {
+        return None;
+    }
+    Some(unscaled)
+}
+
+fn decimal_fits(value: &Value, precision: u8, scale: i8, max_digits: u32) -> bool {
+    decimal_unscaled(value, precision, scale, max_digits).is_some()
+}
+
+/// Whether `value` fits `target`, when `target` is a decimal column.
+fn decimal_fits_type(value: &Value, target: Option<&DataType>) -> bool {
+    match target {
+        Some(DataType::Decimal128(precision, scale)) => {
+            decimal_fits(value, *precision, *scale, DECIMAL128_DIGITS)
+        }
+        Some(DataType::Decimal256(precision, scale)) => {
+            decimal_fits(value, *precision, *scale, DECIMAL256_DIGITS)
+        }
+        _ => false,
+    }
+}
+
 fn int_fits(value: &Value, t: &DataType) -> bool {
     let Some(v) = as_i128(value) else {
         return false;
@@ -569,8 +799,10 @@ fn element_of(data_type: &DataType) -> &DataType {
     }
 }
 
-fn float_exact_in_f32(value: &Value) -> bool {
-    value.as_f64().is_some_and(|v| (v as f32) as f64 == v)
+/// Whether the integer `value` holds is one `f32` carries exactly. The
+/// mantissa is 24 bits, so this is the `f32` twin of [`int_exact_in_f64`].
+fn int_exact_in_f32(value: &Value) -> bool {
+    as_i128(value).is_some_and(|v| v.abs() <= F32_EXACT_INT_BOUND)
 }
 
 /// Whether `value` survives narrowing to `f32`. Rounding a coordinate to
@@ -585,27 +817,78 @@ fn float_in_f32_range(value: &Value) -> bool {
     })
 }
 
-/// A string as a point in time: RFC 3339 with an offset, or a naive
-/// `YYYY-MM-DDTHH:MM:SS[.fff]` read as UTC. `None` for anything else.
-fn parse_time(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|t| t.with_timezone(&Utc))
-        .ok()
-        .or_else(|| {
-            NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
-                .ok()
-                .map(|t| t.and_utc())
-        })
+/// The naive forms a timestamp string may take, in the order they are
+/// tried. A naive string names a wall clock with no zone of its own, so the
+/// column's zone decides the instant it marks (see [`parse_time_in`]).
+///
+/// The space-separated form is what Python's `datetime.isoformat(sep=" ")`,
+/// pandas and most SQL shells print, and the date-only form is a day at
+/// midnight.
+const NAIVE_TIME_FORMATS: [&str; 2] = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"];
+
+/// A string as a point in time for a column in `tz`.
+///
+/// A string carrying its own offset (RFC 3339) names an instant outright and
+/// the column's zone does not enter into it. A naive one names a wall clock,
+/// and the instant it marks depends on where that clock is: `10:30` on a
+/// `America/New_York` column is 10:30 in New York, not 10:30 UTC. Reading it
+/// as UTC stores an instant hours from the one the caller wrote, and says
+/// nothing about it — the write succeeds.
+///
+/// `None` for a zone the build cannot resolve, rather than a silent fallback
+/// to UTC, which is the error this exists to prevent.
+fn parse_time_in(s: &str, tz: Option<&str>) -> Option<DateTime<Utc>> {
+    if let Ok(fixed) = DateTime::parse_from_rfc3339(s) {
+        return Some(fixed.with_timezone(&Utc));
+    }
+    let naive = NAIVE_TIME_FORMATS
+        .iter()
+        .find_map(|format| NaiveDateTime::parse_from_str(s, format).ok())
+        .or_else(|| parse_date(s).and_then(|d| d.and_hms_opt(0, 0, 0)))?;
+    match tz {
+        None => Some(naive.and_utc()),
+        Some(name) => {
+            let zone: Tz = name.parse().ok()?;
+            // A wall clock the zone repeats (the autumn fall-back) names two
+            // instants; the earlier is taken. One the zone skips (the
+            // spring-forward gap) names none at all, and `earliest` is
+            // `None` there, so the row is refused rather than moved to an
+            // hour the caller did not write.
+            zone.from_local_datetime(&naive)
+                .earliest()
+                .map(|t| t.with_timezone(&Utc))
+        }
+    }
 }
 
-/// Whether `value` names a point in time: a time string, or an epoch count
-/// a timestamp column can hold. An integer past `i64` names no instant,
-/// and a column that accepted it would hold a null where the literal was.
-fn parses_as_time(value: &Value) -> bool {
-    match as_i128(value) {
-        Some(n) => i64::try_from(n).is_ok(),
-        None => value.as_str().is_some_and(|s| parse_time(s).is_some()),
+/// The epoch count `value` names in `target`'s unit and zone, or `None` when
+/// it names no instant that column can hold.
+///
+/// The unit is part of the question, not just the parse: a nanosecond column
+/// spans about 1678 to 2262, so a date outside it parses perfectly well and
+/// still has no representation here. Answering only "does it parse" is how a
+/// year-3000 date used to be accepted and read back null.
+fn timestamp_value(value: &Value, target: Option<&DataType>) -> Option<i64> {
+    let (unit, tz) = match target {
+        Some(DataType::Timestamp(unit, tz)) => (unit, tz.as_deref()),
+        _ => return None,
+    };
+    // An integer literal is already an epoch count in the column's own unit.
+    if let Some(n) = as_i128(value) {
+        return i64::try_from(n).ok();
     }
+    let at = parse_time_in(value.as_str()?, tz)?;
+    match unit {
+        TimeUnit::Second => Some(at.timestamp()),
+        TimeUnit::Millisecond => Some(at.timestamp_millis()),
+        TimeUnit::Microsecond => Some(at.timestamp_micros()),
+        TimeUnit::Nanosecond => at.timestamp_nanos_opt(),
+    }
+}
+
+/// Whether `value` names a point in time `target` can hold.
+fn parses_as_time_in(value: &Value, target: Option<&DataType>) -> bool {
+    timestamp_value(value, target).is_some()
 }
 
 /// A string as a calendar day, `YYYY-MM-DD`.
@@ -649,35 +932,48 @@ fn build_array(
             }
             let child = build_scalar_array(&column.path, &flat, item.data_type())?;
             let validity = NullBuffer::from(nulls);
-            let array: ArrayRef = if matches!(data_type, DataType::List(_)) {
+            // `try_new`, not `new`: every one of these panics on a shape it
+            // will not build, and the shape comes from a request body.
+            let built = if matches!(data_type, DataType::List(_)) {
                 let offsets = OffsetBuffer::<i32>::new(
                     offsets.iter().map(|&o| o as i32).collect::<Vec<_>>().into(),
                 );
-                Arc::new(ListArray::new(
-                    Arc::clone(item),
-                    offsets,
-                    child,
-                    Some(validity),
-                ))
+                ListArray::try_new(Arc::clone(item), offsets, child, Some(validity))
+                    .map(|a| Arc::new(a) as ArrayRef)
             } else {
                 let offsets = OffsetBuffer::<i64>::new(
                     offsets.iter().map(|&o| o as i64).collect::<Vec<_>>().into(),
                 );
-                Arc::new(LargeListArray::new(
-                    Arc::clone(item),
-                    offsets,
-                    child,
-                    Some(validity),
-                ))
+                LargeListArray::try_new(Arc::clone(item), offsets, child, Some(validity))
+                    .map(|a| Arc::new(a) as ArrayRef)
             };
-            Ok(array)
+            built.map_err(|e| SchemaError::InvalidRow {
+                row: 0,
+                reason: format!("column `{}`: {e}", column.path),
+            })
         }
         DataType::FixedSizeList(item, dim) => {
             let mut flat: Vec<Option<&Value>> = Vec::new();
             let mut nulls = Vec::with_capacity(rows);
-            for cell in column.by_row(rows) {
+            for (row, cell) in column.by_row(rows).enumerate() {
                 match cell {
-                    Some(Leaf::List(values)) => {
+                    // An empty array stores a null: see the matching arm in
+                    // `resolve_type`.
+                    Some(Leaf::List(values)) if !values.is_empty() => {
+                        // A vector with a hole in it is not a vector: nothing
+                        // can measure a distance to it, and with a
+                        // non-nullable element arrow panics rather than
+                        // building it, so a request body must not reach that.
+                        if values.iter().any(Option::is_none) {
+                            return Err(SchemaError::InvalidRow {
+                                row,
+                                reason: format!(
+                                    "column `{}` is a vector of {dim} values and \
+                                     cannot hold a null among them",
+                                    column.path
+                                ),
+                            });
+                        }
                         flat.extend(values.iter().copied());
                         nulls.push(true);
                     }
@@ -688,12 +984,27 @@ fn build_array(
                 }
             }
             let child = build_scalar_array(&column.path, &flat, item.data_type())?;
-            Ok(Arc::new(FixedSizeListArray::new(
+            FixedSizeListArray::try_new(
                 Arc::clone(item),
                 *dim,
                 child,
                 Some(NullBuffer::from(nulls)),
-            )))
+            )
+            .map(|a| Arc::new(a) as ArrayRef)
+            .map_err(|e| SchemaError::InvalidRow {
+                row: 0,
+                reason: format!("column `{}`: {e}", column.path),
+            })
+        }
+        DataType::Struct(fields) => {
+            let values: Vec<Option<&Value>> = column
+                .by_row(rows)
+                .map(|cell| match cell {
+                    Some(Leaf::Object(v)) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            build_struct_array(&column.path, &values, fields)
         }
         scalar => {
             let values: Vec<Option<&Value>> = column
@@ -706,6 +1017,140 @@ fn build_array(
             build_scalar_array(&column.path, &values, scalar)
         }
     }
+}
+
+/// The struct column `fields` declares, read from one JSON object per row.
+///
+/// A field the object does not carry is null, and a key the struct does not
+/// declare is refused: a document cannot add a field to a declared struct,
+/// the way a top-level key adds a column, because the struct's shape is the
+/// table's and a silent drop would lose the value.
+fn build_struct_array(
+    path: &str,
+    values: &[Option<&Value>],
+    fields: &Fields,
+) -> Result<ArrayRef, SchemaError> {
+    let mut nulls = Vec::with_capacity(values.len());
+    let mut objects: Vec<Option<&Map<String, Value>>> = Vec::with_capacity(values.len());
+    for value in values {
+        match value.and_then(|v| v.as_object()) {
+            Some(object) => {
+                for key in object.keys() {
+                    if !fields.iter().any(|f| f.name() == key) {
+                        return Err(SchemaError::UnknownStructField {
+                            column: path.to_owned(),
+                            field: key.clone(),
+                        });
+                    }
+                }
+                nulls.push(true);
+                objects.push(Some(object));
+            }
+            None => {
+                nulls.push(false);
+                objects.push(None);
+            }
+        }
+    }
+    let mut children: Vec<ArrayRef> = Vec::with_capacity(fields.len());
+    for field in fields {
+        let child_path = format!("{path}.{}", field.name());
+        let child: Vec<Option<&Value>> = objects
+            .iter()
+            .map(|object| match object.and_then(|o| o.get(field.name())) {
+                // A key carrying `null` and a key absent are the same thing:
+                // the field has no value in this row.
+                Some(Value::Null) | None => None,
+                Some(value) => Some(value),
+            })
+            .collect();
+        // A field the struct takes no nulls in, absent from an object that is
+        // itself present: arrow refuses to build that and panics doing it, so
+        // a request body must not reach it. The same refusal a top-level
+        // non-nullable column gets from the resolver, which never sees in
+        // here.
+        if !field.is_nullable()
+            && let Some(row) = (0..values.len()).find(|row| nulls[*row] && child[*row].is_none())
+        {
+            return Err(SchemaError::NullInNonNullable {
+                column: format!("{child_path} (row {row})"),
+            });
+        }
+        children.push(build_field_array(&child_path, &child, field.data_type())?);
+    }
+    StructArray::try_new(fields.clone(), children, Some(NullBuffer::from(nulls)))
+        .map(|array| Arc::new(array) as ArrayRef)
+        .map_err(|e| SchemaError::InvalidRow {
+            row: 0,
+            reason: format!("column `{path}`: {e}"),
+        })
+}
+
+/// One field of a struct, held to the declared type the same way a top-level
+/// column is.
+///
+/// A struct's values do not pass through the resolver — the struct is one
+/// column to it, and its fields are already typed — so the check that a
+/// top-level column gets from the resolver has to happen here. Without it
+/// `build_scalar_array` reads what it can and nulls the rest, so a string in
+/// an `Int64` field, a float in it, or a number in a `Utf8` one all stored a
+/// null and answered 200: the silent write this mapper exists to refuse.
+///
+/// The type is chosen from the values exactly as a column's is, and a choice
+/// other than the declared type is the disagreement the resolver would have
+/// refused, reported here with the field's own path.
+fn build_field_array(
+    path: &str,
+    values: &[Option<&Value>],
+    declared: &DataType,
+) -> Result<ArrayRef, SchemaError> {
+    let rows = values.len();
+    let mut column = Column {
+        path: path.to_owned(),
+        cells: Vec::new(),
+        kinds: Vec::new(),
+        list: false,
+    };
+    for (row, value) in values.iter().enumerate() {
+        let Some(value) = value else { continue };
+        let leaf = match value {
+            Value::Array(items) => {
+                let mut elements = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Value::Null => elements.push(None),
+                        Value::Array(_) | Value::Object(_) => {
+                            return Err(SchemaError::MixedArray {
+                                column: path.to_owned(),
+                                types: vec![json_kind_name(item).to_owned()],
+                            });
+                        }
+                        scalar => elements.push(Some(scalar)),
+                    }
+                }
+                Leaf::List(elements)
+            }
+            Value::Object(_) => Leaf::Object(value),
+            scalar => Leaf::Scalar(scalar),
+        };
+        observe(&mut column, &leaf)?;
+        column.cells.push((row, leaf));
+    }
+    // Every value was null or absent: the field is null for every row, in the
+    // type it was declared with.
+    if column.cells.is_empty() {
+        return build_array(&column, rows, declared);
+    }
+    let kind = column.settle_kind(Some(declared))?;
+    let chosen = resolve_type(&column, kind, Some(declared));
+    if &chosen != declared {
+        return Err(SchemaError::TypeMismatch {
+            column: path.to_owned(),
+            frozen: declared.clone(),
+            offered: chosen,
+        });
+    }
+    build_array(&column, rows, declared)
 }
 
 fn build_scalar_array(
@@ -782,6 +1227,59 @@ fn build_scalar_array(
                 .map(|v| v.and_then(Value::as_str))
                 .collect::<Vec<_>>(),
         )),
+        DataType::Decimal128(precision, scale) => {
+            let mut out: Vec<Option<i128>> = Vec::with_capacity(values.len());
+            for value in values {
+                match value {
+                    None => out.push(None),
+                    Some(value) => {
+                        let unscaled =
+                            decimal_unscaled(value, *precision, *scale, DECIMAL128_DIGITS)
+                                .and_then(i256::to_i128)
+                                .ok_or_else(|| SchemaError::ValueOutOfRange {
+                                    column: column.to_owned(),
+                                    value: value.to_string(),
+                                    data_type: data_type.to_string(),
+                                })?;
+                        out.push(Some(unscaled));
+                    }
+                }
+            }
+            Arc::new(
+                Decimal128Array::from(out)
+                    .with_precision_and_scale(*precision, *scale)
+                    .map_err(|e| SchemaError::InvalidRow {
+                        row: 0,
+                        reason: e.to_string(),
+                    })?,
+            )
+        }
+        DataType::Decimal256(precision, scale) => {
+            let mut out: Vec<Option<i256>> = Vec::with_capacity(values.len());
+            for value in values {
+                match value {
+                    None => out.push(None),
+                    Some(value) => {
+                        let unscaled =
+                            decimal_unscaled(value, *precision, *scale, DECIMAL256_DIGITS)
+                                .ok_or_else(|| SchemaError::ValueOutOfRange {
+                                    column: column.to_owned(),
+                                    value: value.to_string(),
+                                    data_type: data_type.to_string(),
+                                })?;
+                        out.push(Some(unscaled));
+                    }
+                }
+            }
+            Arc::new(
+                Decimal256Array::from(out)
+                    .with_precision_and_scale(*precision, *scale)
+                    .map_err(|e| SchemaError::InvalidRow {
+                        row: 0,
+                        reason: e.to_string(),
+                    })?,
+            )
+        }
         DataType::Date32 => Arc::new(Date32Array::from(
             values
                 .iter()
@@ -800,23 +1298,12 @@ fn build_scalar_array(
                 .collect::<Vec<_>>(),
         )),
         DataType::Timestamp(unit, tz) => {
-            // A string is a point in time; an integral literal is already an
-            // epoch count in the column's unit.
+            // The same function the type was chosen with, so a value that
+            // decided the column's type cannot then fail to build and leave
+            // a null where the literal was.
             let stamps: Vec<Option<i64>> = values
                 .iter()
-                .map(|v| {
-                    let v = (*v)?;
-                    if let Some(n) = as_i128(v) {
-                        return i64::try_from(n).ok();
-                    }
-                    let t = parse_time(v.as_str()?)?;
-                    match unit {
-                        TimeUnit::Second => Some(t.timestamp()),
-                        TimeUnit::Millisecond => Some(t.timestamp_millis()),
-                        TimeUnit::Microsecond => Some(t.timestamp_micros()),
-                        TimeUnit::Nanosecond => t.timestamp_nanos_opt(),
-                    }
-                })
+                .map(|v| timestamp_value((*v)?, Some(data_type)))
                 .collect();
             match unit {
                 TimeUnit::Second => {
@@ -848,7 +1335,10 @@ mod tests {
     use arrow_array::{
         Array,
         cast::AsArray,
-        types::{Float64Type, Int32Type, Int64Type},
+        types::{
+            Decimal128Type, Float32Type, Float64Type, Int32Type, Int64Type,
+            TimestampMillisecondType,
+        },
     };
     use serde_json::json;
 
@@ -1232,5 +1722,850 @@ mod tests {
         assert_eq!(b.len(), 2);
         assert!(b.is_null(0));
         assert_eq!(b.value(1), 9);
+    }
+
+    /// An `f32` column takes a decimal literal. Rounding to `f32` precision
+    /// is what the narrower column is for; the guard used to demand the
+    /// value survive the round trip bit-exactly, which only dyadic
+    /// rationals do, so `0.1` was refused and the column was unusable from
+    /// JSON. The vector path already used the range guard.
+    #[test]
+    fn an_f32_column_takes_a_decimal_literal() {
+        let t = table(vec![("score", DataType::Float32)]);
+        let batch = rows_to_batch(&[json!({"score": 0.1}), json!({"score": 2.72})], &t)
+            .expect("0.1 rounds into an f32 column");
+        assert_eq!(types(&batch)["score"], DataType::Float32);
+        let scores = col(&batch, "score").as_primitive::<Float32Type>();
+        assert_eq!(scores.value(0), 0.1f32);
+        assert_eq!(scores.value(1), 2.72f32);
+    }
+
+    /// Rounding is admitted; losing the number is not. A magnitude `f32`
+    /// cannot reach saturates to an infinity, and a nonzero value below its
+    /// smallest subnormal collapses to zero — each a different number
+    /// rather than a coarser one, so the column does not take it and the
+    /// batch carries the `Float64` the literal infers.
+    #[test]
+    fn an_f32_column_refuses_a_value_narrowing_would_destroy() {
+        let t = table(vec![("score", DataType::Float32)]);
+        for value in [json!(1e50), json!(1e-50)] {
+            // The mapper infers and never checks: the column's type is not
+            // taken, so the literal's own `Float64` is, and the resolver
+            // refuses the disagreement as it would an Arrow producer's.
+            let batch = rows_to_batch(&[json!({"score": value})], &t).expect("map");
+            assert_eq!(types(&batch)["score"], DataType::Float64);
+            assert!(
+                matches!(
+                    resolve_batch(&batch, &t, "_id"),
+                    Err(SchemaError::TypeMismatch { column, .. }) if column == "score"
+                ),
+                "{value} should not reach an f32 column"
+            );
+        }
+    }
+
+    /// An integer is held to the exact bar on `f32` as on `f64`: past the
+    /// mantissa it would read back as a different integer.
+    #[test]
+    fn an_integer_past_the_f32_mantissa_does_not_join_an_f32_column() {
+        let t = table(vec![("n", DataType::Float32)]);
+        let fits = rows_to_batch(&[json!({"n": 1 << 24})], &t).expect("2^24 is exact in f32");
+        assert_eq!(types(&fits)["n"], DataType::Float32);
+
+        let past = rows_to_batch(&[json!({"n": (1i64 << 24) + 1})], &t).expect("map");
+        assert_eq!(
+            types(&past)["n"],
+            DataType::Int64,
+            "the column's type is not taken"
+        );
+        assert!(matches!(
+            resolve_batch(&past, &t, "_id"),
+            Err(SchemaError::TypeMismatch { column, .. }) if column == "n"
+        ));
+    }
+
+    /// A null inside an array is a position, not an absence. Dropping it
+    /// shifted every element after it one place left, so a caller read back
+    /// a shorter list than they sent, with a 200.
+    #[test]
+    fn a_null_inside_an_array_keeps_its_position() {
+        let t = table(vec![(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        )]);
+        let batch = rows_to_batch(&[json!({"tags": [1, null, 3]})], &t).expect("the list maps");
+        let lists = col(&batch, "tags").as_list::<i32>();
+        let values = lists.value(0);
+        let values = values.as_primitive::<Int64Type>();
+        assert_eq!(values.len(), 3, "the null holds its place");
+        assert_eq!(values.value(0), 1);
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), 3);
+    }
+
+    /// An empty array is an empty list, not a missing value. On a column the
+    /// table already has, the element type comes from the column, so there
+    /// is nothing to infer and the row stores the empty list it was sent.
+    #[test]
+    fn an_empty_array_is_an_empty_list_on_a_known_column() {
+        let t = table(vec![(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        )]);
+        let batch = rows_to_batch(&[json!({"tags": []})], &t).expect("the empty list maps");
+        let lists = col(&batch, "tags").as_list::<i32>();
+        assert!(!lists.is_null(0), "an empty list is not a null");
+        assert_eq!(lists.value(0).len(), 0);
+    }
+
+    /// A path the table does not have, carrying only empty arrays, still
+    /// creates nothing: there is no element type to infer from no elements.
+    #[test]
+    fn an_empty_array_on_an_unknown_path_creates_no_column() {
+        let batch = rows_to_batch(&[json!({"tags": []})], &table(Vec::new())).expect("maps");
+        assert!(batch.column_by_name("tags").is_none());
+    }
+
+    /// The timestamp spellings a producer actually writes: the
+    /// space-separated form Python and most SQL shells print, and a bare
+    /// date, which is that day at midnight.
+    #[test]
+    fn a_timestamp_column_takes_the_spellings_producers_write() {
+        let t = table(vec![(
+            "at",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        )]);
+        for (sent, expected) in [
+            ("2024-01-15T10:30:00", 1_705_314_600_000i64),
+            ("2024-01-15 10:30:00", 1_705_314_600_000),
+            ("2024-01-15", 1_705_276_800_000),
+            ("2024-01-15T10:30:00Z", 1_705_314_600_000),
+        ] {
+            let batch = rows_to_batch(&[json!({"at": sent})], &t)
+                .unwrap_or_else(|e| panic!("{sent} should parse: {e}"));
+            assert_eq!(
+                types(&batch)["at"],
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                "{sent}"
+            );
+            assert_eq!(
+                col(&batch, "at")
+                    .as_primitive::<TimestampMillisecondType>()
+                    .value(0),
+                expected,
+                "{sent}"
+            );
+        }
+    }
+
+    /// A naive string names a wall clock, and the column's zone says where
+    /// that clock is. Read as UTC it marks an instant hours away, and the
+    /// write succeeds, so the error is silent: `10:30` on a New York column
+    /// used to be stored as `05:30` New York.
+    #[test]
+    fn a_naive_string_is_the_wall_clock_of_the_columns_zone() {
+        let t = table(vec![(
+            "at",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("America/New_York".into())),
+        )]);
+        let batch = rows_to_batch(&[json!({"at": "2024-01-15T10:30:00"})], &t).expect("maps");
+        // 10:30 in New York in January is 15:30 UTC.
+        assert_eq!(
+            col(&batch, "at")
+                .as_primitive::<TimestampMillisecondType>()
+                .value(0),
+            1_705_332_600_000,
+        );
+    }
+
+    /// A string carrying its own offset names an instant outright, so the
+    /// column's zone does not move it.
+    #[test]
+    fn an_offset_in_the_string_wins_over_the_columns_zone() {
+        let t = table(vec![(
+            "at",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("America/New_York".into())),
+        )]);
+        let batch = rows_to_batch(&[json!({"at": "2024-01-15T10:30:00Z"})], &t).expect("maps");
+        assert_eq!(
+            col(&batch, "at")
+                .as_primitive::<TimestampMillisecondType>()
+                .value(0),
+            1_705_314_600_000,
+        );
+    }
+
+    /// A decimal column takes a number or the string spelling of one, and
+    /// the digits are read from the literal rather than through an `f64`:
+    /// `12.34` has no exact binary form, and scaling it as a float gives
+    /// 1233.9999… , which truncates to the wrong unscaled integer.
+    #[test]
+    fn a_decimal_column_takes_numbers_and_their_string_spellings() {
+        let t = table(vec![("amount", DataType::Decimal128(12, 2))]);
+        for sent in [json!(12.34), json!("12.34"), json!("-12.34"), json!(12)] {
+            let batch = rows_to_batch(&[json!({"amount": sent})], &t)
+                .unwrap_or_else(|e| panic!("{sent} should map: {e}"));
+            assert_eq!(types(&batch)["amount"], DataType::Decimal128(12, 2));
+        }
+        // Values chosen because scaling them through an `f64` gets them
+        // wrong: 1.15 * 100 is 114.999…, 8.70 * 100 is 869.999…, and
+        // 1234567.89 * 100 is 123456788.999…, each truncating one low.
+        // Reading the digits is what makes them exact.
+        for (sent, unscaled) in [
+            (json!(1.15), 115i128),
+            (json!("8.70"), 870),
+            (json!(1234567.89), 123_456_789),
+            (json!(12.34), 1234),
+            (json!(-12.34), -1234),
+        ] {
+            let batch = rows_to_batch(&[json!({"amount": sent})], &t)
+                .unwrap_or_else(|e| panic!("{sent} should map: {e}"));
+            assert_eq!(
+                col(&batch, "amount")
+                    .as_primitive::<Decimal128Type>()
+                    .value(0),
+                unscaled,
+                "{sent}: the unscaled integer comes from the digits, not a float"
+            );
+        }
+    }
+
+    /// More fractional digits than the column keeps would be stored as a
+    /// different number. Rounding is the caller's to do.
+    #[test]
+    fn a_decimal_column_refuses_digits_it_would_have_to_drop() {
+        let t = table(vec![("amount", DataType::Decimal128(10, 2))]);
+        let batch = rows_to_batch(&[json!({"amount": "12.345"})], &t).expect("map");
+        assert_eq!(types(&batch)["amount"], DataType::LargeUtf8);
+        assert!(matches!(
+            resolve_batch(&batch, &t, "_id"),
+            Err(SchemaError::TypeMismatch { column, .. }) if column == "amount"
+        ));
+    }
+
+    /// A fractional literal is not an integer, and is left to be refused as
+    /// the type disagreement it is rather than truncated.
+    #[test]
+    fn a_fractional_literal_is_not_an_integer() {
+        let t = table(vec![("n", DataType::Int64)]);
+        let batch = rows_to_batch(&[json!({"n": 1.5})], &t).expect("map");
+        assert_eq!(types(&batch)["n"], DataType::Float64);
+        assert!(matches!(
+            resolve_batch(&batch, &t, "_id"),
+            Err(SchemaError::TypeMismatch { column, .. }) if column == "n"
+        ));
+    }
+
+    /// A number in a text column stays text: the text arm is tried before
+    /// the numeric ones, so `"42"` on a `LargeUtf8` column is the string.
+    #[test]
+    fn a_numeric_string_in_a_text_column_stays_text() {
+        let t = table(vec![("s", DataType::LargeUtf8)]);
+        let batch = rows_to_batch(&[json!({"s": "42"})], &t).expect("maps");
+        assert_eq!(types(&batch)["s"], DataType::LargeUtf8);
+    }
+
+    /// A quoted number is a string, on a numeric column as anywhere else.
+    /// The engine stores the literal kind the caller wrote; the exceptions
+    /// are the types JSON cannot spell at all, where a string is the only
+    /// transport there is: a timestamp, a date, and a decimal.
+    #[test]
+    fn a_quoted_number_is_not_a_number() {
+        for column in [DataType::Int64, DataType::Float64, DataType::Float32] {
+            let t = table(vec![("n", column.clone())]);
+            let batch = rows_to_batch(&[json!({"n": "42"})], &t).expect("map");
+            assert_eq!(types(&batch)["n"], DataType::LargeUtf8, "{column}");
+            assert!(
+                matches!(
+                    resolve_batch(&batch, &t, "_id"),
+                    Err(SchemaError::TypeMismatch { column: c, .. }) if c == "n"
+                ),
+                "{column}"
+            );
+        }
+        // The exceptions: a quoted decimal and a quoted timestamp are read.
+        let decimal = table(vec![("d", DataType::Decimal128(10, 2))]);
+        rows_to_batch(&[json!({"d": "12.34"})], &decimal).expect("a quoted decimal is read");
+        let stamp = table(vec![(
+            "at",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        )]);
+        rows_to_batch(&[json!({"at": "2024-01-15"})], &stamp).expect("a quoted date is read");
+    }
+
+    /// A string on a path the table does not have is still a string: the
+    /// numeric arms need a column to read the type from.
+    #[test]
+    fn a_numeric_string_on_an_unknown_path_is_text() {
+        let batch = rows_to_batch(&[json!({"s": "42"})], &table(Vec::new())).expect("maps");
+        assert_eq!(types(&batch)["s"], DataType::LargeUtf8);
+    }
+
+    /// A document fills a struct column rather than flattening past it.
+    /// `{"image": {"url": …}}` used to become the path `image.url`, which
+    /// nests under the live `image` column and was refused outright.
+    #[test]
+    fn a_document_fills_a_struct_column() {
+        let t = table(vec![(
+            "image",
+            DataType::Struct(Fields::from(vec![
+                Field::new("url", DataType::Utf8, true),
+                Field::new("width", DataType::Int32, true),
+            ])),
+        )]);
+        let batch = rows_to_batch(
+            &[
+                json!({"image": {"url": "a.png", "width": 10}}),
+                // A field the object leaves out is null, as a column a row
+                // leaves out is.
+                json!({"image": {"url": "b.png"}}),
+                json!({"other": 1}),
+            ],
+            &t,
+        )
+        .expect("the documents fill the struct");
+        assert_eq!(
+            types(&batch)["image"],
+            DataType::Struct(Fields::from(vec![
+                Field::new("url", DataType::Utf8, true),
+                Field::new("width", DataType::Int32, true),
+            ]))
+        );
+        let images = col(&batch, "image").as_struct();
+        let urls = images
+            .column_by_name("url")
+            .expect("url")
+            .as_string::<i32>();
+        let widths = images
+            .column_by_name("width")
+            .expect("width")
+            .as_primitive::<Int32Type>();
+        assert_eq!(urls.value(0), "a.png");
+        assert_eq!(widths.value(0), 10);
+        assert_eq!(urls.value(1), "b.png");
+        assert!(widths.is_null(1), "a field the object omits is null");
+        assert!(images.is_null(2), "a row that omits the column is null");
+    }
+
+    /// A struct nested in a struct is filled the same way.
+    #[test]
+    fn a_nested_struct_column_is_filled_too() {
+        let inner = Fields::from(vec![Field::new("city", DataType::Utf8, true)]);
+        let t = table(vec![(
+            "owner",
+            DataType::Struct(Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("address", DataType::Struct(inner), true),
+            ])),
+        )]);
+        let batch = rows_to_batch(
+            &[json!({"owner": {"name": "ada", "address": {"city": "london"}}})],
+            &t,
+        )
+        .expect("the nested struct fills");
+        let owner = col(&batch, "owner").as_struct();
+        let address = owner
+            .column_by_name("address")
+            .expect("address")
+            .as_struct();
+        assert_eq!(
+            address
+                .column_by_name("city")
+                .expect("city")
+                .as_string::<i32>()
+                .value(0),
+            "london"
+        );
+    }
+
+    /// A struct's fields are the table's. A top-level key the table has not
+    /// seen adds a column; a key a declared struct does not have is a
+    /// mistake, and storing the row without it would lose the value.
+    #[test]
+    fn a_key_a_struct_column_does_not_declare_is_refused() {
+        let t = table(vec![(
+            "image",
+            DataType::Struct(Fields::from(vec![Field::new("url", DataType::Utf8, true)])),
+        )]);
+        let err = rows_to_batch(&[json!({"image": {"url": "a", "height": 1}})], &t)
+            .expect_err("`height` is not a field of the struct");
+        assert!(
+            matches!(
+                &err,
+                SchemaError::UnknownStructField { column, field }
+                    if column == "image" && field == "height"
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A column the table does not declare a struct still flattens, so a
+    /// document cannot grow a column beneath a live scalar one.
+    #[test]
+    fn a_document_still_cannot_nest_under_a_scalar_column() {
+        let t = table(vec![("image", DataType::Utf8)]);
+        let err = rows_to_batch(&[json!({"image": {"url": "a"}})], &t)
+            .expect_err("a scalar column is not filled by an object");
+        assert!(
+            matches!(&err, SchemaError::PathShadowsColumn { column, .. } if column == "image"),
+            "{err:?}"
+        );
+    }
+
+    /// A path the table does not have still flattens to dot paths, which is
+    /// how a document grows new columns.
+    #[test]
+    fn an_unknown_path_still_flattens_to_dot_paths() {
+        let batch = rows_to_batch(&[json!({"a": {"b": 1}})], &table(Vec::new())).expect("maps");
+        assert_eq!(types(&batch)["a.b"], DataType::Int64);
+    }
+
+    /// A struct's fields are held to their declared types, as a top-level
+    /// column is. The struct is one column to the resolver and its fields
+    /// never reach it, so without a check here `build_scalar_array` read
+    /// what it could and nulled the rest: every row below answered 200 and
+    /// stored a null where the value was.
+    #[test]
+    fn a_struct_field_is_held_to_its_declared_type() {
+        let t = table(vec![(
+            "image",
+            DataType::Struct(Fields::from(vec![
+                Field::new("url", DataType::Utf8, true),
+                Field::new("w", DataType::Int64, true),
+                Field::new("ok", DataType::Boolean, true),
+                Field::new("f", DataType::Float32, true),
+            ])),
+        )]);
+        for (row, field) in [
+            (json!({"image": {"w": "wide"}}), "image.w"),
+            (json!({"image": {"w": 1.5}}), "image.w"),
+            (json!({"image": {"url": 5}}), "image.url"),
+            (json!({"image": {"ok": "yes"}}), "image.ok"),
+            // Narrowing destroys this one rather than coarsening it, which
+            // an `f32` column refuses at the top level too.
+            (json!({"image": {"f": 1e50}}), "image.f"),
+        ] {
+            let err = rows_to_batch(std::slice::from_ref(&row), &t)
+                .expect_err("the field does not take that value");
+            assert!(
+                matches!(&err, SchemaError::TypeMismatch { column, .. } if column == field),
+                "{row}: {err:?}"
+            );
+        }
+    }
+
+    /// The values a struct field does take are the ones its type takes
+    /// anywhere else, including a list field, which had no builder at all.
+    #[test]
+    fn a_struct_field_takes_what_its_type_takes() {
+        let t = table(vec![(
+            "s",
+            DataType::Struct(Fields::from(vec![
+                Field::new("f", DataType::Float32, true),
+                Field::new("at", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+                Field::new(
+                    "l",
+                    DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                    true,
+                ),
+            ])),
+        )]);
+        let batch = rows_to_batch(
+            &[json!({"s": {"f": 0.1, "at": "2024-01-15 10:30:00", "l": [1, 2]}})],
+            &t,
+        )
+        .expect("each field takes what its own type takes");
+        let s = col(&batch, "s").as_struct();
+        assert_eq!(
+            s.column_by_name("f")
+                .expect("f")
+                .as_primitive::<Float32Type>()
+                .value(0),
+            0.1f32
+        );
+        assert_eq!(
+            s.column_by_name("at")
+                .expect("at")
+                .as_primitive::<TimestampMillisecondType>()
+                .value(0),
+            1_705_314_600_000
+        );
+        assert_eq!(
+            s.column_by_name("l")
+                .expect("l")
+                .as_list::<i32>()
+                .value(0)
+                .len(),
+            2
+        );
+    }
+
+    /// A vector with a hole is not a vector: nothing can measure a distance
+    /// to it. Keeping nulls in arrays made the length match `dim`, so one
+    /// reached the builder, and with a non-nullable element arrow panicked
+    /// rather than building it — a crash reachable from a request body.
+    #[test]
+    fn a_null_inside_a_vector_is_refused_rather_than_stored_or_panicked() {
+        for nullable in [true, false] {
+            let t = table(vec![(
+                "emb",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, nullable)),
+                    3,
+                ),
+            )]);
+            let err = rows_to_batch(&[json!({"emb": [0.1, null, 0.3]})], &t)
+                .expect_err("a hole in a vector is refused");
+            assert!(
+                matches!(&err, SchemaError::InvalidRow { reason, .. } if reason.contains("null")),
+                "nullable={nullable}: {err:?}"
+            );
+        }
+    }
+
+    /// An empty array on a vector column is a null, as it was before empty
+    /// arrays were kept. A vector column has one width and `[]` is not it,
+    /// and refusing it would take the whole batch down with it.
+    #[test]
+    fn an_empty_array_on_a_vector_column_is_a_null() {
+        let t = table(vec![(
+            "emb",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 3),
+        )]);
+        let batch = rows_to_batch(&[json!({"emb": []}), json!({"emb": [0.1, 0.2, 0.3]})], &t)
+            .expect("the empty cell is a null and the batch still types");
+        let vectors = col(&batch, "emb").as_fixed_size_list();
+        assert!(vectors.is_null(0), "an empty array stores a null");
+        assert!(!vectors.is_null(1));
+    }
+
+    /// A decimal column takes a number and a string in one batch. They are
+    /// two kinds that do not join, so without an arm for the decimal target
+    /// the batch was refused before the decimal arm could be reached.
+    #[test]
+    fn a_decimal_column_takes_a_number_and_a_string_in_one_batch() {
+        let t = table(vec![("a", DataType::Decimal128(10, 2))]);
+        let batch = rows_to_batch(&[json!({"a": 12.34}), json!({"a": "1.5"})], &t)
+            .expect("both spellings settle together");
+        let amounts = col(&batch, "a").as_primitive::<Decimal128Type>();
+        assert_eq!(amounts.value(0), 1234);
+        assert_eq!(amounts.value(1), 150);
+    }
+
+    /// A string carries the digits the caller wrote; a number carries only
+    /// what an `f64` kept of them, because `serde_json` parsed it to one
+    /// before the mapper saw it. A decimal needing more than that has to be
+    /// sent as a string.
+    #[test]
+    fn a_decimal_past_an_f64s_precision_needs_the_string_spelling() {
+        let t = table(vec![("amount", DataType::Decimal128(38, 10))]);
+        let exact = rows_to_batch(&[json!({"amount": "12345678.1234567891"})], &t)
+            .expect("the string is read digit for digit");
+        assert_eq!(
+            col(&exact, "amount")
+                .as_primitive::<Decimal128Type>()
+                .value(0),
+            123_456_781_234_567_891
+        );
+        // Parsed from text, as a request body is, so the rounding happens
+        // where it really happens: in the JSON parser, before the mapper.
+        let sent: Value =
+            serde_json::from_str(r#"{"amount": 12345678.1234567891}"#).expect("a number literal");
+        let through_f64 =
+            rows_to_batch(&[sent], &t).expect("the number is read to the precision it still has");
+        assert_eq!(
+            col(&through_f64, "amount")
+                .as_primitive::<Decimal128Type>()
+                .value(0),
+            123_456_781_234_567_900,
+            "the parser rounded before the mapper saw it"
+        );
+    }
+
+    /// A wall clock the zone repeats names two instants and takes the
+    /// earlier; one the zone skips names none and is refused, rather than
+    /// being moved to an hour the caller did not write.
+    #[test]
+    fn a_wall_clock_the_zone_repeats_or_skips() {
+        let t = table(vec![(
+            "at",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("America/New_York".into())),
+        )]);
+        // 01:30 on the fall-back day happens twice; the first is 05:30 UTC.
+        let repeated = rows_to_batch(&[json!({"at": "2024-11-03T01:30:00"})], &t)
+            .expect("a repeated hour takes the earlier instant");
+        assert_eq!(
+            col(&repeated, "at")
+                .as_primitive::<TimestampMillisecondType>()
+                .value(0),
+            1_730_611_800_000
+        );
+        // 02:30 on the spring-forward day never happens.
+        let skipped = rows_to_batch(&[json!({"at": "2024-03-10T02:30:00"})], &t).expect("map");
+        assert_eq!(
+            types(&skipped)["at"],
+            DataType::LargeUtf8,
+            "the column's type is not taken for a clock that names no instant"
+        );
+        assert!(matches!(
+            resolve_batch(&skipped, &t, "_id"),
+            Err(SchemaError::TypeMismatch { column, .. }) if column == "at"
+        ));
+    }
+
+    /// A timestamp must fit the column's unit, not merely parse. A
+    /// nanosecond column spans about 1678 to 2262, so a year-3000 date
+    /// parses and still has no representation; it used to be accepted and
+    /// read back null.
+    #[test]
+    fn a_time_outside_the_columns_unit_is_refused_not_nulled() {
+        let ns = table(vec![(
+            "at",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        )]);
+        let batch = rows_to_batch(&[json!({"at": "3000-01-01"})], &ns).expect("map");
+        assert_eq!(types(&batch)["at"], DataType::LargeUtf8);
+        assert!(matches!(
+            resolve_batch(&batch, &ns, "_id"),
+            Err(SchemaError::TypeMismatch { column, .. }) if column == "at"
+        ));
+        // The same date fits a millisecond column, which spans far wider.
+        let ms = table(vec![(
+            "at",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        )]);
+        let batch = rows_to_batch(&[json!({"at": "3000-01-01"})], &ms).expect("map");
+        assert_eq!(
+            types(&batch)["at"],
+            DataType::Timestamp(TimeUnit::Millisecond, None)
+        );
+    }
+
+    /// A field the struct takes no nulls in, absent from an object that is
+    /// itself present, is refused. Arrow will not build that struct and
+    /// panics rather than returning an error, so a request body must not
+    /// reach it — the same crash shape as a null inside a vector.
+    #[test]
+    fn a_null_in_a_non_nullable_struct_field_is_refused_rather_than_panicked() {
+        let t = table(vec![(
+            "s",
+            DataType::Struct(Fields::from(vec![Field::new("n", DataType::Int64, false)])),
+        )]);
+        for row in [json!({"s": {}}), json!({"s": {"n": null}})] {
+            let err = rows_to_batch(std::slice::from_ref(&row), &t)
+                .expect_err("the field takes no nulls");
+            assert!(
+                matches!(&err, SchemaError::NullInNonNullable { column } if column.contains("s.n")),
+                "{row}: {err:?}"
+            );
+        }
+        // The struct itself being absent is fine: the null is masked by the
+        // struct's own null, which is what the field's nullability is about.
+        rows_to_batch(&[json!({"other": 1})], &t).expect("an absent struct is a null struct");
+    }
+
+    /// A struct column sent as something that is not an object is the type
+    /// disagreement it looks like, not a panic and not a silent null.
+    #[test]
+    fn a_struct_column_sent_as_a_scalar_or_an_array_is_refused() {
+        let t = table(vec![(
+            "s",
+            DataType::Struct(Fields::from(vec![Field::new("n", DataType::Int64, true)])),
+        )]);
+        for row in [json!({"s": 5}), json!({"s": [1, 2]})] {
+            let batch = rows_to_batch(std::slice::from_ref(&row), &t).expect("map");
+            assert!(
+                matches!(
+                    resolve_batch(&batch, &t, "_id"),
+                    Err(SchemaError::TypeMismatch { column, .. }) if column == "s"
+                ),
+                "{row}"
+            );
+        }
+    }
+
+    /// A struct holds the same types a top-level column does, and each is
+    /// built the same way: the field machinery dispatches on the declared
+    /// type rather than knowing a fixed list of scalars.
+    #[test]
+    fn a_struct_field_may_be_a_vector_a_decimal_or_a_nested_struct() {
+        let t = table(vec![(
+            "s",
+            DataType::Struct(Fields::from(vec![
+                Field::new(
+                    "emb",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        3,
+                    ),
+                    true,
+                ),
+                Field::new("d", DataType::Decimal128(10, 2), true),
+                Field::new(
+                    "in",
+                    DataType::Struct(Fields::from(vec![Field::new(
+                        "deep",
+                        DataType::Int64,
+                        true,
+                    )])),
+                    true,
+                ),
+            ])),
+        )]);
+        let batch = rows_to_batch(
+            &[json!({"s": {"emb": [0.1, 0.2, 0.3], "d": "1.5", "in": {"deep": 7}}})],
+            &t,
+        )
+        .expect("every field builds in its own type");
+        let s = col(&batch, "s").as_struct();
+        assert_eq!(
+            s.column_by_name("emb")
+                .expect("emb")
+                .as_fixed_size_list()
+                .value(0)
+                .len(),
+            3
+        );
+        assert_eq!(
+            s.column_by_name("d")
+                .expect("d")
+                .as_primitive::<Decimal128Type>()
+                .value(0),
+            150
+        );
+        assert_eq!(
+            s.column_by_name("in")
+                .expect("in")
+                .as_struct()
+                .column_by_name("deep")
+                .expect("deep")
+                .as_primitive::<Int64Type>()
+                .value(0),
+            7
+        );
+    }
+
+    /// A key a nested struct does not declare is named by its full path, so
+    /// the message says which struct is missing the field.
+    #[test]
+    fn an_unknown_field_in_a_nested_struct_names_its_path() {
+        let t = table(vec![(
+            "s",
+            DataType::Struct(Fields::from(vec![Field::new(
+                "in",
+                DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int64, true)])),
+                true,
+            )])),
+        )]);
+        let err = rows_to_batch(&[json!({"s": {"in": {"b": 1}}})], &t)
+            .expect_err("`b` is not a field of the inner struct");
+        assert!(
+            matches!(
+                &err,
+                SchemaError::UnknownStructField { column, field }
+                    if column == "s.in" && field == "b"
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A vector of the wrong width is a type disagreement, not a truncation
+    /// and not a null.
+    #[test]
+    fn a_vector_of_the_wrong_width_is_refused() {
+        let t = table(vec![(
+            "emb",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 3),
+        )]);
+        let batch = rows_to_batch(&[json!({"emb": [0.1, 0.2]})], &t).expect("map");
+        assert!(matches!(
+            resolve_batch(&batch, &t, "_id"),
+            Err(SchemaError::TypeMismatch { column, .. }) if column == "emb"
+        ));
+    }
+
+    /// A zone the build cannot resolve refuses the value rather than falling
+    /// back to UTC, which would be the silent hours-off write the zone
+    /// handling exists to prevent.
+    #[test]
+    fn a_zone_that_cannot_be_resolved_refuses_the_value() {
+        let t = table(vec![(
+            "at",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("Mars/Olympus".into())),
+        )]);
+        let batch = rows_to_batch(&[json!({"at": "2024-01-15T10:30:00"})], &t).expect("map");
+        assert_eq!(types(&batch)["at"], DataType::LargeUtf8);
+        assert!(matches!(
+            resolve_batch(&batch, &t, "_id"),
+            Err(SchemaError::TypeMismatch { column, .. }) if column == "at"
+        ));
+    }
+
+    /// The new readers work inside a list, since a list resolves its element
+    /// against the column's item type and builds through the same path.
+    #[test]
+    fn a_list_carries_the_element_types_the_column_declares() {
+        for (item, sent, label) in [
+            (DataType::Float32, json!([0.1]), "f32 rounds"),
+            (
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                json!(["2024-01-15"]),
+                "a bare date",
+            ),
+            (
+                DataType::Decimal128(10, 2),
+                json!(["1.5"]),
+                "a quoted decimal",
+            ),
+        ] {
+            let t = table(vec![(
+                "xs",
+                DataType::List(Arc::new(Field::new("item", item.clone(), true))),
+            )]);
+            let batch = rows_to_batch(&[json!({"xs": sent})], &t)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(
+                types(&batch)["xs"],
+                DataType::List(Arc::new(Field::new("item", item, true))),
+                "{label}"
+            );
+        }
+    }
+
+    /// The decimal reader's edges, each refused rather than stored as a
+    /// different number: more digits than `precision`, a scale the column
+    /// does not keep, an exponent the digits would have to be shifted by,
+    /// and a negative scale, which this reader does not spell.
+    #[test]
+    fn the_decimal_reader_refuses_what_it_cannot_store_exactly() {
+        for (column, sent, label) in [
+            (
+                DataType::Decimal128(5, 2),
+                json!("99999999.99"),
+                "past precision",
+            ),
+            (DataType::Decimal128(10, 2), json!("12.345"), "past scale"),
+            (DataType::Decimal128(10, 2), json!("1.5e2"), "an exponent"),
+            (
+                DataType::Decimal128(10, -2),
+                json!("1500"),
+                "a negative scale",
+            ),
+        ] {
+            let t = table(vec![("d", column)]);
+            let batch = rows_to_batch(&[json!({"d": sent})], &t).expect("map");
+            assert!(
+                matches!(
+                    resolve_batch(&batch, &t, "_id"),
+                    Err(SchemaError::TypeMismatch { column, .. }) if column == "d"
+                ),
+                "{label}"
+            );
+        }
+        // Decimal256 and a zero scale are read on the same terms.
+        let wide = table(vec![("d", DataType::Decimal256(40, 3))]);
+        rows_to_batch(&[json!({"d": "1.5"})], &wide).expect("Decimal256 reads");
+        let whole = table(vec![("d", DataType::Decimal128(10, 0))]);
+        rows_to_batch(&[json!({"d": 12})], &whole).expect("scale 0 reads");
     }
 }
