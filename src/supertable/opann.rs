@@ -2471,6 +2471,14 @@ impl WidthLawCalibration {
         let k_max = WIDTH_LAW_MAX_K;
         let rl = self.rerank.as_ref();
         let mut est_of = vec![f32::NEG_INFINITY; frozen.ids.len()];
+        // Each query's k-th best distance so far. A row farther than that can
+        // never enter the query's top-k, so it is not pushed only to be
+        // truncated away at the end of this chunk.
+        let bound: Vec<Option<f32>> = sink
+            .partial
+            .iter()
+            .map(|cand| kth_distance(cand, k_max))
+            .collect();
         for row in rows {
             if let Some(rl) = rl
                 && row.rabitq_code.len() == rl.quant.code_bytes()
@@ -2532,7 +2540,9 @@ impl WidthLawCalibration {
                 // self-hit exclusion above is the guard that keeps the query's
                 // own row out of both).
                 let dist = distance(self.metric, q, scratch);
-                sink.partial[qi].push((dist, cell, row.stable_id, est_of[qi]));
+                if bound[qi].is_none_or(|b| dist.total_cmp(&b) != Ordering::Greater) {
+                    sink.partial[qi].push((dist, cell, row.stable_id, est_of[qi]));
+                }
                 if let (Some(ctx), Some(flat)) = (fanout, flat)
                     && let Some(&rank) = ctx.selection[qi].get(&flat)
                 {
@@ -2977,12 +2987,26 @@ fn merge_candidates(
     truncate_ascending(acc, cap);
 }
 
-/// Keep the ascending-best `cap` candidates in place.
+/// Keep the ascending-best `cap` candidates in place. Ties on distance break
+/// on stable id, then cell, so the kept set never depends on input order.
 fn truncate_ascending(cand: &mut Vec<(f32, u32, i128, f32)>, cap: usize) {
     if cand.len() > cap {
-        cand.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        cand.sort_unstable_by(|a, b| {
+            a.0.total_cmp(&b.0)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.1.cmp(&b.1))
+        });
         cand.truncate(cap);
     }
+}
+
+/// The largest distance in `cand` once it holds `cap` candidates, compared
+/// the way [`truncate_ascending`] keeps them; `None` while it holds fewer.
+fn kth_distance(cand: &[(f32, u32, i128, f32)], cap: usize) -> Option<f32> {
+    if cand.len() < cap {
+        return None;
+    }
+    cand.iter().map(|c| c.0).max_by(f32::total_cmp)
 }
 
 /// One pass-1 shortlist candidate, ordered by 1-bit estimate (higher = nearer).
@@ -3353,6 +3377,211 @@ mod tests {
             "top-10 coverage needs the rank-2 cluster"
         );
         assert_eq!(&laws.fine_for_k[2..], &[0, 0], "unsupported points stay 0");
+    }
+
+    /// Exact scoring skips a row once it is farther than the query's current
+    /// k-th best. That must not change what is kept: per query, the merged
+    /// top-k equals a brute-force top-k over every row, ties included. The cell
+    /// spans several score chunks, so the bound is active, and repeats each
+    /// vector under several ids, so distance ties straddle the cutoff.
+    #[test]
+    fn exact_scoring_keeps_the_brute_force_top_k() {
+        const DIM: usize = 16;
+        /// Rows in the one scored cell: three chunks, well past the cap.
+        const ROWS: usize = 3 * WIDTH_LAW_SCORE_CHUNK;
+        /// Copies of each vector, one per chunk. Three, so the k-th slot
+        /// (1000 = 3 x 333 + 1) splits a group of equal distances.
+        const COPIES: usize = 3;
+        /// Distinct vectors.
+        const DISTINCT: usize = ROWS / COPIES;
+        const N_CELLS: usize = 4;
+        const N_QUERIES: usize = 5;
+        const QUERY_ID_BASE: i128 = 900_000;
+        const { assert!(ROWS > WIDTH_LAW_MAX_K + WIDTH_LAW_SCORE_CHUNK) };
+
+        let mut cents = vec![0f32; N_CELLS * DIM];
+        for c in 0..N_CELLS {
+            cents[c * DIM + c] = 1.0;
+        }
+        let grid = ClusterCentroids::from_fp32(
+            N_CELLS as u32,
+            DIM as u32,
+            &cents,
+            vec![ROWS as u32; N_CELLS],
+        );
+        let scale: Arc<[f32]> = Arc::from(vec![1.0f32; DIM]);
+        let offset: Arc<[f32]> = Arc::from(vec![0.0f32; DIM]);
+        let make_row = |stable_id: i128, seed: u32| {
+            let codes: Vec<u8> = (0..DIM)
+                .map(|d| ((seed.wrapping_mul(131).wrapping_add(d as u32 * 17)) % 200 + 20) as u8)
+                .collect();
+            MaterializedIvfRow {
+                local_doc_id: stable_id as u32,
+                stable_id,
+                cluster: 0,
+                rabitq_code: vec![(seed % 251) as u8; DIM.div_ceil(8)],
+                encoded: EncodedCellRow {
+                    stable_id,
+                    rerank_codec: RerankCodec::Sq8FixedResidual,
+                    scale: Arc::clone(&scale),
+                    offset: Arc::clone(&offset),
+                    codes,
+                    residuals: vec![0u8; DIM],
+                    norm_sq: Some(1.0),
+                },
+            }
+        };
+        // Ids count down, so a vector's later copies (later chunks) have the
+        // lower ids and win the tie: skipping them would keep the wrong copy.
+        let rows: Vec<MaterializedIvfRow> = (0..ROWS)
+            .map(|i| make_row((ROWS - i) as i128, (i % DISTINCT) as u32 + 1))
+            .collect();
+        let query_rows: Vec<MaterializedIvfRow> = (0..N_QUERIES)
+            .map(|q| make_row(QUERY_ID_BASE + q as i128, (7 + q * 1000) as u32))
+            .collect();
+
+        for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
+            let mut cal = WidthLawCalibration::new(DIM, metric, shipped_target_recall());
+            for qr in &query_rows {
+                cal.offer(qr);
+            }
+            cal.freeze(&grid, 0x1234_5678, RERANK_LAW_POOL_CELLS);
+            cal.score_rows(0, &rows, None).expect("score_rows");
+
+            let frozen = cal.frozen.as_ref().expect("frozen queries");
+            let tops = cal.tops.lock().unwrap_or_else(PoisonError::into_inner);
+            let key = |c: &(f32, u32, i128, f32)| (c.0.to_bits(), c.2, c.1);
+            let mut scratch = vec![0f32; DIM];
+            for (qi, q) in frozen.queries.chunks_exact(DIM).enumerate() {
+                let mut all: Vec<(f32, u32, i128, f32)> = Vec::with_capacity(ROWS);
+                for row in &rows {
+                    dequantize_row_into(&row.encoded, &mut scratch);
+                    if metric == Metric::Cosine {
+                        normalize(&mut scratch);
+                    }
+                    all.push((distance(metric, q, &scratch), 0, row.stable_id, 0.0));
+                }
+                truncate_ascending(&mut all, WIDTH_LAW_MAX_K);
+                let mut want: Vec<_> = all.iter().map(key).collect();
+                let mut got: Vec<_> = tops[qi].iter().map(key).collect();
+                want.sort_unstable();
+                got.sort_unstable();
+                assert_eq!(got, want, "{metric:?} query {qi}: kept top-k differs");
+            }
+        }
+    }
+
+    /// The scoring bound skips only rows strictly farther than a query's k-th
+    /// best. A later row that ties it exactly, under a lower id, must still be
+    /// kept: it wins the tie, so the kept top-k must swap it in.
+    #[test]
+    fn exact_scoring_keeps_a_later_row_that_ties_the_kth_distance() {
+        const DIM: usize = 16;
+        const N_CELLS: usize = 4;
+        /// Ids of the first chunk's rows, all above the tying copy's id.
+        const FIRST_ID_BASE: i128 = 10_000;
+        /// Ids of the second chunk's far rows.
+        const FAR_ID_BASE: i128 = 20_000;
+        /// The tying copy's id: lower than every other row's.
+        const TIE_ID: i128 = 1;
+        const QUERY_ID: i128 = 900_000;
+        const QUERY_SEED: u32 = 7;
+        /// Odd multiplier mixing a row's seed and dimension into its codes.
+        const CODE_HASH_MUL: u64 = 0x9E37_79B9_7F4A_7C15;
+        /// High bits of the mixed hash are the well-spread ones.
+        const CODE_HASH_SHIFT: u32 = 40;
+        /// Codes land in `CODE_FLOOR..CODE_FLOOR + CODE_SPAN`.
+        const CODE_SPAN: u64 = 200;
+        const CODE_FLOOR: u64 = 20;
+        const { assert!(WIDTH_LAW_SCORE_CHUNK > WIDTH_LAW_MAX_K) };
+
+        let mut cents = vec![0f32; N_CELLS * DIM];
+        for c in 0..N_CELLS {
+            cents[c * DIM + c] = 1.0;
+        }
+        let grid =
+            ClusterCentroids::from_fp32(N_CELLS as u32, DIM as u32, &cents, vec![1; N_CELLS]);
+        let scale: Arc<[f32]> = Arc::from(vec![1.0f32; DIM]);
+        let offset: Arc<[f32]> = Arc::from(vec![0.0f32; DIM]);
+        let make_row = |stable_id: i128, seed: u32| {
+            // Hashed per (seed, dim), so distinct seeds give distinct rows.
+            let codes: Vec<u8> = (0..DIM)
+                .map(|d| {
+                    let h = u64::from(seed)
+                        .wrapping_mul(CODE_HASH_MUL)
+                        .wrapping_add(d as u64)
+                        .wrapping_mul(CODE_HASH_MUL);
+                    ((h >> CODE_HASH_SHIFT) % CODE_SPAN + CODE_FLOOR) as u8
+                })
+                .collect();
+            MaterializedIvfRow {
+                local_doc_id: 0,
+                stable_id,
+                cluster: 0,
+                rabitq_code: vec![(seed % 251) as u8; DIM.div_ceil(8)],
+                encoded: EncodedCellRow {
+                    stable_id,
+                    rerank_codec: RerankCodec::Sq8FixedResidual,
+                    scale: Arc::clone(&scale),
+                    offset: Arc::clone(&offset),
+                    codes,
+                    residuals: vec![0u8; DIM],
+                    norm_sq: Some(1.0),
+                },
+            }
+        };
+
+        for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
+            let mut cal = WidthLawCalibration::new(DIM, metric, shipped_target_recall());
+            cal.offer(&make_row(QUERY_ID, QUERY_SEED));
+            cal.freeze(&grid, 0x1234_5678, RERANK_LAW_POOL_CELLS);
+            let query = cal.frozen.as_ref().expect("frozen").queries.clone();
+            let mut scratch = vec![0f32; DIM];
+            let mut dist_of = |row: &MaterializedIvfRow| {
+                dequantize_row_into(&row.encoded, &mut scratch);
+                if metric == Metric::Cosine {
+                    normalize(&mut scratch);
+                }
+                distance(metric, &query, &scratch)
+            };
+
+            // First chunk: distinct rows, ranked by distance to the query.
+            let first: Vec<MaterializedIvfRow> = (0..WIDTH_LAW_SCORE_CHUNK)
+                .map(|i| make_row(FIRST_ID_BASE + i as i128, i as u32 + 1))
+                .collect();
+            let mut ranked: Vec<(f32, usize)> = first
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (dist_of(r), i))
+                .collect();
+            ranked.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            let (kth_dist, kth) = ranked[WIDTH_LAW_MAX_K - 1];
+            let far = &ranked[WIDTH_LAW_MAX_K..];
+            assert!(
+                far.iter()
+                    .all(|&(d, _)| d.total_cmp(&kth_dist) == Ordering::Greater),
+                "{metric:?}: fixture needs every far row strictly past the k-th"
+            );
+
+            // Second chunk: a lower-id copy of the k-th row, then far rows.
+            let mut second = vec![make_row(TIE_ID, kth as u32 + 1)];
+            second.extend((1..WIDTH_LAW_SCORE_CHUNK).map(|j| {
+                let (_, src) = far[j % far.len()];
+                make_row(FAR_ID_BASE + j as i128, src as u32 + 1)
+            }));
+            let rows: Vec<MaterializedIvfRow> = first.into_iter().chain(second).collect();
+            cal.score_rows(0, &rows, None).expect("score_rows");
+
+            let tops = cal.tops.lock().unwrap_or_else(PoisonError::into_inner);
+            assert!(
+                tops[0].iter().any(|c| c.2 == TIE_ID),
+                "{metric:?}: the tying lower-id copy must be kept"
+            );
+            assert!(
+                !tops[0].iter().any(|c| c.2 == FIRST_ID_BASE + kth as i128),
+                "{metric:?}: the higher-id original must lose the tie"
+            );
+        }
     }
 
     /// The 1-bit-gated width sweep (pass 1 `shortlist_rows` + pass 2
