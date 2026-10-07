@@ -2158,6 +2158,10 @@ fn sample_fp32_rows(vectors: &[f32], sample_size: usize, dim: usize, seed: u64) 
 /// to disk. The single builder behind the drain (spilled rows), the
 /// commit-time cell pack (fp32 buffer), and maintenance rebuilds (in-RAM
 /// encoded rows).
+///
+/// `durable` fsyncs the subsection and stable-id files before returning, for a
+/// caller that reopens them after a crash (the drain's resume checkpoint).
+/// Callers that read the files back in-process and delete them pass `false`.
 pub(crate) fn build_cell_subsection_from_source(
     cfg: VectorConfig,
     requested_n_cent: usize,
@@ -2165,6 +2169,7 @@ pub(crate) fn build_cell_subsection_from_source(
     subsection_path: &Path,
     stable_ids_path: &Path,
     scratch: &Path,
+    durable: bool,
 ) -> Result<StreamedIvfSubsection, BuildError> {
     let dim = cfg.dim;
     if dim == 0 {
@@ -2305,12 +2310,16 @@ pub(crate) fn build_cell_subsection_from_source(
         ),
     })?;
     stable_ids.flush()?;
-    stable_ids.get_ref().sync_all()?;
+    if durable {
+        stable_ids.get_ref().sync_all()?;
+    }
+    // Flush, not fsync: the buckets live in a temp dir dropped when this build
+    // returns, and are read back below through the page cache. Nothing recovers
+    // them after a crash, so syncing them only forces data to disk for nothing.
     for writer in bucket_writers {
         writer
             .into_inner()
-            .map_err(|error| BuildError::Io(error.into_error()))?
-            .sync_all()?;
+            .map_err(|error| BuildError::Io(error.into_error()))?;
     }
     let quantizers: Vec<(Vec<f32>, Vec<f32>)> = if fit_quantizer {
         (0..n_cent)
@@ -2436,7 +2445,9 @@ pub(crate) fn build_cell_subsection_from_source(
     output.seek(SeekFrom::Start(layout.total_size_before_crc as u64))?;
     output.write_all(&crc.to_le_bytes())?;
     output.flush()?;
-    output.sync_all()?;
+    if durable {
+        output.sync_all()?;
+    }
     Ok(StreamedIvfSubsection {
         n_docs: n_docs as u32,
         rerank_codec: codec,
@@ -2454,7 +2465,7 @@ pub(crate) fn build_cell_subsection_from_source(
 
 /// Build one complete cell IVF from a cross-batch materialized-row spill,
 /// writing the subsection and stable-id stream directly to disk. Thin
-/// wrapper over the shared cell-pack core.
+/// wrapper over the shared cell-pack core; `durable` as there.
 pub(crate) fn build_merged_subsection_from_spilled_materialized(
     cfg: VectorConfig,
     requested_n_cent: usize,
@@ -2462,6 +2473,7 @@ pub(crate) fn build_merged_subsection_from_spilled_materialized(
     subsection_path: &Path,
     stable_ids_path: &Path,
     scratch: &Path,
+    durable: bool,
 ) -> Result<StreamedIvfSubsection, BuildError> {
     build_cell_subsection_from_source(
         cfg,
@@ -2470,6 +2482,7 @@ pub(crate) fn build_merged_subsection_from_spilled_materialized(
         subsection_path,
         stable_ids_path,
         scratch,
+        durable,
     )
 }
 
@@ -2486,6 +2499,7 @@ fn build_cell_subsection_in_memory(
         .tempdir_in(scratch_root())?;
     let subsection_path = scratch_dir.path().join("cell.ivf");
     let stable_ids_path = scratch_dir.path().join("cell.ids");
+    // Not durable: the files are read back below and the temp dir removed.
     let built = build_cell_subsection_from_source(
         cfg,
         requested_n_cent,
@@ -2493,6 +2507,7 @@ fn build_cell_subsection_in_memory(
         &subsection_path,
         &stable_ids_path,
         scratch_dir.path(),
+        false,
     )?;
     let bytes = fs::read(&subsection_path)?;
     if bytes.len() as u64 != built.subsection_len {
@@ -4828,6 +4843,7 @@ mod tests {
             &subsection_path,
             &stable_ids_path,
             directory.path(),
+            false,
         )
         .expect("streamed materialized build");
         assert_eq!(built.n_docs, rows.len() as u32);

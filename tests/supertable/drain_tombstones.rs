@@ -12,6 +12,11 @@
 //! routed) would resurface deleted rows. Asserting on the hidden table's
 //! own document count pins the exclusion at the build layer, where
 //! query-time tombstone filtering can't mask a regression.
+//!
+//! Compaction has the same duty for the user table: it drops tombstoned
+//! rows, and the merged file has no tombstones left to filter with, so a
+//! deleted vector the merge keeps would come back in hybrid search, whose
+//! vector leg reads the user table.
 
 #![deny(clippy::unwrap_used)]
 
@@ -21,9 +26,9 @@ use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, 
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
-    VectorSearchOptions,
+    CompactionSettings, OptimizeOptions, VectorSearchOptions,
     storage::{LocalFsStorageProvider, StorageProvider},
-    superfile::builder::FtsConfig,
+    superfile::{builder::FtsConfig, fts::reader::BoolMode, vector::rerank_codec::RerankCodec},
     supertable::{Supertable, SupertableOptions},
     test_helpers::default_vector_config,
 };
@@ -50,6 +55,12 @@ fn fixed_list_f32(dim: usize) -> DataType {
 }
 
 fn vector_options() -> SupertableOptions {
+    vector_options_with_codec(default_vector_config("emb", VECTOR_ROT_SEED).rerank_codec)
+}
+
+/// [`vector_options`] with `codec` for the vector column. Optimize needs a
+/// codec the cell build accepts; `Sq16` is what a cosine table gets by default.
+fn vector_options_with_codec(codec: RerankCodec) -> SupertableOptions {
     let schema = Arc::new(Schema::new(vec![
         Field::new("title", DataType::LargeUtf8, false),
         Field::new("emb", fixed_list_f32(DIM), false),
@@ -57,7 +68,7 @@ fn vector_options() -> SupertableOptions {
     SupertableOptions::new(
         schema,
         vec![FtsConfig::new("title")],
-        vec![default_vector_config("emb", VECTOR_ROT_SEED)],
+        vec![default_vector_config("emb", VECTOR_ROT_SEED).with_rerank_codec(codec)],
     )
     .expect("valid options")
 }
@@ -289,4 +300,165 @@ async fn drain_pairs_each_superfile_with_its_own_tombstones() {
             }
         }
     }
+}
+
+/// Rows per commit in the compaction fixture: enough that each user
+/// superfile packs several cells, so some deletes sit past a file's first
+/// cell, where the merge must offset the file-local tombstone ids.
+const SPREAD_ROWS_PER_BATCH: usize = 40;
+/// Commits in the compaction fixture.
+const SPREAD_BATCHES: usize = 3;
+/// Rows deleted in every batch, spread from the first rows to the last.
+const SPREAD_DELETED_ROWS: &[usize] = &[2, 13, 27, 38];
+/// Weight of each row's second axis, which makes every row's embedding
+/// distinct while keeping its own embedding the clear nearest neighbour.
+const SECOND_AXIS_WEIGHT: f32 = 0.5;
+
+fn spread_title(batch: usize, row: usize) -> String {
+    format!("s{batch}r{row}")
+}
+
+/// Row `g` (global) points along axis `g % DIM`, plus a smaller component
+/// along an axis picked by `g / DIM`, so no two rows share an embedding.
+fn spread_vector(global: usize) -> Vec<f32> {
+    let mut v = vec![0.0f32; DIM];
+    let first = global % DIM;
+    let second = (first + 1 + global / DIM) % DIM;
+    v[first] = 1.0;
+    v[second] += SECOND_AXIS_WEIGHT;
+    v
+}
+
+fn spread_batch(schema: Arc<Schema>, batch: usize) -> RecordBatch {
+    let mut flat = Vec::<f32>::with_capacity(SPREAD_ROWS_PER_BATCH * DIM);
+    let mut titles = Vec::with_capacity(SPREAD_ROWS_PER_BATCH);
+    for row in 0..SPREAD_ROWS_PER_BATCH {
+        flat.extend(spread_vector(batch * SPREAD_ROWS_PER_BATCH + row));
+        titles.push(spread_title(batch, row));
+    }
+    let fsl = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        DIM as i32,
+        Arc::new(Float32Array::from(flat)) as ArrayRef,
+        None,
+    )
+    .expect("FSL");
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(LargeStringArray::from(titles)) as ArrayRef,
+            Arc::new(fsl),
+        ],
+    )
+    .expect("batch")
+}
+
+/// A BM25 query no title contains, so hybrid fuses the vector leg alone.
+const NO_TEXT_MATCH: &str = "nomatch";
+/// Compaction target small enough that every user superfile merges.
+const MERGE_TARGET_MB: u64 = 1;
+/// Fill floor low enough that the tiny fixture still qualifies.
+const MERGE_MIN_FILL_PERCENT: u8 = 1;
+/// Merge as soon as a partition holds two superfiles: the fixture's files
+/// sit far below any byte floor.
+const MERGE_MIN_SUPERFILES: u64 = 2;
+
+/// Titles of every hybrid hit for `query_text` + `query_vec`, best first.
+fn hybrid_titles(st: &Supertable, query_text: &str, query_vec: &[f32]) -> Vec<String> {
+    let hits = st
+        .hybrid_search(
+            "title",
+            query_text,
+            BoolMode::Or,
+            "emb",
+            query_vec,
+            VectorSearchOptions::new(),
+            TOP_K,
+            Some(&["_id", "title", "score"]),
+        )
+        .expect("hybrid search");
+    hit_titles(&hits)
+}
+
+/// Every survivor ranks itself first in hybrid search, by its embedding
+/// alone and by its title plus embedding; no deleted row appears in either.
+fn assert_hybrid_membership(st: &Supertable, stage: &str) {
+    for batch in 0..SPREAD_BATCHES {
+        for row in 0..SPREAD_ROWS_PER_BATCH {
+            let global = batch * SPREAD_ROWS_PER_BATCH + row;
+            let title = spread_title(batch, row);
+            let deleted = SPREAD_DELETED_ROWS.contains(&row);
+            for query_text in [NO_TEXT_MATCH, title.as_str()] {
+                let titles = hybrid_titles(st, query_text, &spread_vector(global));
+                if deleted {
+                    assert!(
+                        !titles.contains(&title),
+                        "{stage}: deleted {title} came back for text {query_text:?}: {titles:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        titles.first().map(String::as_str),
+                        Some(title.as_str()),
+                        "{stage}: survivor {title} must rank first for text {query_text:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Deletes spread over several user superfiles, then `optimize()` merges
+/// them. The merged file carries no tombstones, so only the merge itself
+/// can keep the deleted vectors out, and hybrid search reads it directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn optimize_keeps_deleted_rows_out_of_hybrid_search() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(
+        vector_options_with_codec(RerankCodec::Sq16).with_storage(Arc::clone(&storage)),
+    )
+    .expect("create");
+
+    let schema = st.options().schema.clone();
+    let mut w = st.writer().expect("writer");
+    for batch in 0..SPREAD_BATCHES {
+        w.append(&spread_batch(schema.clone(), batch))
+            .expect("append");
+        w.commit().expect("commit");
+    }
+    for batch in 0..SPREAD_BATCHES {
+        for &row in SPREAD_DELETED_ROWS {
+            let pending = w
+                .delete(col("title").eq(lit(spread_title(batch, row))))
+                .expect("delete");
+            assert_eq!(pending.matched, 1);
+        }
+        w.commit().expect("commit delete");
+    }
+    drop(w);
+    assert!(
+        st.reader().expect("reader").n_superfiles() >= SPREAD_BATCHES,
+        "each commit writes at least one user superfile, so there is something to merge"
+    );
+    assert_hybrid_membership(&st, "before optimize");
+
+    st.optimize(&OptimizeOptions::compact(CompactionSettings {
+        target_superfile_size_mb: MERGE_TARGET_MB,
+        min_fill_percent: MERGE_MIN_FILL_PERCENT,
+        min_superfiles_for_merge: MERGE_MIN_SUPERFILES,
+        ..CompactionSettings::default()
+    }))
+    .expect("optimize");
+    assert_eq!(
+        st.reader().expect("reader").n_superfiles(),
+        1,
+        "the user superfiles must merge into one"
+    );
+    assert_eq!(
+        st.reader().expect("reader").n_docs_total(),
+        (SPREAD_BATCHES * (SPREAD_ROWS_PER_BATCH - SPREAD_DELETED_ROWS.len())) as u64,
+        "the merged user superfile holds only the survivors"
+    );
+    assert_hybrid_membership(&st, "after optimize");
 }

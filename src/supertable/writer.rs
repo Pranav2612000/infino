@@ -5399,11 +5399,14 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             if let Some(cal) = width_law_ref {
                                 cal.score_cell(*cell_id, spill)?;
                             }
+                            // Durable: the checkpoint below records this cell,
+                            // and a resumed drain reopens its files.
                             let cell = build_spilled_packed_cell_from_rows(
                                 scratch,
                                 *cell_id,
                                 spill,
                                 &vector_config,
+                                true,
                             )?;
                             {
                                 let mut state = checkpoint.lock().map_err(|_| {
@@ -6201,11 +6204,14 @@ fn spill_packed_cell(
     })
 }
 
+/// `durable` fsyncs the cell's files, for the drain, whose resume checkpoint
+/// reopens them after a crash. The split repack has no resume and passes `false`.
 fn build_spilled_packed_cell_from_rows(
     scratch: &Path,
     cell_id: u32,
     spill: &SpilledCellRows,
     vector_config: &VectorConfig,
+    durable: bool,
 ) -> Result<SpilledPackedCell, BuildError> {
     let subsection_path = scratch.join(format!("cell-{cell_id}.ivf"));
     let subsection_temp = scratch.join(format!("cell-{cell_id}.ivf.tmp"));
@@ -6219,6 +6225,7 @@ fn build_spilled_packed_cell_from_rows(
         &subsection_temp,
         &stable_ids_temp,
         scratch,
+        durable,
     )?;
     fs::rename(&subsection_temp, &subsection_path)
         .map_err(|error| BuildError::Store(format!("cell subsection rename: {error}")))?;
@@ -8502,6 +8509,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
                                 child_id,
                                 &spill,
                                 &wave_cfg,
+                                false,
                             )?;
                             spill.remove_files();
                             packed.push((child_id, packed_cell));
