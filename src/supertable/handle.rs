@@ -1108,6 +1108,7 @@ impl Supertable {
     /// budgets; an explicit budget is never changed, but gets a one-shot
     /// warning when the footprint exceeds it (steady-state reads would
     /// churn the cache).
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub(crate) fn reconcile_cache_budget(&self) {
         let Some(cache) = self.inner.options.disk_cache.as_ref() else {
             return;
