@@ -683,7 +683,7 @@ impl Supertable {
                 false => tombstones.get(&superfile_id).map(Arc::clone),
             };
 
-            let reader = reader.map_err(|e| BuildError::Store(e.to_string()))?;
+            let reader = reader.map_err(BuildError::from)?;
             let superseded = superseded_map
                 .and_then(|m| m.get(&superfile_id))
                 .cloned()
@@ -906,7 +906,7 @@ impl Supertable {
             Err(BuildError::NoDocsToBuild) => None,
             Err(e) => {
                 unseal_all(&wal_store, sealed).await;
-                return Err(CompactionError::Build(e.to_string()));
+                return Err(CompactionError::from(e));
             }
         };
 
@@ -2113,12 +2113,12 @@ mod tests {
         *,
     };
     use crate::{
-        Bm25Stats, BoolMode, VectorSearchOptions,
+        BoolMode, VectorSearchOptions,
         config::{DEFAULT_GC_SAFETY_GAP, DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions},
         memory::ConnectionMemoryBudget,
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::{reader::Bm25SearchOptions, tokenize::STANDARD_TOKENIZER},
+            fts::reader::Bm25SearchOptions,
             reader::SuperfileReader,
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
@@ -4277,9 +4277,7 @@ mod tests {
                     "title",
                     &token,
                     5,
-                    Bm25SearchOptions::new()
-                        .with_mode(BoolMode::And)
-                        .with_stats(Bm25Stats::Global),
+                    Bm25SearchOptions::new().with_mode(BoolMode::And),
                     Some(&["title"]),
                 )
                 .unwrap_or_else(|e| panic!("bm25_search for {token}: {e}"));
@@ -4370,14 +4368,10 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        let opts = SupertableOptions::new(
-            schema_id_title(),
-            vec![FtsConfig::new("title").analyzer(STANDARD_TOKENIZER)],
-            vec![],
-        )
-        .expect("options")
-        .with_writer_pool(pool)
-        .with_storage(Arc::clone(&storage));
+        let opts = SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
+            .expect("options")
+            .with_writer_pool(pool)
+            .with_storage(Arc::clone(&storage));
         let st = Supertable::create(opts).expect("create");
         let mut titles: Vec<String> = Vec::with_capacity(BATCHES * PER_BATCH);
         for b in 0..BATCHES {
@@ -4979,9 +4973,7 @@ mod tests {
                 "title",
                 query,
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25_search warmup");
@@ -4993,9 +4985,7 @@ mod tests {
                 "title",
                 query,
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25_search measured");
