@@ -2134,7 +2134,9 @@ mod tests {
                         Some(&["_id", "score"]),
                     )
                     .expect("search");
-                let opened = op_stats::current().expect("metered").superfiles_opened();
+                let opened = op_stats::current()
+                    .expect("metered")
+                    .score_pruning_survived();
                 (hits_of(&batches), opened)
             })
             .0
@@ -3129,7 +3131,9 @@ mod tests {
                         Some(&["_id", "score"]),
                     )
                     .expect("search");
-                let opened = op_stats::current().expect("metered").superfiles_opened();
+                let opened = op_stats::current()
+                    .expect("metered")
+                    .score_pruning_survived();
                 (hits_of(&batches), opened)
             })
             .0

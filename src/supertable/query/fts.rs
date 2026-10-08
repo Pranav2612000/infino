@@ -5447,7 +5447,7 @@ mod tests {
                 .expect("wave");
             let opened = crate::runtime_metrics::op_stats::current()
                 .expect("metered")
-                .superfiles_opened();
+                .score_pruning_survived();
             ((map, memos), opened)
         })
         .0;
