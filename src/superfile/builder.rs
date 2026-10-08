@@ -132,7 +132,10 @@ use crate::{
         },
     },
     supertable::schema::{FieldId, field_id_of, map::FileSchemaMap, with_field_id},
-    utils::{terms::validate_column_name, trace::detail_span},
+    utils::{
+        terms::validate_column_name,
+        trace::{detail_span, record},
+    },
 };
 
 /// Merges below this many surviving documents keep arrival order: a
@@ -1670,6 +1673,10 @@ impl SuperfileBuilder {
     /// [`build_from_sq8_ivf_readers`](Self::build_from_sq8_ivf_readers): writes
     /// the merged superfile to `output` instead of returning a `Vec<u8>`, so
     /// the compaction caller can stream to a temp file.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(name = "sq8_merge", skip_all, fields(inputs = inputs.len()))
+    )]
     pub(crate) fn build_from_sq8_ivf_readers_to<W: Write>(
         inputs: &[MergeInput],
         base: BuilderOptions,
@@ -1693,6 +1700,12 @@ impl SuperfileBuilder {
             Vec::with_capacity(inputs.len());
         let mut local_base = 0u32;
 
+        let read_span = detail_span!(
+            "sq8_merge.read_inputs",
+            rows = tracing::field::Empty,
+            deleted_rows = tracing::field::Empty,
+        )
+        .entered();
         for input in inputs {
             let (reader, deleted) = (&input.reader, &input.deleted);
             // Compaction opens its inputs eagerly (see
@@ -1713,10 +1726,20 @@ impl SuperfileBuilder {
             superfile_builder.add_batch_ids_only(&record_batch)?;
             local_base += record_batch.num_rows() as u32;
         }
+        record("rows", local_base);
+        record(
+            "deleted_rows",
+            inputs
+                .iter()
+                .filter_map(|input| input.deleted.as_ref().map(|d| d.len()))
+                .sum::<u64>(),
+        );
+        drop(read_span);
 
         let merged_sub = merge_sq8_ivf_subsections(&merge_inputs)?;
         superfile_builder.set_prebuilt_ivf_subsection(0, merged_sub)?;
 
+        let _write_span = detail_span!("sq8_merge.write").entered();
         superfile_builder.finish_to(output)?;
         Ok(SuperfileStats::from_children(stats_collector.as_slice()))
     }
@@ -1753,6 +1776,19 @@ impl SuperfileBuilder {
     /// Streaming counterpart of
     /// [`build_from_multi_cell_sq8_ivf_readers`](Self::build_from_multi_cell_sq8_ivf_readers):
     /// writes the merged superfile to `output` instead of returning a `Vec<u8>`.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "multi_cell_merge",
+            skip_all,
+            fields(
+                inputs = inputs.len(),
+                tombstones = tracing::field::Empty,
+                splice_cells = tracing::field::Empty,
+                rebuild_cells = tracing::field::Empty,
+            )
+        )
+    )]
     pub(crate) fn build_from_multi_cell_sq8_ivf_readers_to<W: Write>(
         inputs: &[MergeInput],
         superseded_per_reader: &[BTreeSet<u32>],
@@ -1778,6 +1814,29 @@ impl SuperfileBuilder {
             .iter()
             .any(|input| input.deleted.as_ref().is_some_and(|b| !b.is_empty()));
 
+        record("tombstones", any_tombstones);
+        // One span per merged cell: whether it spliced or rebuilt, and (for a
+        // rebuild) the cell builder's phase timings, which it records here.
+        // Without `detailed-tracing` the span takes no fields.
+        #[cfg_attr(not(feature = "detailed-tracing"), allow(unused_variables))]
+        let cell_span = |cell_id: u32, fragments: usize, rows: usize| {
+            detail_span!(
+                "merge_cell",
+                cell = cell_id,
+                fragments = fragments,
+                rows = rows,
+                path = tracing::field::Empty,
+                sample_ms = tracing::field::Empty,
+                train_ms = tracing::field::Empty,
+                n_cent = tracing::field::Empty,
+                bucket_ms = tracing::field::Empty,
+                fsync_ms = tracing::field::Empty,
+                write_ms = tracing::field::Empty,
+                crc_ms = tracing::field::Empty,
+            )
+        };
+
+        let read_span = detail_span!("multi_cell_merge.read_inputs").entered();
         let mut stats_collector = Vec::with_capacity(inputs.len());
         let mut scalar_batches = Vec::with_capacity(inputs.len());
         for input in inputs {
@@ -1803,6 +1862,7 @@ impl SuperfileBuilder {
                 .check_fts_carry_compat(remote_cfg.as_deref())?;
             scalar_batches.push(record_batch);
         }
+        drop(read_span);
 
         let mut packed_cells: Vec<(u32, MergedIvfSubsection)> = Vec::new();
         let mut all_stable_ids: Vec<i128> = Vec::new();
@@ -1812,7 +1872,9 @@ impl SuperfileBuilder {
             // The fine-cluster count is re-derived from the surviving row count at
             // rebuild time (see the build loop) so a merged cell is re-clustered
             // to the fine-run byte target rather than inheriting a source width.
-            let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
+            // Per cell: how many fragments fed it, and its surviving rows.
+            let mut by_cell: HashMap<u32, (usize, Vec<MaterializedIvfRow>)> = HashMap::new();
+            let materialize_span = detail_span!("multi_cell_merge.materialize").entered();
             for (reader_idx, input) in inputs.iter().enumerate() {
                 let (reader, deleted) = (&input.reader, &input.deleted);
                 let v = reader.vec().ok_or(BuildError::VectorReadError)?;
@@ -1836,14 +1898,21 @@ impl SuperfileBuilder {
                     if rows.is_empty() {
                         continue;
                     }
-                    by_cell.entry(cell_id).or_default().extend(rows);
+                    let (fragments, cell_rows) = by_cell.entry(cell_id).or_default();
+                    *fragments += 1;
+                    cell_rows.extend(rows);
                 }
             }
+            drop(materialize_span);
 
             let mut cell_ids: Vec<u32> = by_cell.keys().copied().collect();
             cell_ids.sort_unstable();
+            record("splice_cells", 0);
+            record("rebuild_cells", cell_ids.len());
             for cell_id in cell_ids {
-                let mut rows = by_cell.remove(&cell_id).expect("cell present");
+                let (fragments, mut rows) = by_cell.remove(&cell_id).expect("cell present");
+                let _span = cell_span(cell_id, fragments, rows.len()).entered();
+                record("path", "rebuild");
                 for (i, row) in rows.iter_mut().enumerate() {
                     row.local_doc_id = i as u32;
                 }
@@ -1896,6 +1965,9 @@ impl SuperfileBuilder {
             let mut __rebuild_ns: u128 = 0;
             for cell_id in cell_ids {
                 let sources = by_cell.remove(&cell_id).expect("cell present");
+                let merged_docs: usize =
+                    sources.iter().map(|(_, _, inp)| inp.n_docs as usize).sum();
+                let _span = cell_span(cell_id, sources.len(), merged_docs).entered();
                 let __mt = std::time::Instant::now();
                 let same_shape = sources
                     .windows(2)
@@ -1915,11 +1987,17 @@ impl SuperfileBuilder {
                 // the capped count, so a raw-target gate would reject the splice
                 // and rebuild it on every compaction only to re-derive that same
                 // capped count.
-                let merged_docs: usize =
-                    sources.iter().map(|(_, _, inp)| inp.n_docs as usize).sum();
                 let fits_target =
                     effective_fine_n_cent(sources[0].2.dim, sources[0].2.rerank_codec, merged_docs)
                         <= sources[0].2.n_cent;
+                record(
+                    "path",
+                    if same_shape && fits_target {
+                        "splice"
+                    } else {
+                        "rebuild"
+                    },
+                );
                 if same_shape && fits_target {
                     let mut inputs: Vec<Sq8IvfMergeInput> =
                         sources.into_iter().map(|(_, _, inp)| inp).collect();
@@ -1979,6 +2057,8 @@ impl SuperfileBuilder {
                 __rebuild_ns += __mt.elapsed().as_nanos();
                 __rebuild_cells += 1;
             }
+            record("splice_cells", __splice_cells);
+            record("rebuild_cells", __rebuild_cells);
             if __merge_timers {
                 eprintln!(
                     "[optmerge] cells splice {} ({:.1}s)  rebuild {} ({:.1}s)",
@@ -2000,6 +2080,7 @@ impl SuperfileBuilder {
             return Ok(SuperfileStats::from_children(&[]));
         }
 
+        let _write_span = detail_span!("multi_cell_merge.write").entered();
         // Carry FTS postings across in the packed output order. Unlike the
         // concatenating merges, output rows follow `all_stable_ids`
         // (cell-directory order), so the remap is stable-id → output
