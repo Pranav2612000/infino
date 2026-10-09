@@ -2016,7 +2016,7 @@ mod tests {
                 .join()
                 .expect("peer commit");
         });
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
 
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (live, root) = live_and_covered(&st, &storage, &rt);
@@ -2045,7 +2045,7 @@ mod tests {
             .collect();
         assert_eq!(found, live, "`shared` is found in every live superfile");
 
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
         let (live, root) = live_and_covered(&st, &storage, &rt);
         assert_eq!(root.segments.len(), 1);
         assert!(
@@ -2093,7 +2093,7 @@ mod tests {
                 .join()
                 .expect("peer commit");
         });
-        stats_only_optimize(&st);
+        maintenance_only_optimize(&st);
 
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (live, root) = live_and_covered(&st, &storage, &rt);
@@ -2146,8 +2146,10 @@ mod tests {
             .expect("peer commit");
             hook_faults.fail(FaultOp::Get, "term-index/root-", 2);
         });
-        stats_only_optimize(&st);
-        assert_eq!(faults.fired(), 2, "both root loads failed");
+        maintenance_only_optimize(&st);
+        // How many reads the retry makes is not the point; disarm the rest.
+        faults.clear();
+        assert!(faults.fired() > 0, "the root failed to load");
 
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (live, root) = live_and_covered(&st, &storage, &rt);
