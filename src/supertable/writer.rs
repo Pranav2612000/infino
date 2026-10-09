@@ -10441,7 +10441,7 @@ pub(in crate::supertable) async fn stamp_term_index(
             if !old.needs_term_index_rebuild(&entries).await {
                 return Ok(None);
             }
-            let current = referenced_root(storage.as_ref(), &old).await;
+            let current = referenced_root(&old).await;
             let last = last_build.lock().expect("term-index build lock").clone();
             let spliced = last
                 .as_ref()
@@ -10456,15 +10456,21 @@ pub(in crate::supertable) async fn stamp_term_index(
                     // committed since the last build.
                     let onto = last.map(|(base, _)| base).unwrap_or_default();
                     let missing = unlisted(&onto, &entries);
-                    let built = collect_and_build_term_index(&old, &missing, onto)
-                        .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?;
-                    term_index::write_slices(storage.as_ref(), built.slices)
-                        .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?;
-                    *last_build.lock().expect("term-index build lock") =
-                        Some((built.root.clone(), current));
-                    built.root
+                    // Already lists every live superfile: an empty segment
+                    // would add nothing.
+                    if missing.is_empty() {
+                        onto
+                    } else {
+                        let built = collect_and_build_term_index(&old, &missing, onto)
+                            .await
+                            .map_err(|e| BuildError::Store(e.to_string()))?;
+                        term_index::write_slices(storage.as_ref(), built.slices)
+                            .await
+                            .map_err(|e| BuildError::Store(e.to_string()))?;
+                        *last_build.lock().expect("term-index build lock") =
+                            Some((built.root.clone(), current));
+                        built.root
+                    }
                 }
             };
             let reference = term_index::write_root(storage.as_ref(), &root)
@@ -10483,13 +10489,13 @@ pub(in crate::supertable) async fn stamp_term_index(
 }
 
 /// The root `manifest` references: empty when it has none, `None` when it
-/// cannot be read.
-async fn referenced_root(
-    storage: &dyn StorageProvider,
-    manifest: &ManifestSnapshot,
-) -> Option<Root> {
+/// cannot be read. Loaded through the snapshot, which caches it.
+async fn referenced_root(manifest: &ManifestSnapshot) -> Option<Root> {
     match manifest.term_index_ref() {
-        Some(reference) => term_index::load_root(storage, reference).await.ok(),
+        Some(_) => manifest
+            .term_index()
+            .await
+            .map(|index| index.root().clone()),
         None => Some(Root::default()),
     }
 }
