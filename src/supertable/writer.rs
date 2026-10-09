@@ -173,7 +173,6 @@ use crate::{
             part::{self as part_mod, PartId},
             superfile_stem,
             term_index::{self, Contribution as TermContribution, TermIndexError},
-            term_stats,
         },
         mutations::{
             CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -3431,7 +3430,10 @@ async fn write_superfile_terms(
     let dict_bytes = fts
         .dict_bytes_async()
         .await
-        .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
+        .map_err(|source| TermIndexError::Read {
+            what: "term walk",
+            source,
+        })?;
     for (_, column, column_id) in &columns {
         let mut after: Option<Vec<u8>> = None;
         loop {
@@ -3443,7 +3445,10 @@ async fn write_superfile_terms(
                     TERM_INDEX_BATCH_TERMS,
                 )
                 .await
-                .map_err(|e| TermIndexError::Build(format!("term facts: {e}")))?;
+                .map_err(|source| TermIndexError::Read {
+                    what: "term facts",
+                    source,
+                })?;
             for (term, fact) in &chunk {
                 let term =
                     from_utf8(term).map_err(|_| TermIndexError::Build("non-utf8 term".into()))?;
@@ -10401,85 +10406,6 @@ where
     )))
 }
 
-/// Build and publish the term-stats sidecar over the CURRENT
-/// membership, stamping its reference on a successor manifest (see
-/// `manifest::term_stats` for artifact semantics and the carry rule).
-/// Maintenance-only: optimize calls it after compaction settles, so the
-/// artifact always describes the post-merge superfile set. Safe to lose
-/// to contention — queries fall back to the fused query-time gather
-/// until the next maintenance pass republishes.
-pub(in crate::supertable) async fn stamp_term_stats(
-    inner: &SupertableInner,
-) -> Result<(), BuildError> {
-    let Some(storage) = inner.options.storage.clone() else {
-        return Ok(());
-    };
-    if inner.manifest.load().fts_configs().is_empty() {
-        return Ok(());
-    }
-    stamp_with_retries(inner, &storage, "term-stats", |old| {
-        let storage = Arc::clone(&storage);
-        async move {
-            // Every live superfile, parts included: a lazily loaded
-            // manifest's flat view holds only what has been loaded.
-            let entries = old
-                .get_all_superfiles_loaded()
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
-            // One superfile is its own global statistics: a query gathers
-            // df from that superfile's dictionary — the same numbers, one
-            // probe — so publishing an artifact would only duplicate the
-            // dictionary on disk. Nothing to drop either: a commit that
-            // removed the other superfiles already dropped the reference
-            // (the carry rule), and the next multi-superfile maintenance
-            // pass republishes.
-            if entries.len() <= 1 {
-                return Ok(None);
-            }
-            let store = Arc::clone(&old.options.store);
-            let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
-            let opt_storage = old.options.storage.as_ref().map(Arc::clone);
-            // Readers are opened by `build`, one at a time, and dropped
-            // before the next: each pins its superfile's term dictionary
-            // for its lifetime, so materializing them all here made the
-            // pass scale with table size rather than with the work it does.
-            //
-            // No background fills: this pass reads dictionaries and df
-            // headers only, and a fill here copies EVERY superfile —
-            // including compaction's fresh multi-GiB outputs — into the
-            // disk cache. On real object storage those fills outlive the
-            // optimize call and their reads bleed into whatever runs next
-            // (they surfaced as phantom user-data GETs in cold measurements
-            // that began while a fill was still draining).
-            let legacy = old.options.legacy_names();
-            let bytes = term_stats::build(&entries, &legacy, |entry| {
-                let store = Arc::clone(&store);
-                let disk_cache = disk_cache.clone();
-                let opt_storage = opt_storage.clone();
-                let entry = Arc::clone(entry);
-                async move {
-                    open_reader(
-                        &store,
-                        disk_cache.as_ref(),
-                        opt_storage.as_ref(),
-                        &entry,
-                        ReadIntent::Stream,
-                    )
-                    .await
-                    .map_err(term_stats::TermStatsError::Open)
-                }
-            })
-            .await?;
-            let reference = term_stats::write(storage.as_ref(), bytes).await?;
-            if old.term_stats_blob() == Some(&reference) {
-                return Ok(None);
-            }
-            Ok(Some(old.with_term_stats(reference)))
-        }
-    })
-    .await
-}
-
 /// Build and publish the table-level term index over the CURRENT
 /// membership, stamping its root reference on a successor manifest (see
 /// `manifest::term_index`). Maintenance-only: optimize calls it after
@@ -10519,11 +10445,8 @@ pub(in crate::supertable) async fn stamp_term_index(
                 &entries,
                 &old.options.legacy_names(),
             )
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
-            let reference = term_index::write_built(storage.as_ref(), built)
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
+            .await?;
+            let reference = term_index::write_built(storage.as_ref(), built).await?;
             // The root is content-addressed, so an unchanged reference can
             // still sit beside a stale "incomplete" mark; this build covers
             // the whole membership, so publish whenever that mark is wrong.
@@ -10553,7 +10476,7 @@ async fn collect_and_build_term_index(
     for entry in entries {
         let reader = open_reader(store, disk_cache, opt_storage, entry, ReadIntent::Stream)
             .await
-            .map_err(|e| TermIndexError::Build(e.to_string()))?;
+            .map_err(TermIndexError::Open)?;
         // The walk reads most of the FTS section, whose reads skip the block
         // cache, so each would be its own GET. Fetch the section in bulk first.
         // On failure the walk still works, read by read.
@@ -11870,9 +11793,8 @@ pub(in crate::supertable) async fn put_bytes_multipart_or_atomic(
 
 /// Objects at or above this size go through the multipart upload path.
 /// Azure and S3 cap a single PUT at ~5 GiB, and the artifacts written by
-/// content hash — slow-vector state, term statistics, term-index slices
-/// and roots — can grow past that at scale; the figure matches the
-/// superfile default.
+/// content hash — slow-vector state, term-index slices and roots — can
+/// grow past that at scale; the figure matches the superfile default.
 pub(in crate::supertable) const CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES: u64 =
     100 * 1024 * 1024;
 

@@ -27,7 +27,7 @@ use crate::{
     },
     supertable::{
         ManifestLoadError,
-        manifest::{part, term_stats::TermStatsError},
+        manifest::{part, term_index::TermIndexError},
         schema::error::SchemaError,
     },
 };
@@ -248,17 +248,16 @@ impl BuildError {
     }
 }
 
-impl From<TermStatsError> for BuildError {
-    /// The term-stats pass reaches the build path as `Store` carrying the
-    /// message, except a refused credential under it, which keeps its own
-    /// variant so the caller is told to fix the credentials, not to retry,
-    /// and a superfile in a format this engine does not read, which keeps
-    /// `Unsupported`.
-    fn from(e: TermStatsError) -> Self {
+impl From<TermIndexError> for BuildError {
+    /// A term-index build failure reaches the build path as `Store`, except a
+    /// refused credential, which stays `PermissionDenied` so the caller fixes
+    /// the credentials instead of retrying, and a superfile in a format this
+    /// engine does not read, which stays `Unsupported`.
+    fn from(e: TermIndexError) -> Self {
         if e.is_permission_denied() {
             return BuildError::PermissionDenied(e.to_string());
         }
-        if let TermStatsError::Open(QueryError::Unsupported(m)) = e {
+        if let TermIndexError::Open(QueryError::Unsupported(m)) = e {
             return BuildError::Unsupported(m);
         }
         BuildError::Store(e.to_string())
@@ -947,28 +946,34 @@ mod tests {
     use super::*;
     use crate::{superfile::LazyByteSourceError, supertable::reader_cache::disk::DiskCacheError};
 
-    /// The term-stats pass runs during optimize: a refused credential under
+    /// The term-index pass runs during optimize: a refused credential under
     /// any of its failures (a dictionary read, a reader open, the artifact
     /// write) reaches the build path as `PermissionDenied`, so the caller
-    /// fixes the credentials instead of retrying; anything else stays `Store`.
+    /// fixes the credentials instead of retrying; an unreadable superfile
+    /// stays `Unsupported`; anything else is `Store`.
     #[test]
-    fn a_refused_credential_in_the_term_stats_pass_stays_permission_denied() {
+    fn a_term_index_failure_keeps_its_class_on_the_build_path() {
         let refused = || StorageError::PermissionDenied { uri: "u".into() };
-        let read = TermStatsError::Read {
-            what: "dict fetch",
+        let read = TermIndexError::Read {
+            what: "term walk",
             source: FtsError::RangeFetch {
                 what: "fts/dict",
                 source: LazyByteSourceError::Storage(refused()),
             },
         };
-        let open = TermStatsError::Open(QueryError::PermissionDenied("refused".into()));
-        for failure in [read, open, TermStatsError::Storage(refused())] {
+        let open = TermIndexError::Open(QueryError::PermissionDenied("refused".into()));
+        for failure in [read, open, TermIndexError::Storage(refused())] {
             assert!(
                 matches!(BuildError::from(failure), BuildError::PermissionDenied(_)),
                 "a refused credential must stay one"
             );
         }
-        let timeout = TermStatsError::Storage(StorageError::TransientExhausted {
+        let unreadable = TermIndexError::Open(QueryError::Unsupported("format".into()));
+        assert!(matches!(
+            BuildError::from(unreadable),
+            BuildError::Unsupported(_)
+        ));
+        let timeout = TermIndexError::Storage(StorageError::TransientExhausted {
             uri: "u".into(),
             source: "boom".into(),
         });
