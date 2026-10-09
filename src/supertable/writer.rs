@@ -10461,21 +10461,15 @@ pub(in crate::supertable) async fn stamp_term_index(
                     if missing.is_empty() {
                         onto
                     } else {
-                        let built = collect_and_build_term_index(&old, &missing, onto)
-                            .await
-                            .map_err(|e| BuildError::Store(e.to_string()))?;
-                        term_index::write_slices(storage.as_ref(), built.slices)
-                            .await
-                            .map_err(|e| BuildError::Store(e.to_string()))?;
+                        let built = collect_and_build_term_index(&old, &missing, onto).await?;
+                        term_index::write_slices(storage.as_ref(), built.slices).await?;
                         *last_build.lock().expect("term-index build lock") =
                             Some((built.root.clone(), current));
                         built.root
                     }
                 }
             };
-            let reference = term_index::write_root(storage.as_ref(), &root)
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
+            let reference = term_index::write_root(storage.as_ref(), &root).await?;
             // The root is content-addressed, so an unchanged reference can
             // still sit beside a stale "incomplete" mark; this build covers
             // the whole membership, so publish whenever that mark is wrong.
