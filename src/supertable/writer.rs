@@ -10415,10 +10415,10 @@ where
 /// Every posting carries the term's score ceiling in that superfile, at the
 /// superfile's own statistics; the query rescales it.
 ///
-/// The build runs once. When commits land before it publishes, a retry
-/// splices it over their delta segments (`term_index::splice_base`) rather
-/// than rebuilding, and rebuilds only when the splice cannot cover every
-/// live superfile.
+/// The full build runs once. When commits land before it publishes, a retry
+/// splices it over their delta segments (`term_index::splice_base`), or,
+/// when that cannot list every live superfile, indexes only the superfiles
+/// the last build lacks on top of it.
 pub(in crate::supertable) async fn stamp_term_index(
     inner: &SupertableInner,
 ) -> Result<(), BuildError> {
@@ -10442,18 +10442,21 @@ pub(in crate::supertable) async fn stamp_term_index(
                 return Ok(None);
             }
             let current = referenced_root(storage.as_ref(), &old).await;
-            let spliced = {
-                let last = last_build.lock().expect("term-index build lock");
-                last.as_ref()
-                    .and_then(|(base, prior)| {
-                        term_index::splice_base(base, prior.as_ref()?, current.as_ref()?)
-                    })
-                    .filter(|root| lists_every_entry(root, &entries))
-            };
+            let last = last_build.lock().expect("term-index build lock").clone();
+            let spliced = last
+                .as_ref()
+                .and_then(|(base, prior)| {
+                    term_index::splice_base(base, prior.as_ref()?, current.as_ref()?)
+                })
+                .filter(|root| unlisted(root, &entries).is_empty());
             let root = match spliced {
                 Some(root) => root,
                 None => {
-                    let built = collect_and_build_term_index(&old, &entries)
+                    // Everything on the first attempt; after that, only what
+                    // committed since the last build.
+                    let onto = last.map(|(base, _)| base).unwrap_or_default();
+                    let missing = unlisted(&onto, &entries);
+                    let built = collect_and_build_term_index(&old, &missing, onto)
                         .await
                         .map_err(|e| BuildError::Store(e.to_string()))?;
                     term_index::write_slices(storage.as_ref(), built.slices)
@@ -10491,18 +10494,24 @@ async fn referenced_root(
     }
 }
 
-/// Whether `root` lists every one of `entries`.
-fn lists_every_entry(root: &Root, entries: &[Arc<SuperfileEntry>]) -> bool {
+/// The `entries` that `root` does not list.
+fn unlisted(root: &Root, entries: &[Arc<SuperfileEntry>]) -> Vec<Arc<SuperfileEntry>> {
     let listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
-    entries.iter().all(|e| listed.contains(&e.superfile_id))
+    entries
+        .iter()
+        .filter(|e| !listed.contains(&e.superfile_id))
+        .cloned()
+        .collect()
 }
 
 /// Walk every superfile's dictionary once, spilling a contribution per
-/// superfile into one scratch directory, then merge them into slices. The
-/// scratch directory goes with the contributions when this returns.
+/// superfile into one scratch directory, then merge them into one segment
+/// on top of `onto`. The scratch directory goes with the contributions when
+/// this returns.
 async fn collect_and_build_term_index(
     manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
+    onto: Root,
 ) -> Result<term_index::Built, TermIndexError> {
     let store = &manifest.options.store;
     let disk_cache = manifest.options.disk_cache.as_ref();
@@ -10534,7 +10543,7 @@ async fn collect_and_build_term_index(
         contributions.push(writer.finish()?);
         drop(reader);
     }
-    term_index::build(&contributions, &term_index::BuildPolicy::default())
+    term_index::build_onto(onto, &contributions, &term_index::BuildPolicy::default())
 }
 
 /// Terms per batch of facts read during the term-index build.

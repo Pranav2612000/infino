@@ -40,9 +40,9 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) use build::{
-    BuildPolicy, Built, Contribution, ContributionWriter, build, build_segment,
-};
+#[cfg(test)]
+pub(crate) use build::build;
+pub(crate) use build::{BuildPolicy, Built, Contribution, ContributionWriter, build_onto};
 use bytes::Bytes;
 pub(crate) use format::{Location, Posting, Root, Slice};
 use futures::{StreamExt, TryStreamExt, stream};
@@ -237,13 +237,9 @@ pub(crate) async fn append_delta(
     contributions: &[Contribution],
     policy: &BuildPolicy,
 ) -> Result<RoutingRef, TermIndexError> {
-    let mut root = prior.unwrap_or_default();
-    let built = build_segment(contributions, policy, root.superfiles.len() as u32)?;
+    let built = build_onto(prior.unwrap_or_default(), contributions, policy)?;
     write_slices(storage, built.slices).await?;
-    root.superfiles.extend(built.superfiles);
-    root.id_mins.extend(built.id_mins);
-    root.segments.push(built.segment);
-    write_root(storage, &root).await
+    write_root(storage, &built.root).await
 }
 
 /// Place `base`, a rebuild of the index `prior` referenced, over `current`,
@@ -2057,6 +2053,70 @@ mod tests {
             "the next rebuild drops the padding"
         );
         assert_eq!(root.superfiles.len(), live.len());
+    }
+
+    /// An incomplete index lists fewer superfiles than a rebuild, so a
+    /// commit during the rebuild cannot be spliced in. The retry indexes
+    /// only that commit's superfile on top of the rebuild, not everything
+    /// again.
+    #[test]
+    fn a_commit_during_the_rebuild_of_an_incomplete_index_is_caught_up() {
+        let (dir, faults, storage, st) = fault_table();
+        for segment in 0..SEGMENTS {
+            commit_segment(&st, segment);
+        }
+        // With its root gone, the next commit restarts the index from its
+        // own superfile alone.
+        let reference = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .term_index_ref()
+            .cloned()
+            .expect("the commits publish a root");
+        st.block_on_query(storage.delete(&reference.uri))
+            .expect("delete root");
+        commit_segment(&st, SEGMENTS);
+        assert!(
+            !st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
+
+        // Another process commits just before the rebuild publishes.
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let other = crate::supertable::Supertable::open(fresh_options(&local)).expect("open");
+        faults.before(FaultOp::PutAtomic, "term-index/root-", move || {
+            thread::spawn(move || commit_segment(&other, SEGMENTS + 1))
+                .join()
+                .expect("peer commit");
+        });
+        stats_only_optimize(&st);
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(
+            root.segments.len(),
+            2,
+            "the rebuild, then the caught-up commit"
+        );
+        assert_eq!(root.superfiles.len(), live.len(), "no padding");
+        assert!(
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let found: HashSet<Uuid> = rt
+            .block_on(index.postings(title_id(), "shared"))
+            .expect("lookup")
+            .iter()
+            .map(|p| index.superfile_id(p.superfile).expect("ordinal resolves"))
+            .collect();
+        assert_eq!(found, live, "`shared` is found in every live superfile");
     }
 
     /// A commit that only removes superfiles appends no segment and leaves
