@@ -172,7 +172,7 @@ use crate::{
             listed_once, options_hash,
             part::{self as part_mod, PartId},
             superfile_stem,
-            term_index::{self, Contribution as TermContribution, TermIndexError},
+            term_index::{self, Contribution as TermContribution, Root, TermIndexError},
         },
         mutations::{
             CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -184,9 +184,7 @@ use crate::{
             dispatch::{open_compaction_input, open_reader},
             vector::{IndexOutcome, stable_ids_by_local_for_routing},
         },
-        reader_cache::{
-            DiskCacheStore, ReadIntent, SuperfileReaderCache, disk::mmap_readonly_bytes,
-        },
+        reader_cache::{DiskCacheStore, ReadIntent, disk::mmap_readonly_bytes},
         schema::{
             DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId, LegacyNames, PhysicalSchema,
             TableSchema,
@@ -10416,6 +10414,11 @@ where
 ///
 /// Every posting carries the term's score ceiling in that superfile, at the
 /// superfile's own statistics; the query rescales it.
+///
+/// The build runs once. When commits land before it publishes, a retry
+/// splices it over their delta segments (`term_index::splice_base`) rather
+/// than rebuilding, and rebuilds only when the splice cannot cover every
+/// live superfile.
 pub(in crate::supertable) async fn stamp_term_index(
     inner: &SupertableInner,
 ) -> Result<(), BuildError> {
@@ -10425,8 +10428,11 @@ pub(in crate::supertable) async fn stamp_term_index(
     if inner.manifest.load().fts_configs().is_empty() {
         return Ok(());
     }
+    // The last build's root, and the root it was built to replace.
+    let last_build: Mutex<Option<(Root, Option<Root>)>> = Mutex::new(None);
     stamp_with_retries(inner, &storage, "term-index", |old| {
-        let storage = Arc::clone(&storage);
+        let storage = &storage;
+        let last_build = &last_build;
         async move {
             let entries = old
                 .get_all_superfiles_loaded()
@@ -10435,18 +10441,32 @@ pub(in crate::supertable) async fn stamp_term_index(
             if !old.needs_term_index_rebuild(&entries).await {
                 return Ok(None);
             }
-            let store = Arc::clone(&old.options.store);
-            let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
-            let opt_storage = old.options.storage.as_ref().map(Arc::clone);
-            let built = collect_and_build_term_index(
-                &store,
-                disk_cache.as_ref(),
-                opt_storage.as_ref(),
-                &entries,
-                &old.options.legacy_names(),
-            )
-            .await?;
-            let reference = term_index::write_built(storage.as_ref(), built).await?;
+            let current = referenced_root(storage.as_ref(), &old).await;
+            let spliced = {
+                let last = last_build.lock().expect("term-index build lock");
+                last.as_ref()
+                    .and_then(|(base, prior)| {
+                        term_index::splice_base(base, prior.as_ref()?, current.as_ref()?)
+                    })
+                    .filter(|root| lists_every_entry(root, &entries))
+            };
+            let root = match spliced {
+                Some(root) => root,
+                None => {
+                    let built = collect_and_build_term_index(&old, &entries)
+                        .await
+                        .map_err(|e| BuildError::Store(e.to_string()))?;
+                    term_index::write_slices(storage.as_ref(), built.slices)
+                        .await
+                        .map_err(|e| BuildError::Store(e.to_string()))?;
+                    *last_build.lock().expect("term-index build lock") =
+                        Some((built.root.clone(), current));
+                    built.root
+                }
+            };
+            let reference = term_index::write_root(storage.as_ref(), &root)
+                .await
+                .map_err(|e| BuildError::Store(e.to_string()))?;
             // The root is content-addressed, so an unchanged reference can
             // still sit beside a stale "incomplete" mark; this build covers
             // the whole membership, so publish whenever that mark is wrong.
@@ -10459,16 +10479,35 @@ pub(in crate::supertable) async fn stamp_term_index(
     .await
 }
 
+/// The root `manifest` references: empty when it has none, `None` when it
+/// cannot be read.
+async fn referenced_root(
+    storage: &dyn StorageProvider,
+    manifest: &ManifestSnapshot,
+) -> Option<Root> {
+    match manifest.term_index_ref() {
+        Some(reference) => term_index::load_root(storage, reference).await.ok(),
+        None => Some(Root::default()),
+    }
+}
+
+/// Whether `root` lists every one of `entries`.
+fn lists_every_entry(root: &Root, entries: &[Arc<SuperfileEntry>]) -> bool {
+    let listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+    entries.iter().all(|e| listed.contains(&e.superfile_id))
+}
+
 /// Walk every superfile's dictionary once, spilling a contribution per
 /// superfile into one scratch directory, then merge them into slices. The
 /// scratch directory goes with the contributions when this returns.
 async fn collect_and_build_term_index(
-    store: &Arc<dyn SuperfileReaderCache>,
-    disk_cache: Option<&Arc<DiskCacheStore>>,
-    opt_storage: Option<&Arc<dyn StorageProvider>>,
+    manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
-    legacy: &LegacyNames,
 ) -> Result<term_index::Built, TermIndexError> {
+    let store = &manifest.options.store;
+    let disk_cache = manifest.options.disk_cache.as_ref();
+    let opt_storage = manifest.options.storage.as_ref();
+    let legacy = manifest.options.legacy_names();
     let scratch = tempfile::Builder::new()
         .prefix("infino-term-index-")
         .tempdir()?;
@@ -10491,7 +10530,7 @@ async fn collect_and_build_term_index(
             entry.superfile_id,
             entry.id_min,
         )?;
-        write_superfile_terms(&reader, legacy, &mut writer).await?;
+        write_superfile_terms(&reader, &legacy, &mut writer).await?;
         contributions.push(writer.finish()?);
         drop(reader);
     }
