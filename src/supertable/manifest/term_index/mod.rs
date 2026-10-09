@@ -2119,6 +2119,49 @@ mod tests {
         assert_eq!(found, live, "`shared` is found in every live superfile");
     }
 
+    /// When the retry cannot read the current root, it falls back to the
+    /// last build. If that already lists every live superfile, it is
+    /// published as it is, without an empty segment.
+    #[test]
+    fn a_retry_with_nothing_to_catch_up_adds_no_segment() {
+        let (dir, faults, storage, st) = fault_table();
+        for segment in 0..SEGMENTS {
+            commit_segment(&st, segment);
+        }
+
+        // Just before the rebuild publishes, another process removes a
+        // superfile, and the root then fails to load twice: once for the
+        // retry's rebuild check, once for the splice.
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let other = crate::supertable::Supertable::open(fresh_options(&local)).expect("open");
+        let hook_faults = Arc::clone(&faults);
+        faults.before(FaultOp::PutAtomic, "term-index/root-", move || {
+            thread::spawn(move || {
+                let reader = other.reader().expect("reader");
+                let entries = reader.manifest().get_all_superfiles();
+                commit_without_postings(&other, &local, Vec::new(), &entries[..1]);
+            })
+            .join()
+            .expect("peer commit");
+            hook_faults.fail(FaultOp::Get, "term-index/root-", 2);
+        });
+        stats_only_optimize(&st);
+        assert_eq!(faults.fired(), 2, "both root loads failed");
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(root.segments.len(), 1, "the build alone, no empty segment");
+        let listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+        assert!(listed.is_superset(&live), "every live superfile is listed");
+        assert!(
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
+    }
+
     /// A commit that only removes superfiles appends no segment and leaves
     /// the index complete, but the root still lists the removed superfile.
     /// Only the live-set check sees it.
