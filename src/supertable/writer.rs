@@ -10360,10 +10360,22 @@ where
             return Ok(());
         };
         let attempted_id = new_manifest.get_manifest_id();
-        let prev_etag = get_current_manifest_etag(storage, Arc::clone(&old))
-            .await
-            .inspect_err(|e| inner.note_commit_error(e))
-            .map_err(BuildError::from)?;
+        let prev_etag = match get_current_manifest_etag(storage, Arc::clone(&old)).await {
+            Ok(etag) => etag,
+            // Another commit landed while the successor was built: a lost
+            // race like the one the write reports, so reload and retry.
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                refresh_inner_state_async(inner, storage)
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?;
+                sleep(backoff_delay(attempt)).await;
+                continue;
+            }
+            Err(e) => {
+                inner.note_commit_error(&e);
+                return Err(BuildError::from(e));
+            }
+        };
         match new_manifest
             .write(storage.as_ref(), prev_etag.as_deref(), &[])
             .await
@@ -12086,7 +12098,10 @@ mod tests {
     }
 
     use std::{
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
 
@@ -12185,6 +12200,65 @@ mod tests {
                     if column == REQUIRED_COLUMN
             ),
             "{err}"
+        );
+    }
+
+    /// A commit that lands while a stamp builds its successor moves the
+    /// pointer past the stamp's snapshot. The stamp reloads and retries
+    /// instead of failing on that first lost race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stamp_retries_when_a_commit_lands_during_its_build() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let options = || default_supertable_options().with_storage(Arc::clone(&storage));
+        let table = Supertable::create(options()).expect("create");
+        {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_title_batch(&["alpha"]))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        // Another process committing to the same table.
+        let other = Supertable::open(options()).expect("open");
+
+        let attempts = AtomicUsize::new(0);
+        stamp_with_retries(table.inner(), &storage, "test", |old| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let other = &other;
+            async move {
+                if attempt == 0 {
+                    let mut writer = other.writer().expect("writer");
+                    writer
+                        .append(&build_title_batch(&["beta"]))
+                        .expect("append");
+                    writer.commit().expect("commit");
+                }
+                let reference = old
+                    .term_index_ref()
+                    .cloned()
+                    .expect("the commits publish a term index");
+                Ok(Some(old.with_term_index(reference)))
+            }
+        })
+        .await
+        .expect("the stamp retries past the concurrent commit");
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "one lost race, then a win"
+        );
+        assert_eq!(
+            table
+                .inner()
+                .manifest
+                .load_full()
+                .get_all_superfiles()
+                .len(),
+            2,
+            "the retry built on the other commit"
         );
     }
 
