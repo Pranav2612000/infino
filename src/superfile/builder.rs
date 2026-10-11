@@ -83,6 +83,7 @@ use arrow_schema::{DataType, Field, Schema};
 use parquet::basic::{Compression, ZstdLevel};
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
+use tracing::warn;
 
 pub use crate::superfile::vector::builder::VectorConfig;
 use crate::{
@@ -576,6 +577,21 @@ fn append_stable_id_sidecar(out: &mut Vec<u8>, batch: &RecordBatch, id_column: &
         out.extend_from_slice(&col.value(i).to_le_bytes());
     }
     true
+}
+
+/// A packed id sidecar for `source`, rebuilt from its Parquet `_id` column.
+/// Reads only that column, so a rewrite that carries the rest stays a carry.
+/// Empty, so no sidecar, if the column is not `Decimal128`.
+fn rebuild_id_sidecar(source: &SuperfileReader) -> Result<Vec<u8>, BuildError> {
+    let docs: Vec<u32> = (0..source.n_docs() as u32).collect();
+    let batch = source
+        .take_by_local_doc_ids(&docs, &[source.id_column()])
+        .map_err(Error::other)?;
+    let mut raw = Vec::new();
+    if !append_stable_id_sidecar(&mut raw, &batch, source.id_column()) {
+        return Ok(Vec::new());
+    }
+    Ok(ids::encode_packed(&raw))
 }
 
 /// Materialize the stable-id sidecar from the accumulated batches: one
@@ -3124,9 +3140,20 @@ impl SuperfileBuilder {
         // The ids sidecar is derived from rows this build never decoded, so
         // it is carried too — re-packed when the source predates the packed
         // layout, which is the upgrade a rewrite is expected to perform.
+        // Opening the source checked only a packed sidecar's header, so its
+        // blocks are checked here. One with a bad block is rebuilt from the
+        // `_id` column instead, so a rewrite repairs it rather than failing.
         let raw_ids = region(kv::IDS_OFFSET, kv::IDS_LENGTH)?.map(|r| bytes.slice(r));
         let ids_bytes: Vec<u8> = match (&raw_ids, source.id_sidecar_is_packed()) {
-            (Some(ids), true) => ids.to_vec(),
+            (Some(ids), true) => match ids::PackedIds::open(ids, source.n_docs() as usize)
+                .and_then(|packed| packed.check_blocks())
+            {
+                Ok(()) => ids.to_vec(),
+                Err(reason) => {
+                    warn!(%reason, "rebuilding the id sidecar from the `_id` column");
+                    rebuild_id_sidecar(source)?
+                }
+            },
             (Some(ids), false) => ids::encode_packed(ids),
             (None, _) => Vec::new(),
         };
@@ -7324,10 +7351,48 @@ mod tests {
         );
     }
 
-    // ---- Raw stable-id sidecar: read, then repacked on carry ----
+    // ---- Stable-id sidecar on a rewrite ----
 
-    /// Rows in the raw-sidecar fixture.
-    const RAW_SIDECAR_ROWS: u64 = 64;
+    /// Rows in the sidecar fixture.
+    const SIDECAR_ROWS: u64 = 64;
+
+    /// A `SIDECAR_ROWS`-row superfile with a packed id sidecar, the batch it
+    /// was built from, and the options that built it.
+    fn sidecar_fixture() -> (BuilderOptions, RecordBatch, Bytes) {
+        let opts = opts_minimal();
+        let titles: Vec<String> = (0..SIDECAR_ROWS).map(|i| format!("row {i}")).collect();
+        let title = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
+        let body = LargeStringArray::from(vec!["x"; SIDECAR_ROWS as usize]);
+        let batch = RecordBatch::try_new(
+            opts.schema.clone(),
+            vec![
+                Arc::new(decimal128_ids(0..SIDECAR_ROWS)),
+                Arc::new(title),
+                Arc::new(body),
+            ],
+        )
+        .expect("build RecordBatch");
+        let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let bytes = Bytes::from(b.finish().expect("finish builder"));
+        (opts, batch, bytes)
+    }
+
+    /// Rewrite `source` the way a reindex does: keep its body and FTS index,
+    /// and write the new file.
+    fn carry_rewrite(
+        opts: BuilderOptions,
+        source: &SuperfileReader,
+    ) -> Result<Vec<u8>, BuildError> {
+        let mut carry = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        carry
+            .carry_fts_from_reader_scoped(source, None, CarryScope::AllColumns)
+            .expect("carry the FTS blob");
+        carry.set_carried_doc_count(SIDECAR_ROWS);
+        let mut out = Vec::new();
+        carry.finish_carrying_body_to(source, &mut out)?;
+        Ok(out)
+    }
 
     /// `bytes` re-spliced with its stable-id sidecar in the raw layout — one
     /// little-endian `i128` per row of `batch`, and no layout key — the form
@@ -7369,26 +7434,11 @@ mod tests {
     /// through it, and a carried rewrite repacks it without moving an id.
     #[test]
     fn a_raw_id_sidecar_reads_and_is_repacked_on_carry() {
-        let opts = opts_minimal();
-        let titles: Vec<String> = (0..RAW_SIDECAR_ROWS).map(|i| format!("row {i}")).collect();
-        let title = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
-        let body = LargeStringArray::from(vec!["x"; RAW_SIDECAR_ROWS as usize]);
-        let batch = RecordBatch::try_new(
-            opts.schema.clone(),
-            vec![
-                Arc::new(decimal128_ids(0..RAW_SIDECAR_ROWS)),
-                Arc::new(title),
-                Arc::new(body),
-            ],
-        )
-        .expect("build RecordBatch");
-        let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
-        b.add_batch(&batch, &[]).expect("add_batch");
-        let packed = Bytes::from(b.finish().expect("finish builder"));
+        let (opts, batch, packed) = sidecar_fixture();
         let raw = with_raw_id_sidecar(&packed, &batch);
 
         // Every row, out of order, so a mis-strided raw read cannot pass.
-        let locals: Vec<u32> = (0..RAW_SIDECAR_ROWS as u32).rev().collect();
+        let locals: Vec<u32> = (0..SIDECAR_ROWS as u32).rev().collect();
         let expected = SuperfileReader::open(packed)
             .expect("open packed superfile")
             .take_by_local_doc_ids(&locals, &["doc_id"])
@@ -7403,15 +7453,7 @@ mod tests {
             expected
         );
 
-        let mut carry = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
-        carry
-            .carry_fts_from_reader_scoped(&raw_reader, None, CarryScope::AllColumns)
-            .expect("carry the FTS blob");
-        carry.set_carried_doc_count(RAW_SIDECAR_ROWS);
-        let mut out = Vec::new();
-        carry
-            .finish_carrying_body_to(&raw_reader, &mut out)
-            .expect("carry the body");
+        let out = carry_rewrite(opts, &raw_reader).expect("carry the body");
         let repacked = SuperfileReader::open(Bytes::from(out)).expect("open the rewrite");
         assert!(
             repacked.id_sidecar_is_packed(),
@@ -7422,6 +7464,32 @@ mod tests {
                 .take_by_local_doc_ids(&locals, &["doc_id"])
                 .expect("ids via the repacked sidecar"),
             expected
+        );
+    }
+
+    #[test]
+    fn a_carry_rebuilds_a_malformed_id_sidecar_block() {
+        // A superfile with one broken block in its id sidecar, rewritten the way
+        // a reindex does.
+        //  - `open` takes it, since it checks only the sidecar's header.
+        //  - the rewrite succeeds, with a sidecar rebuilt from the `_id` column.
+        //  - every block of the new sidecar is good, and every `_id` matches.
+        // This test pins that a rewrite repairs a bad block instead of failing.
+        let (opts, _, bytes) = sidecar_fixture();
+        let damaged = Bytes::from(ids::with_damaged_id_block(&bytes, 0));
+        let source = SuperfileReader::open(damaged).expect("open checks only the header");
+        let out = carry_rewrite(opts, &source).expect("the rewrite repairs the sidecar");
+
+        assert_eq!(ids::check_id_sidecar(&out), Ok(()));
+        let rewrite = SuperfileReader::open(Bytes::from(out)).expect("open the rewrite");
+        let locals: Vec<u32> = (0..SIDECAR_ROWS as u32).collect();
+        assert_eq!(
+            rewrite
+                .take_by_local_doc_ids(&locals, &["doc_id"])
+                .expect("read every _id")
+                .column(0)
+                .as_ref(),
+            &decimal128_ids(0..SIDECAR_ROWS) as &dyn Array,
         );
     }
 
