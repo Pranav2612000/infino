@@ -11672,6 +11672,19 @@ pub(in crate::supertable) async fn refresh_and_orphaned_id_floor(
     storage: &Arc<dyn StorageProvider>,
     attempted_id: u64,
 ) -> Result<u64, SupertableCommitError> {
+    refresh_inner_state_async(inner, storage).await?;
+    let refreshed_id = inner.manifest.load_full().get_manifest_id();
+    Ok(orphaned_id_floor(storage, refreshed_id, attempted_id).await)
+}
+
+/// The probe half of [`refresh_and_orphaned_id_floor`], for a caller that
+/// has already refreshed to `refreshed_id`: the first free id past an
+/// unpublished list at `attempted_id`, or 0 when there is nothing to skip.
+pub(in crate::supertable) async fn orphaned_id_floor(
+    storage: &Arc<dyn StorageProvider>,
+    refreshed_id: u64,
+    attempted_id: u64,
+) -> u64 {
     /// Cap on sequential HEAD probes per retry. A contiguous orphan run
     /// longer than this escapes in chunks — each retry's floor lands on
     /// the first unprobed id and the next collision resumes the walk from
@@ -11680,10 +11693,8 @@ pub(in crate::supertable) async fn refresh_and_orphaned_id_floor(
     /// its body, so probes are not free).
     const MAX_ORPHAN_RUN_PROBES: u64 = 32;
 
-    refresh_inner_state_async(inner, storage).await?;
-    let refreshed_id = inner.manifest.load_full().get_manifest_id();
     if refreshed_id >= attempted_id {
-        return Ok(0);
+        return 0;
     }
     // Ids above the pointer are only ever held by unpublished lists, so
     // the occupied run starting at `attempted_id` is finite; the floor
@@ -11708,11 +11719,11 @@ pub(in crate::supertable) async fn refresh_and_orphaned_id_floor(
             }
         }
     }
-    Ok(if next_free_id > attempted_id {
+    if next_free_id > attempted_id {
         next_free_id
     } else {
         0
-    })
+    }
 }
 
 /// CAS-publish a successor manifest whose tombstone seq for every
