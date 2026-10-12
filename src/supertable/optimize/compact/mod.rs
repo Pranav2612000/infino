@@ -25,6 +25,7 @@ use futures::{
     future::BoxFuture,
     stream::{self, StreamExt},
 };
+use rand::random_range;
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tokio::{
@@ -79,6 +80,19 @@ use crate::{
 
 /// Number of seal/reseal/unseal requests to run in parallel at a time
 const MAX_CONCURRENT_SEAL_WRITES: usize = 64;
+
+/// How long a compaction commit keeps retrying lost races after
+/// `max_commit_retries` is used up. Its merged superfiles are already
+/// uploaded, so on a table with frequent commits it is worth waiting rather
+/// than throwing the merge away after a few quick losses.
+const COMMIT_RETRY_BUDGET: Duration = Duration::from_secs(60);
+
+/// Shortest and longest pause, in milliseconds, before a compaction commit
+/// retries. A lost race means another commit has just landed, which is the
+/// best time to try again, so the pause is short. The jitter keeps two
+/// compactors from retrying in lockstep.
+const RETRY_PAUSE_MIN_MS: u64 = 10;
+const RETRY_PAUSE_MAX_MS: u64 = 50;
 
 /// Held for as long as one process is reshaping superfiles, and released
 /// on drop. Compaction and reindex share it: both rewrite superfiles and
@@ -1061,8 +1075,11 @@ impl Supertable {
         // The batch's term-index delta, built on the first attempt and
         // appended again by any retry instead of rebuilt.
         let mut reserved_segment: Option<ReservedSegment> = None;
+        let started = Instant::now();
 
-        for attempt in 0..max_retries {
+        // Ends through the arms below: a commit, an error, or a lost race
+        // with neither attempts nor time left.
+        for attempt in 0.. {
             let mut current = inner.manifest.load_full();
             if next_id_floor > 0 {
                 current = Arc::new(current.with_next_manifest_id_floor(next_id_floor));
@@ -1258,7 +1275,7 @@ impl Supertable {
                 // batch and ending the pass.
                 Err(
                     e @ (CommitError::WriteContentionExhausted | CommitError::InputsChanged { .. }),
-                ) if attempt + 1 < max_retries => {
+                ) if attempt + 1 < max_retries || started.elapsed() < COMMIT_RETRY_BUDGET => {
                     warn!(
                         jobs = batch.len(),
                         attempt,
@@ -1274,7 +1291,10 @@ impl Supertable {
                     {
                         batch[owner].term_contributions.push(contribution);
                     }
-                    time::sleep(backoff_delay(attempt)).await;
+                    time::sleep(Duration::from_millis(random_range(
+                        RETRY_PAUSE_MIN_MS..=RETRY_PAUSE_MAX_MS,
+                    )))
+                    .await;
                     if let Err(e) = self.refresh().await {
                         unseal_batch(&wal_store, batch).await;
                         return Err(CompactionError::Refresh(e.to_string()));
@@ -4111,6 +4131,46 @@ mod tests {
         assert_eq!(st.manifest_id(), peer_id + 1);
         let n_superfiles = st.reader().expect("reader").n_superfiles();
         assert_eq!(n_superfiles, 2, "the merge and the peer's superfile");
+    }
+
+    /// Commit retries for the time-budget test, fewer than the losses it
+    /// injects.
+    const TIGHT_COMMIT_RETRIES: u32 = 2;
+    /// Pointer swaps the time-budget test makes lose.
+    const LOST_POINTER_SWAPS: usize = 4;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_keeps_retrying_past_max_commit_retries_within_the_time_budget() {
+        // The merge is uploaded before its commit. A commit that has lost more
+        // races than `max_commit_retries` keeps retrying while time is left,
+        // rather than throwing the merge away.
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let st = Supertable::create(
+            default_supertable_options()
+                .with_storage(storage)
+                .with_max_commit_retries(TIGHT_COMMIT_RETRIES),
+        )
+        .expect("create supertable");
+        commit_mergeable_superfiles(&st);
+        let rows: HashSet<i128> = listed_row_ids(&st).await.into_iter().collect();
+        faults.fail_with(
+            FaultKind::Precondition,
+            FaultOp::PutIfMatch,
+            POINTER_PATH,
+            LOST_POINTER_SWAPS,
+        );
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact commits once the swaps stop losing");
+
+        assert_eq!(faults.fired(), LOST_POINTER_SWAPS);
+        let listed = assert_listed_once(&st, &rows).await;
+        assert_eq!(listed.len(), 1, "one merged superfile: {listed:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
