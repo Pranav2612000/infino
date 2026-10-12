@@ -250,8 +250,14 @@ pub(crate) async fn append_delta(
 /// stay valid. No posting names a padding entry. `None` when `current` was
 /// not built on `prior` (e.g. another rebuild replaced it), or the base does
 /// not fit below `prior`'s length.
+///
+/// Relies on every segment after `prior` naming only ordinals at or past
+/// `prior`'s length. The checks below cannot see posting ordinals; it holds
+/// because `append_delta`, the only delta writer, numbers from the length of
+/// the root it extends. A new root writer must keep it.
 pub(crate) fn splice_base(base: &Root, prior: &Root, current: &Root) -> Option<Root> {
     if !current.superfiles.starts_with(&prior.superfiles)
+        || !current.id_mins.starts_with(&prior.id_mins)
         || !current.segments.starts_with(&prior.segments)
     {
         return None;
@@ -1985,6 +1991,10 @@ mod tests {
         let rebuilt_elsewhere = tagged_root(&[1, 3], &[7, 8]);
         assert_eq!(splice_base(&base, &prior, &rebuilt_elsewhere), None);
 
+        let mut id_mins_differ = tagged_root(&[1, 2, 4], &[0, 1]);
+        id_mins_differ.id_mins[0] += 1;
+        assert_eq!(splice_base(&base, &prior, &id_mins_differ), None);
+
         let long_base = tagged_root(&[1, 2, 3], &[9]);
         let current = tagged_root(&[1, 2, 4], &[0, 1]);
         assert_eq!(splice_base(&long_base, &prior, &current), None);
@@ -2006,6 +2016,8 @@ mod tests {
         let entries = reader.manifest().get_all_superfiles();
         commit_without_postings(&st, &storage, Vec::new(), &entries[..1]);
         st.block_on_query(st.refresh()).expect("refresh");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (before, _) = live_and_covered(&st, &storage, &rt);
 
         // Another process commits just before the rebuild publishes.
         let local: Arc<dyn StorageProvider> =
@@ -2018,7 +2030,6 @@ mod tests {
         });
         maintenance_only_optimize(&st);
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (live, root) = live_and_covered(&st, &storage, &rt);
         assert_eq!(
             root.superfiles.iter().filter(|id| id.is_nil()).count(),
@@ -2044,6 +2055,18 @@ mod tests {
             .map(|p| index.superfile_id(p.superfile).expect("ordinal resolves"))
             .collect();
         assert_eq!(found, live, "`shared` is found in every live superfile");
+        // A term only the peer's superfile holds resolves to it alone, so
+        // its delta's ordinal names the right superfile.
+        let peer: HashSet<Uuid> = live.difference(&before).copied().collect();
+        assert_eq!(peer.len(), 1, "the peer added one superfile");
+        let peer_term = format!("s{SEGMENTS}d00");
+        let found: HashSet<Uuid> = rt
+            .block_on(index.postings(title_id(), &peer_term))
+            .expect("lookup")
+            .iter()
+            .map(|p| index.superfile_id(p.superfile).expect("ordinal resolves"))
+            .collect();
+        assert_eq!(found, peer, "the peer's own term resolves to its superfile");
 
         maintenance_only_optimize(&st);
         let (live, root) = live_and_covered(&st, &storage, &rt);
@@ -2147,9 +2170,9 @@ mod tests {
             hook_faults.fail(FaultOp::Get, "term-index/root-", 2);
         });
         maintenance_only_optimize(&st);
-        // How many reads the retry makes is not the point; disarm the rest.
-        faults.clear();
-        assert!(faults.fired() > 0, "the root failed to load");
+        // The retry loads the root twice, for the rebuild check and the
+        // splice, because a failed load is not cached.
+        assert_eq!(faults.fired(), 2, "both root loads failed");
 
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (live, root) = live_and_covered(&st, &storage, &rt);

@@ -10430,7 +10430,9 @@ pub(in crate::supertable) async fn stamp_term_index(
     if inner.manifest.load().fts_configs().is_empty() {
         return Ok(());
     }
-    // The last build's root, and the root it was built to replace.
+    // The last build's root, and the root it was built to replace. A retry
+    // reuses its slices without PUTting them again: were one reclaimed in
+    // between, queries would fall back to summary routing until a rebuild.
     let last_build: Mutex<Option<(Root, Option<Root>)>> = Mutex::new(None);
     stamp_with_retries(inner, &storage, "term-index", |old| {
         let storage = &storage;
