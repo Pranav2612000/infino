@@ -66,6 +66,7 @@ use crate::{
         query::prune::PruneLeaf,
         schema::FieldId,
     },
+    utils::trace::detail_span,
 };
 
 /// Object-store directory prefix for term-index objects, sibling to the
@@ -200,6 +201,10 @@ pub(crate) async fn write_slice(
 /// Persist the root; idempotent by content hash. Call after every slice it
 /// names is written, so a manifest never references a root whose slices
 /// are not all present.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(skip_all, fields(superfiles = root.superfiles.len()))
+)]
 pub(crate) async fn write_root(
     storage: &dyn StorageProvider,
     root: &Root,
@@ -294,7 +299,12 @@ pub(crate) async fn append_reserved(
     });
     if !reusable {
         let base = len as u32 + RESERVED_ORDINAL_SLACK;
-        let built = build_segment(contributions, policy, base)?;
+        let built = detail_span!(
+            "term_index.build_segment",
+            inputs = contributions.len(),
+            ordinal_base = base,
+        )
+        .in_scope(|| build_segment(contributions, policy, base))?;
         write_slices(storage, built.slices).await?;
         *reserved = Some(ReservedSegment {
             base,
