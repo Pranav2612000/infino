@@ -282,6 +282,7 @@ pub async fn probe_pointer(
     }
 }
 
+#[derive(Clone)]
 pub struct EncodedPart {
     pub part: ManifestPart,
     /// Primary wire form: FULL (fp32 + admit slab) for user manifests —

@@ -54,7 +54,7 @@ use crate::{
         error::CompactionError,
         handle::{SupertableInner, hidden_vector_index_compaction_settings},
         manifest::{
-            SuperfileUri,
+            RebuiltParts, SuperfileUri,
             list::PartitionStrategy,
             listed_once,
             term_index::{Contribution as TermContribution, ReservedSegment},
@@ -1075,6 +1075,8 @@ impl Supertable {
         // The batch's term-index delta, built on the first attempt and
         // appended again by any retry instead of rebuilt.
         let mut reserved_segment: Option<ReservedSegment> = None;
+        // Parts rebuilt for the batch's removals, reused by any retry.
+        let mut rebuilt_parts = RebuiltParts::default();
         let started = Instant::now();
 
         // Ends through the arms below: a commit, an error, or a lost race
@@ -1202,6 +1204,7 @@ impl Supertable {
                 &mut pending_storage_replaces,
                 &term_contributions,
                 Some(&mut reserved_segment),
+                Some(&mut rebuilt_parts),
                 Some(&mut fence),
             )
             .instrument(detail_span!(

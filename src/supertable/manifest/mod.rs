@@ -2102,7 +2102,7 @@ impl ManifestSnapshot {
             return Err(ManifestError::SuperfileAlreadyListed { superfile_id });
         }
 
-        self.update_inner(new_entries, entries_to_remove, false)
+        self.update_inner(new_entries, entries_to_remove, false, None)
             .await
     }
 
@@ -2110,16 +2110,20 @@ impl ManifestSnapshot {
     /// commits already represented by those files. Preserve each replacement
     /// entry's inherited `birth_version` so the hidden drain watermark keeps
     /// recognizing that data as drained. Refuses duplicates like [`Self::update`].
+    ///
+    /// A commit that retries passes the same `rebuilt` to every attempt, so
+    /// parts an earlier attempt rebuilt are reused (see [`RebuiltParts`]).
     pub(crate) async fn update_preserving_birth_versions(
         &self,
         new_entries: &[Arc<SuperfileEntry>],
         entries_to_remove: &[Arc<SuperfileEntry>],
+        rebuilt: Option<&mut RebuiltParts>,
     ) -> Result<(ManifestSnapshot, Vec<EncodedPart>), ManifestError> {
         if let Some(superfile_id) = self.first_listed(new_entries) {
             return Err(ManifestError::SuperfileAlreadyListed { superfile_id });
         }
 
-        self.update_inner(new_entries, entries_to_remove, true)
+        self.update_inner(new_entries, entries_to_remove, true, rebuilt)
             .await
     }
 
@@ -2130,7 +2134,7 @@ impl ManifestSnapshot {
         &self,
         new_entries: &[Arc<SuperfileEntry>],
     ) -> Result<(ManifestSnapshot, Vec<EncodedPart>), ManifestError> {
-        self.update_inner(new_entries, &[], false).await
+        self.update_inner(new_entries, &[], false, None).await
     }
 
     /// The first of `entries` whose `superfile_id` this manifest already
@@ -2156,6 +2160,7 @@ impl ManifestSnapshot {
         new_entries: &[Arc<SuperfileEntry>],
         entries_to_remove: &[Arc<SuperfileEntry>],
         preserve_birth_versions: bool,
+        mut rebuilt: Option<&mut RebuiltParts>,
     ) -> Result<(ManifestSnapshot, Vec<EncodedPart>), ManifestError> {
         // 1. Resolve the effective partition strategy. Locked at
         //    first commit: read from the existing manifest list
@@ -2305,8 +2310,43 @@ impl ManifestSnapshot {
                 .iter()
                 .map(|r| r.superfile_id)
                 .collect::<HashSet<_>>();
+            if let Some(cache) = rebuilt.as_deref_mut()
+                && cache.removed != removal_ids
+            {
+                cache.removed = removal_ids.clone();
+                cache.by_source.clear();
+            }
             for entry in out_list_entries {
                 // TODO: Handle merging 2 parts into one if their sum is within threshold
+
+                // A part from the base an earlier attempt already rebuilt for
+                // these removals. A part this commit appended to is new, so
+                // never found here.
+                let source = entry.content_hash;
+                let from_base = !parts_to_write
+                    .iter()
+                    .any(|ep| ep.part.part_id == entry.part_id);
+                let done = rebuilt
+                    .as_deref()
+                    .filter(|_| from_base)
+                    .and_then(|cache| cache.by_source.get(&source).cloned());
+                if let Some(done) = done {
+                    match done {
+                        RebuiltPart::Unchanged => out_list_entries_after_removal.push(entry),
+                        RebuiltPart::Dropped => {}
+                        RebuiltPart::Rebuilt(rebuilt_part) => {
+                            let (fresh_entry, fresh_encoded_part) = *rebuilt_part;
+                            parts_to_write.push(fresh_encoded_part);
+                            out_list_entries_after_removal.push(fresh_entry);
+                        }
+                    }
+                    continue;
+                }
+                let mut remember = |outcome: RebuiltPart| {
+                    if from_base && let Some(cache) = rebuilt.as_deref_mut() {
+                        cache.by_source.insert(source, outcome);
+                    }
+                };
 
                 // Fetch the part's current superfiles — from parts_to_write (freshly
                 // rebuilt this commit) or the prior manifest.
@@ -2329,6 +2369,7 @@ impl ManifestSnapshot {
 
                 // No superfile removed from this part → keep it unchanged.
                 if final_superfile_entries.len() == superfile_entries_in_part.len() {
+                    remember(RebuiltPart::Unchanged);
                     out_list_entries_after_removal.push(entry);
                     continue;
                 }
@@ -2344,11 +2385,18 @@ impl ManifestSnapshot {
                 // run with zero parts), and nothing else would ever collect a
                 // retained empty stub (compaction merges superfiles, not parts).
                 if final_superfile_entries.is_empty() {
+                    remember(RebuiltPart::Dropped);
                     continue;
                 }
 
                 let (fresh_entry, fresh_encoded_part) =
                     rebuild_part_and_entry(vec![], final_superfile_entries, None, hidden_table);
+                if from_base {
+                    remember(RebuiltPart::Rebuilt(Box::new((
+                        fresh_entry.clone(),
+                        fresh_encoded_part.clone(),
+                    ))));
+                }
 
                 if let Some(existing) = existing_part_to_update {
                     *existing = fresh_encoded_part;
@@ -2534,6 +2582,32 @@ impl ManifestSnapshot {
 
         Ok((new_manifest, parts_to_write))
     }
+}
+
+/// Parts a commit rebuilt for its removals, kept across its retries.
+///
+/// A part is content-addressed, so a retry that meets the same part (the
+/// winning commit left it alone) for the same removals would rebuild it to
+/// the same thing. Taking it from here skips the part load and both
+/// encodes. Holds the encoded bytes of every rebuilt part until the commit
+/// ends. Cleared when the removals change, e.g. a batch that lost a job.
+#[derive(Default)]
+pub(crate) struct RebuiltParts {
+    /// The removals these outcomes were worked out for.
+    removed: HashSet<Uuid>,
+    /// What each base part, by content hash, became.
+    by_source: HashMap<ContentHash, RebuiltPart>,
+}
+
+/// What applying the removals did to one part.
+#[derive(Clone)]
+enum RebuiltPart {
+    /// None of its superfiles was removed.
+    Unchanged,
+    /// All of its superfiles were removed.
+    Dropped,
+    /// Rebuilt without the removed superfiles.
+    Rebuilt(Box<(ManifestPartEntry, EncodedPart)>),
 }
 
 /// build one `ManifestPart` from `superfiles` + the
@@ -9453,6 +9527,150 @@ mod tests {
         assert!(
             matches!(err, ManifestLoadError::Parse(_)),
             "expected a parse error, got {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rebuilt_parts_tests {
+    use std::{collections::HashSet, sync::Arc};
+
+    use tempfile::TempDir;
+    use tokio::runtime::Runtime;
+    use uuid::Uuid;
+
+    use super::{ManifestSnapshot, RebuiltParts, SuperfileEntry};
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        supertable::Supertable,
+        test_helpers::{build_title_batch, default_supertable_options},
+    };
+
+    /// Superfiles per part, so a few commits spread over several parts.
+    const SUPERFILES_PER_PART: u64 = 2;
+    /// Commits in the fixture: three parts at two superfiles a part.
+    const COMMITS: usize = 5;
+
+    fn commit_titles(st: &Supertable, titles: &[&str]) {
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(titles)).expect("append");
+        w.commit().expect("commit");
+    }
+
+    /// A table whose superfiles span several manifest parts.
+    fn multi_part_table() -> (TempDir, Supertable) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            default_supertable_options()
+                .with_target_superfiles_per_part(SUPERFILES_PER_PART)
+                .with_storage(storage),
+        )
+        .expect("create");
+        for i in 0..COMMITS {
+            commit_titles(&st, &[&format!("title {i}")]);
+        }
+        (dir, st)
+    }
+
+    fn ids(manifest: &ManifestSnapshot) -> HashSet<Uuid> {
+        manifest
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect()
+    }
+
+    #[test]
+    fn a_retry_reuses_the_parts_an_earlier_attempt_rebuilt() {
+        let (_dir, st) = multi_part_table();
+        let rt = Runtime::new().expect("runtime");
+        let base = st.inner().manifest.load_full();
+        assert!(
+            base.get_all_list_entries().len() > 1,
+            "the fixture spans several parts"
+        );
+        // One superfile out of the first part, which keeps the other.
+        let removed: Vec<Arc<SuperfileEntry>> = vec![Arc::clone(&base.get_all_superfiles()[0])];
+
+        // Each rebuild mints a new part id, so without the cache two
+        // attempts never produce the same part.
+        let (_, once) = rt
+            .block_on(base.update_preserving_birth_versions(&[], &removed, None))
+            .expect("update");
+        let (_, twice) = rt
+            .block_on(base.update_preserving_birth_versions(&[], &removed, None))
+            .expect("update");
+        assert_ne!(once[0].part.part_id, twice[0].part.part_id);
+
+        let mut rebuilt = RebuiltParts::default();
+        let (_, first) = rt
+            .block_on(base.update_preserving_birth_versions(&[], &removed, Some(&mut rebuilt)))
+            .expect("first attempt");
+        assert_eq!(first.len(), 1, "only the first part is rebuilt");
+
+        // Another commit lands; it touches only the last part.
+        commit_titles(&st, &["winner"]);
+        let winner = st.inner().manifest.load_full();
+        let (successor, retry) = rt
+            .block_on(winner.update_preserving_birth_versions(&[], &removed, Some(&mut rebuilt)))
+            .expect("retry");
+
+        assert_eq!(retry.len(), 1);
+        assert_eq!(
+            retry[0].part.part_id, first[0].part.part_id,
+            "the retry reuses the rebuilt part"
+        );
+        assert_eq!(retry[0].encoded, first[0].encoded);
+        let mut expected = ids(&winner);
+        expected.remove(&removed[0].superfile_id);
+        assert_eq!(
+            ids(&successor),
+            expected,
+            "the winner's superfile is kept, the removed one dropped"
+        );
+
+        // Other removals rebuild the part again.
+        let other: Vec<Arc<SuperfileEntry>> = vec![Arc::clone(&base.get_all_superfiles()[1])];
+        let (_, fresh) = rt
+            .block_on(winner.update_preserving_birth_versions(&[], &other, Some(&mut rebuilt)))
+            .expect("other removals");
+        assert_ne!(fresh[0].part.part_id, first[0].part.part_id);
+    }
+
+    #[test]
+    fn a_retry_rebuilds_a_part_the_winner_changed() {
+        let (_dir, st) = multi_part_table();
+        let rt = Runtime::new().expect("runtime");
+        let base = st.inner().manifest.load_full();
+        let removed: Vec<Arc<SuperfileEntry>> = vec![Arc::clone(&base.get_all_superfiles()[0])];
+        let mut rebuilt = RebuiltParts::default();
+        let (_, first) = rt
+            .block_on(base.update_preserving_birth_versions(&[], &removed, Some(&mut rebuilt)))
+            .expect("first attempt");
+
+        // The winner removes the other superfile of the same part, so the
+        // part the first attempt rebuilt is no longer the base's.
+        let other = Arc::clone(&base.get_all_superfiles()[1]);
+        let (changed, _) = rt
+            .block_on(base.update(&[], &[Arc::clone(&other)]))
+            .expect("winner");
+        let (successor, retry) = rt
+            .block_on(changed.update_preserving_birth_versions(&[], &removed, Some(&mut rebuilt)))
+            .expect("retry");
+
+        assert!(
+            retry
+                .iter()
+                .all(|p| p.part.part_id != first[0].part.part_id),
+            "the stale rebuild is not reused"
+        );
+        let successor_ids = ids(&successor);
+        assert!(!successor_ids.contains(&removed[0].superfile_id));
+        assert!(
+            !successor_ids.contains(&other.superfile_id),
+            "the winner's removal stands"
         );
     }
 }
