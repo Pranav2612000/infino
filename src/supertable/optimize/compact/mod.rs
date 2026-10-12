@@ -53,8 +53,10 @@ use crate::{
         error::CompactionError,
         handle::{SupertableInner, hidden_vector_index_compaction_settings},
         manifest::{
-            SuperfileUri, list::PartitionStrategy, listed_once,
-            term_index::Contribution as TermContribution,
+            SuperfileUri,
+            list::PartitionStrategy,
+            listed_once,
+            term_index::{Contribution as TermContribution, ReservedSegment},
         },
         opann::rerank_pool_hint,
         query::dispatch::open_compaction_input,
@@ -1056,6 +1058,9 @@ impl Supertable {
         // Raised when an attempt finds its manifest id taken by a list that
         // was never published, so later attempts derive their id past it.
         let mut next_id_floor: u64 = 0;
+        // The batch's term-index delta, built on the first attempt and
+        // appended again by any retry instead of rebuilt.
+        let mut reserved_segment: Option<ReservedSegment> = None;
 
         for attempt in 0..max_retries {
             let mut current = inner.manifest.load_full();
@@ -1179,6 +1184,7 @@ impl Supertable {
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
                 &term_contributions,
+                Some(&mut reserved_segment),
                 Some(&mut fence),
             )
             .instrument(detail_span!(

@@ -172,7 +172,9 @@ use crate::{
             listed_once, options_hash,
             part::{self as part_mod, PartId},
             superfile_stem,
-            term_index::{self, Contribution as TermContribution, Root, TermIndexError},
+            term_index::{
+                self, Contribution as TermContribution, ReservedSegment, Root, TermIndexError,
+            },
         },
         mutations::{
             CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -9819,6 +9821,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             &mut Vec::new(),
             &[],
             None,
+            None,
         )
         .await
         {
@@ -11017,6 +11020,7 @@ pub(in crate::supertable) async fn persist_commit_async(
                 pending_replaces,
                 contributions,
                 None,
+                None,
             )
             .await
             {
@@ -11400,6 +11404,9 @@ pub(crate) async fn try_commit_attempt(
     pending_storage_writes: &mut Vec<(String, Bytes)>,
     pending_storage_replaces: &mut Vec<(String, Bytes)>,
     term_contributions: &[TermContribution],
+    // Set by a caller that retries: the delta is built once at a reserved
+    // ordinal and kept here across attempts (see `term_index::append_reserved`).
+    reserved_segment: Option<&mut Option<ReservedSegment>>,
     // Checked immediately before the pointer PUT; see [`CommitFence`].
     fence: Option<&mut dyn CommitFence>,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
@@ -11494,8 +11501,9 @@ pub(crate) async fn try_commit_attempt(
     //     forward), then the new root's reference on this successor. So a
     //     visible superfile always has postings, and a crash between these
     //     writes and the CAS leaves only orphans for GC. On a lost CAS the
-    //     retry rebuilds against the winner's root; the slices are
-    //     content-addressed, so their re-PUTs are no-ops.
+    //     retry rebuilds against the winner's root, unless the caller keeps
+    //     a reserved segment: then the retry appends the segment it already
+    //     built and writes only a new root.
     //
     //     Runs after the pointer fence above so a purged table refuses the
     //     commit before any artifact is written. A prior root that cannot
@@ -11547,13 +11555,22 @@ pub(crate) async fn try_commit_attempt(
                 true => current_manifest.term_index_complete(),
                 false => current_manifest.holds_no_superfiles(),
             };
-        let reference = term_index::append_delta(
-            storage.as_ref(),
-            prior,
-            term_contributions,
-            &term_index::BuildPolicy::default(),
-        )
-        .await
+        let policy = term_index::BuildPolicy::default();
+        let reference = match reserved_segment {
+            Some(reserved) => {
+                term_index::append_reserved(
+                    storage.as_ref(),
+                    prior,
+                    term_contributions,
+                    &policy,
+                    reserved,
+                )
+                .await
+            }
+            None => {
+                term_index::append_delta(storage.as_ref(), prior, term_contributions, &policy).await
+            }
+        }
         .map_err(|e| BuildError::Store(e.to_string()))?;
         new_manifest = new_manifest.with_term_index_ref(reference, complete);
     } else if !every_new_covered
