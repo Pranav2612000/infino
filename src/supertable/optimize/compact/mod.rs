@@ -67,8 +67,9 @@ use crate::{
         writer::{
             CommitFence, CommitListMetadata, NewEntryBirthVersions, PreparedSuperfile, ShardOutput,
             backoff_delay, finalize_compaction_commit, maint_pool, persist_list_metadata_async,
-            prepare_superfile_named, recalibrate_probe_laws, refresh_slow_vector_state,
-            split_overflow_cells, try_commit_attempt, write_superfile_list,
+            prepare_superfile_named, recalibrate_probe_laws, refresh_and_orphaned_id_floor,
+            refresh_slow_vector_state, split_overflow_cells, try_commit_attempt,
+            write_superfile_list,
         },
     },
     utils::trace::{RegionUsage, detail_span, record},
@@ -1045,9 +1046,15 @@ impl Supertable {
             )));
         }
         let carried_sidecar = carried.first().copied();
+        // Raised when an attempt finds its manifest id taken by a list that
+        // was never published, so later attempts derive their id past it.
+        let mut next_id_floor: u64 = 0;
 
         for attempt in 0..max_retries {
-            let current = inner.manifest.load_full();
+            let mut current = inner.manifest.load_full();
+            if next_id_floor > 0 {
+                current = Arc::new(current.with_next_manifest_id_floor(next_id_floor));
+            }
 
             // Another compactor already merged some job's inputs — that job has
             // nothing left to commit, so drop it and keep the rest. On a retry
@@ -1153,6 +1160,7 @@ impl Supertable {
                 wal_store: &wal_store,
                 batch: &mut batch,
             };
+            let attempted_id = current.get_next_manifest_id();
             let attempt_outcome = try_commit_attempt(
                 storage.clone(),
                 Arc::clone(&opts),
@@ -1254,9 +1262,12 @@ impl Supertable {
                         batch[owner].term_contributions.push(contribution);
                     }
                     time::sleep(backoff_delay(attempt)).await;
-                    if let Err(e) = self.refresh().await {
-                        unseal_batch(&wal_store, batch).await;
-                        return Err(CompactionError::Refresh(e.to_string()));
+                    match refresh_and_orphaned_id_floor(inner, &storage, attempted_id).await {
+                        Ok(floor) => next_id_floor = next_id_floor.max(floor),
+                        Err(e) => {
+                            unseal_batch(&wal_store, batch).await;
+                            return Err(CompactionError::Refresh(e.to_string()));
+                        }
                     }
                 }
                 Err(e) => {
@@ -2291,7 +2302,7 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             error::CompactionError,
-            manifest::commit::{POINTER_PATH, get_current_manifest_etag},
+            manifest::commit::{POINTER_PATH, get_current_manifest_etag, manifest_uri},
             schema::change::{FieldPatch, SchemaPatch},
             storage::{LocalFsStorageProvider, StorageProvider},
             writer::persist_commit_async,
@@ -3956,6 +3967,43 @@ mod tests {
             let listed = assert_listed_once(&st, &rows).await;
             assert_eq!(listed.len(), 1, "one merged superfile: {listed:?}");
         }
+    }
+
+    /// Stands in for a manifest list whose writer died before its pointer
+    /// PUT. Never parsed: no pointer names it.
+    const UNPUBLISHED_LIST_BYTES: &[u8] = b"manifest list never published";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_commits_past_an_unpublished_manifest_list() {
+        // A list sits at the next manifest id while the pointer stays put.
+        // Lists are create-only, so retrying that id can never publish: the
+        // commit has to derive its next id past it.
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_mergeable_superfiles(&st);
+        let rows: HashSet<i128> = listed_row_ids(&st).await.into_iter().collect();
+        let storage = st
+            .inner()
+            .options
+            .storage
+            .clone()
+            .expect("storage-backed table");
+        let taken_id = st.manifest_id() + 1;
+        storage
+            .put_atomic(
+                &manifest_uri(taken_id),
+                Bytes::from_static(UNPUBLISHED_LIST_BYTES),
+            )
+            .await
+            .expect("unpublished list");
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact commits past the unpublished list");
+
+        assert!(st.manifest_id() > taken_id, "published past the taken id");
+        let listed = assert_listed_once(&st, &rows).await;
+        assert_eq!(listed.len(), 1, "one merged superfile: {listed:?}");
     }
 
     /// Vector dimension of the multi-cell fixture.
