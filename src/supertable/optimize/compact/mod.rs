@@ -1253,11 +1253,11 @@ impl Supertable {
                     {
                         batch[owner].term_contributions.push(contribution);
                     }
+                    time::sleep(backoff_delay(attempt)).await;
                     if let Err(e) = self.refresh().await {
                         unseal_batch(&wal_store, batch).await;
                         return Err(CompactionError::Refresh(e.to_string()));
                     }
-                    time::sleep(backoff_delay(attempt)).await;
                 }
                 Err(e) => {
                     unseal_batch(&wal_store, batch).await;
