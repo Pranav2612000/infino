@@ -150,6 +150,11 @@ pub const MAX_STEM_CHARS: usize = 64;
 /// prefix at create; this constant only keeps pre-prefix tables readable.
 pub(crate) const DEFAULT_VECTOR_INDEX_PREFIX: &str = "_vector_index";
 
+/// Most encoded bytes [`RebuiltParts`] keeps. The bytes are shared with the
+/// attempt that wrote them, so what this bounds is how much stays alive
+/// between attempts. A part past it is rebuilt on each attempt, as before.
+const REBUILT_PARTS_MAX_BYTES: usize = 256 * 1024 * 1024;
+
 /// One immutable point-in-time view of the supertable.
 ///
 /// **Construction is copy-on-write.** Adding a superfile via
@@ -1240,7 +1245,7 @@ impl ManifestSnapshot {
         &self,
         storage: &dyn StorageProvider,
         expected_prev_etag: Option<&str>,
-        parts_to_write: &[&[u8]],
+        parts_to_write: &[Bytes],
     ) -> Result<(), CommitError> {
         let Some(list_to_write) = self.list.as_ref() else {
             return Ok(());
@@ -1254,7 +1259,7 @@ impl ManifestSnapshot {
         let list_fut = write_manifest(storage, list_to_write);
         let part_futs = parts_to_write
             .iter()
-            .map(|encoded| write_part_bytes(storage, encoded));
+            .map(|encoded| write_part_bytes(storage, encoded.clone()));
         let part_join = future::join_all(part_futs);
 
         let (list_res, part_results) = tokio::join!(list_fut, part_join);
@@ -2160,7 +2165,7 @@ impl ManifestSnapshot {
         new_entries: &[Arc<SuperfileEntry>],
         entries_to_remove: &[Arc<SuperfileEntry>],
         preserve_birth_versions: bool,
-        mut rebuilt: Option<&mut RebuiltParts>,
+        rebuilt: Option<&mut RebuiltParts>,
     ) -> Result<(ManifestSnapshot, Vec<EncodedPart>), ManifestError> {
         // 1. Resolve the effective partition strategy. Locked at
         //    first commit: read from the existing manifest list
@@ -2172,6 +2177,8 @@ impl ManifestSnapshot {
         // a user part to routing-only wire (that would drop its fp32
         // summaries durably, with no sibling to recover from).
         let hidden_table = matches!(&strategy, PartitionStrategy::VectorCell { .. });
+        // Hidden tables keep no manifest parts, so there is nothing to reuse.
+        let mut rebuilt = rebuilt.filter(|_| !hidden_table);
 
         // 2. Stamp each new entry with its partition key — this also validates
         //    against the strategy (surfaces SuperfileSpansPartition /
@@ -2585,11 +2592,6 @@ impl ManifestSnapshot {
     }
 }
 
-/// Most encoded bytes [`RebuiltParts`] keeps. The bytes are shared with the
-/// attempt that wrote them, so what this bounds is how much stays alive
-/// between attempts. A part past it is rebuilt on each attempt, as before.
-const REBUILT_PARTS_MAX_BYTES: usize = 256 * 1024 * 1024;
-
 /// Parts a commit rebuilt for its removals, kept across its retries.
 ///
 /// A part is content-addressed, so a retry that meets the same part (the
@@ -2623,7 +2625,7 @@ impl RebuiltParts {
     /// bytes past the cap.
     fn keep(&mut self, source: ContentHash, outcome: RebuiltPart) {
         let bytes = outcome.bytes();
-        if self.by_source.contains_key(&source) || self.bytes + bytes > self.max_bytes {
+        if self.bytes + bytes > self.max_bytes {
             return;
         }
         self.bytes += bytes;
@@ -4642,20 +4644,21 @@ mod tests {
     use dashmap::DashMap;
     use datafusion::scalar::ScalarValue;
     use tempfile::TempDir;
-    use tokio::sync::OnceCell;
+    use tokio::{runtime::Runtime, sync::OnceCell};
 
     use super::*;
     use crate::{
         storage::LocalFsStorageProvider,
         superfile::{builder::FtsConfig, vector::distance::distance},
         supertable::{
+            Supertable,
             manifest::{
                 commit::{PartWriteResult, write_manifest_part},
                 list::{Manifest, PartitionStrategy},
             },
             schema::LegacyNames,
         },
-        test_helpers::{default_tokenizer, fid},
+        test_helpers::{build_title_batch, default_supertable_options, default_tokenizer, fid},
     };
 
     /// Deterministic synthetic fp32 centroids for cluster-scoring tests.
@@ -6863,10 +6866,10 @@ mod tests {
             routing.len(),
             full.len()
         );
-        write_part_bytes(storage.as_ref(), &full)
+        write_part_bytes(storage.as_ref(), Bytes::from(full.clone()))
             .await
             .expect("put full part");
-        write_part_bytes(storage.as_ref(), &routing)
+        write_part_bytes(storage.as_ref(), Bytes::from(routing.clone()))
             .await
             .expect("put routing part");
         let list = Manifest {
@@ -9574,22 +9577,6 @@ mod tests {
             "expected a parse error, got {err:?}"
         );
     }
-}
-
-#[cfg(test)]
-mod rebuilt_parts_tests {
-    use std::{collections::HashSet, sync::Arc};
-
-    use tempfile::TempDir;
-    use tokio::runtime::Runtime;
-    use uuid::Uuid;
-
-    use super::{ManifestSnapshot, RebuiltParts, SuperfileEntry};
-    use crate::{
-        storage::{LocalFsStorageProvider, StorageProvider},
-        supertable::Supertable,
-        test_helpers::{build_title_batch, default_supertable_options},
-    };
 
     /// Superfiles per part, so a few commits spread over several parts.
     const SUPERFILES_PER_PART: u64 = 2;
@@ -9693,7 +9680,12 @@ mod rebuilt_parts_tests {
         let (_dir, st) = multi_part_table();
         let rt = Runtime::new().expect("runtime");
         let base = st.inner().manifest.load_full();
-        let removed: Vec<Arc<SuperfileEntry>> = vec![Arc::clone(&base.get_all_superfiles()[0])];
+        let superfiles = base.get_all_superfiles();
+        // The whole first part, and one superfile of the second.
+        let removed: Vec<Arc<SuperfileEntry>> = [0, 1, 2]
+            .iter()
+            .map(|&i| Arc::clone(&superfiles[i]))
+            .collect();
         // No room for any rebuilt part's bytes.
         let mut rebuilt = RebuiltParts {
             max_bytes: 0,
@@ -9702,7 +9694,13 @@ mod rebuilt_parts_tests {
         let (_, first) = rt
             .block_on(base.update_preserving_birth_versions(&[], &removed, Some(&mut rebuilt)))
             .expect("first attempt");
+        assert_eq!(first.len(), 1, "only the second part is rebuilt");
         assert_eq!(rebuilt.bytes, 0, "nothing past the cap is kept");
+        // Outcomes that hold no bytes are kept whatever the cap.
+        let kept = |want: fn(&RebuiltPart) -> bool| rebuilt.by_source.values().any(want);
+        assert!(kept(|o| matches!(o, RebuiltPart::Dropped)));
+        assert!(kept(|o| matches!(o, RebuiltPart::Unchanged)));
+        assert!(!kept(|o| matches!(o, RebuiltPart::Rebuilt(_))));
 
         let (successor, retry) = rt
             .block_on(base.update_preserving_birth_versions(&[], &removed, Some(&mut rebuilt)))
@@ -9711,7 +9709,11 @@ mod rebuilt_parts_tests {
             retry[0].part.part_id, first[0].part.part_id,
             "rebuilt again"
         );
-        assert!(!ids(&successor).contains(&removed[0].superfile_id));
+        let mut expected = ids(&base);
+        for entry in &removed {
+            expected.remove(&entry.superfile_id);
+        }
+        assert_eq!(ids(&successor), expected);
     }
 
     #[test]

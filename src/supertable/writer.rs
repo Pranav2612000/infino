@@ -11612,9 +11612,9 @@ pub(crate) async fn try_commit_attempt(
     //    content-hashes) are unchanged in the new list. Each touched
     //    part ships both wire forms: full and the routing sibling the
     //    list entry references.
-    let encoded_refs: Vec<&[u8]> = parts_to_write
+    let encoded_parts: Vec<Bytes> = parts_to_write
         .iter()
-        .flat_map(|ep| [Some(&ep.encoded[..]), ep.routing_encoded.as_deref()])
+        .flat_map(|ep| [Some(ep.encoded.clone()), ep.routing_encoded.clone()])
         .flatten()
         .collect();
     // Whatever this commit's safety rests on has to still hold here. What is left after it is the
@@ -11627,7 +11627,7 @@ pub(crate) async fn try_commit_attempt(
         })?;
     }
     new_manifest
-        .write(storage.as_ref(), prev_etag.as_deref(), &encoded_refs)
+        .write(storage.as_ref(), prev_etag.as_deref(), &encoded_parts)
         .await?;
     // Silence the unused-import warning when no path uses
     // `PartId` / `part_mod` directly (helpers consume them

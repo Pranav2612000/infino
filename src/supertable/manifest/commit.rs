@@ -363,13 +363,10 @@ pub(crate) fn frame_content_size(compressed: &[u8], fallback: u64) -> u64 {
 /// PUT pre-encoded part bytes to storage.
 pub(crate) async fn write_part_bytes(
     storage: &dyn StorageProvider,
-    encoded: &[u8],
+    encoded: Bytes,
 ) -> Result<(), CommitError> {
-    let uri = part_uri(&ContentHash::of(encoded));
-    match storage
-        .put_atomic(&uri, Bytes::copy_from_slice(encoded))
-        .await
-    {
+    let uri = part_uri(&ContentHash::of(&encoded));
+    match storage.put_atomic(&uri, encoded).await {
         Ok(_) | Err(StorageError::PreconditionFailed { .. }) => Ok(()),
         Err(e) => Err(e.into()),
     }
