@@ -70,7 +70,7 @@ pub use list::{FtsSummaryAgg, GlobalVectorIndex, RoutingRef, ScalarStatsAgg};
 use rayon::{ThreadPool, prelude::*};
 use rustc_hash::FxHashSet;
 use tokio::{sync::OnceCell, task::spawn_blocking};
-use tracing::warn;
+use tracing::{Instrument, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -112,7 +112,7 @@ use crate::{
         schema::{FieldId, LegacyNames, PhysicalKind, PhysicalSchema, TableSchema},
         slow_vector_state,
     },
-    utils::trace::record,
+    utils::trace::{detail_span, record},
 };
 
 /// Object-store / LocalFS directory prefix under which committed superfile
@@ -1224,6 +1224,18 @@ impl ManifestSnapshot {
     /// — passing them directly avoids a second encode cycle.
     /// Reused parts from the previous manifest version are not in this
     /// list — their URIs are already in `new_list.parts[i].uri`.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(
+            name = "manifest.write",
+            skip_all,
+            fields(
+                manifest_id = self.get_manifest_id(),
+                parts = parts_to_write.len(),
+                lost = tracing::field::Empty
+            )
+        )
+    )]
     pub async fn write(
         &self,
         storage: &dyn StorageProvider,
@@ -1250,7 +1262,11 @@ impl ManifestSnapshot {
         // into `WriteContentionExhausted` so callers (and the
         // writer's OCC retry loop) can match on one variant
         // regardless of which CAS lost the race — list or pointer.
-        let list_res = list_res.map_err(translate_contention)?;
+        let list_res = list_res.map_err(translate_contention).inspect_err(|e| {
+            if matches!(e, CommitError::WriteContentionExhausted) {
+                record("lost", "list");
+            }
+        })?;
         for part_result in part_results {
             part_result.map_err(translate_contention)?;
         }
@@ -1265,7 +1281,14 @@ impl ManifestSnapshot {
         // Step 4: conditional pointer write — the visibility
         // barrier. Until this succeeds, no reader sees the new
         // manifest version.
-        write_pointer(storage, &pointer, expected_prev_etag).await?;
+        write_pointer(storage, &pointer, expected_prev_etag)
+            .instrument(detail_span!("manifest.write_pointer"))
+            .await
+            .inspect_err(|e| {
+                if matches!(e, CommitError::WriteContentionExhausted) {
+                    record("lost", "pointer");
+                }
+            })?;
         Ok(())
     }
 

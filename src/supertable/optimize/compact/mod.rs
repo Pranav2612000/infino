@@ -1207,8 +1207,10 @@ impl Supertable {
             .instrument(detail_span!(
                 "compaction_commit_attempt",
                 attempt = attempt,
+                attempted_id = attempted_id,
                 superfiles_added = new_entries.len(),
                 superfiles_removed = entries_to_remove.len(),
+                lost = tracing::field::Empty,
             ))
             .await;
             match attempt_outcome {
