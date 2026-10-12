@@ -3914,7 +3914,7 @@ mod tests {
             .expect("pointer etag");
         let encoded: Vec<&[u8]> = parts
             .iter()
-            .flat_map(|p| [Some(p.encoded.as_slice()), p.routing_encoded.as_deref()])
+            .flat_map(|p| [Some(&p.encoded[..]), p.routing_encoded.as_deref()])
             .flatten()
             .collect();
         successor

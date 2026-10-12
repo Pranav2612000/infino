@@ -2315,6 +2315,7 @@ impl ManifestSnapshot {
             {
                 cache.removed = removal_ids.clone();
                 cache.by_source.clear();
+                cache.bytes = 0;
             }
             for entry in out_list_entries {
                 // TODO: Handle merging 2 parts into one if their sum is within threshold
@@ -2344,7 +2345,7 @@ impl ManifestSnapshot {
                 }
                 let mut remember = |outcome: RebuiltPart| {
                     if from_base && let Some(cache) = rebuilt.as_deref_mut() {
-                        cache.by_source.insert(source, outcome);
+                        cache.keep(source, outcome);
                     }
                 };
 
@@ -2584,19 +2585,50 @@ impl ManifestSnapshot {
     }
 }
 
+/// Most encoded bytes [`RebuiltParts`] keeps. The bytes are shared with the
+/// attempt that wrote them, so what this bounds is how much stays alive
+/// between attempts. A part past it is rebuilt on each attempt, as before.
+const REBUILT_PARTS_MAX_BYTES: usize = 256 * 1024 * 1024;
+
 /// Parts a commit rebuilt for its removals, kept across its retries.
 ///
 /// A part is content-addressed, so a retry that meets the same part (the
 /// winning commit left it alone) for the same removals would rebuild it to
 /// the same thing. Taking it from here skips the part load and both
-/// encodes. Holds the encoded bytes of every rebuilt part until the commit
-/// ends. Cleared when the removals change, e.g. a batch that lost a job.
-#[derive(Default)]
+/// encodes. Cleared when the removals change, e.g. a batch that lost a job.
 pub(crate) struct RebuiltParts {
     /// The removals these outcomes were worked out for.
     removed: HashSet<Uuid>,
     /// What each base part, by content hash, became.
     by_source: HashMap<ContentHash, RebuiltPart>,
+    /// Encoded bytes the rebuilt parts above hold.
+    bytes: usize,
+    /// Cap on `bytes`.
+    max_bytes: usize,
+}
+
+impl Default for RebuiltParts {
+    fn default() -> Self {
+        Self {
+            removed: HashSet::new(),
+            by_source: HashMap::new(),
+            bytes: 0,
+            max_bytes: REBUILT_PARTS_MAX_BYTES,
+        }
+    }
+}
+
+impl RebuiltParts {
+    /// Keep what the part `source` became, unless it would take the kept
+    /// bytes past the cap.
+    fn keep(&mut self, source: ContentHash, outcome: RebuiltPart) {
+        let bytes = outcome.bytes();
+        if self.by_source.contains_key(&source) || self.bytes + bytes > self.max_bytes {
+            return;
+        }
+        self.bytes += bytes;
+        self.by_source.insert(source, outcome);
+    }
 }
 
 /// What applying the removals did to one part.
@@ -2608,6 +2640,19 @@ enum RebuiltPart {
     Dropped,
     /// Rebuilt without the removed superfiles.
     Rebuilt(Box<(ManifestPartEntry, EncodedPart)>),
+}
+
+impl RebuiltPart {
+    /// Encoded bytes it holds.
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Rebuilt(rebuilt) => {
+                let part = &rebuilt.1;
+                part.encoded.len() + part.routing_encoded.as_ref().map_or(0, Bytes::len)
+            }
+            Self::Unchanged | Self::Dropped => 0,
+        }
+    }
 }
 
 /// build one `ManifestPart` from `superfiles` + the
@@ -2680,8 +2725,8 @@ fn rebuild_part_and_entry(
         entry,
         EncodedPart {
             part,
-            encoded: compressed,
-            routing_encoded: routing.map(|(bytes, _)| bytes),
+            encoded: Bytes::from(compressed),
+            routing_encoded: routing.map(|(bytes, _)| Bytes::from(bytes)),
         },
     )
 }
@@ -9622,7 +9667,11 @@ mod rebuilt_parts_tests {
             retry[0].part.part_id, first[0].part.part_id,
             "the retry reuses the rebuilt part"
         );
-        assert_eq!(retry[0].encoded, first[0].encoded);
+        assert_eq!(
+            retry[0].encoded.as_ptr(),
+            first[0].encoded.as_ptr(),
+            "the retry shares the first attempt's bytes rather than copying them"
+        );
         let mut expected = ids(&winner);
         expected.remove(&removed[0].superfile_id);
         assert_eq!(
@@ -9637,6 +9686,32 @@ mod rebuilt_parts_tests {
             .block_on(winner.update_preserving_birth_versions(&[], &other, Some(&mut rebuilt)))
             .expect("other removals");
         assert_ne!(fresh[0].part.part_id, first[0].part.part_id);
+    }
+
+    #[test]
+    fn rebuilt_parts_past_the_cap_are_rebuilt_on_retry() {
+        let (_dir, st) = multi_part_table();
+        let rt = Runtime::new().expect("runtime");
+        let base = st.inner().manifest.load_full();
+        let removed: Vec<Arc<SuperfileEntry>> = vec![Arc::clone(&base.get_all_superfiles()[0])];
+        // No room for any rebuilt part's bytes.
+        let mut rebuilt = RebuiltParts {
+            max_bytes: 0,
+            ..RebuiltParts::default()
+        };
+        let (_, first) = rt
+            .block_on(base.update_preserving_birth_versions(&[], &removed, Some(&mut rebuilt)))
+            .expect("first attempt");
+        assert_eq!(rebuilt.bytes, 0, "nothing past the cap is kept");
+
+        let (successor, retry) = rt
+            .block_on(base.update_preserving_birth_versions(&[], &removed, Some(&mut rebuilt)))
+            .expect("retry");
+        assert_ne!(
+            retry[0].part.part_id, first[0].part.part_id,
+            "rebuilt again"
+        );
+        assert!(!ids(&successor).contains(&removed[0].superfile_id));
     }
 
     #[test]

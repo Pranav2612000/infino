@@ -11614,7 +11614,7 @@ pub(crate) async fn try_commit_attempt(
     //    list entry references.
     let encoded_refs: Vec<&[u8]> = parts_to_write
         .iter()
-        .flat_map(|ep| [Some(ep.encoded.as_slice()), ep.routing_encoded.as_deref()])
+        .flat_map(|ep| [Some(&ep.encoded[..]), ep.routing_encoded.as_deref()])
         .flatten()
         .collect();
     // Whatever this commit's safety rests on has to still hold here. What is left after it is the

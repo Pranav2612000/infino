@@ -289,12 +289,12 @@ pub struct EncodedPart {
     /// the fp32 store the first rescore hydrates from — ROUTING-only for
     /// hidden manifests, whose fp32 lives in the slow-CAS centroid
     /// section instead.
-    pub encoded: Vec<u8>,
+    pub encoded: Bytes,
     /// Routing-only sibling (counts + admit slab, no fp32) — what
     /// consumer opens fetch. `None` for hidden manifests: their primary
     /// form IS routing-shaped, so a sibling would be a byte-identical
     /// duplicate. PUT together with `encoded` in the same commit.
-    pub routing_encoded: Option<Vec<u8>>,
+    pub routing_encoded: Option<Bytes>,
 }
 
 /// Outcome of writing a manifest part — returned by
