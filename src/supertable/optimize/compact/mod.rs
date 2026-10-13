@@ -2339,7 +2339,7 @@ mod tests {
             builder::{FtsConfig, VectorConfig},
             fts::reader::Bm25SearchOptions,
             reader::SuperfileReader,
-            vector::{distance::Metric, rerank_codec::RerankCodec},
+            vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
             Supertable, SupertableOptions,
@@ -4734,6 +4734,247 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(n_shared, BATCHES * PER_BATCH, "every document carries it");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multicell_hybrid_compaction_preserves_hybrid_search_after_deletion() {
+        const BATCHES: usize = 60;
+        const DOCS_PER_BATCH: usize = 80;
+        const TOTAL: usize = BATCHES * DOCS_PER_BATCH;
+        const VECTOR_DIM: usize = 16;
+        const TOP_K: usize = 256;
+
+        // Create a Isolated Storage Environment
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+
+        // Define some Schema for the data to ingested
+        let emb_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(Arc::clone(&emb_field), VECTOR_DIM as i32),
+                false,
+            ),
+        ]));
+
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+
+        let opts = SupertableOptions::new(
+            Arc::clone(&schema),
+            vec![FtsConfig::new("title")],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim: VECTOR_DIM,
+                rot_seed: 42,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq16,
+                provided_centroids: None,
+            }],
+        )
+        .expect("options")
+        .with_writer_pool(pool)
+        .with_storage(Arc::clone(&storage));
+
+        let st = Supertable::create(opts).expect("create");
+
+        let mut all_titles = Vec::with_capacity(TOTAL);
+        let mut deleted_titles = Vec::new();
+
+        for batch_idx in 0..BATCHES {
+            let titles: Vec<String> = (0..DOCS_PER_BATCH)
+                .map(|i| {
+                    let n = batch_idx * DOCS_PER_BATCH + i;
+                    format!("uq{n} shared t{} t{}", n % 37, n % 53)
+                })
+                .collect();
+
+            let mut flat = vec![0.0_f32; DOCS_PER_BATCH * VECTOR_DIM];
+            for i in 0..DOCS_PER_BATCH {
+                let n = batch_idx * DOCS_PER_BATCH + i;
+
+                // Deliberately repeat dimensions. Unique FTS terms, not vector
+                // tie-breaking, identify the document we expect from each query.
+                flat[i * VECTOR_DIM + n % VECTOR_DIM] = 1.0;
+
+                if n.is_multiple_of(97) {
+                    deleted_titles.push(titles[i].clone());
+                }
+            }
+
+            all_titles.extend(titles.iter().cloned());
+
+            let emb = FixedSizeListArray::try_new(
+                Arc::clone(&emb_field),
+                VECTOR_DIM as i32,
+                Arc::new(Float32Array::from(flat)),
+                None,
+            )
+            .expect("embeddings");
+
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(LargeStringArray::from(
+                        titles.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(emb) as ArrayRef,
+                ],
+            )
+            .expect("record batch");
+
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+
+        let before_delete = st.reader().expect("reader before delete");
+        assert_eq!(
+            before_delete.n_superfiles(),
+            BATCHES,
+            "fixture should have one superfile per commit"
+        );
+        assert!(
+            before_delete
+                .manifest()
+                .get_all_superfiles()
+                .iter()
+                .all(|sf| sf.vector_layout == VectorLayout::MultiCellIvf),
+            "fixture must use the normal multi-cell IVF layout"
+        );
+
+        // Delete rows before compaction, so the merge must apply tombstones to
+        // both the FTS postings and the vector index.
+        let predicate = col("title").in_list(
+            deleted_titles
+                .iter()
+                .map(|title| lit(title.as_str()))
+                .collect(),
+            false,
+        );
+
+        let deleted = st.delete(predicate).expect("delete rows");
+        assert_eq!(deleted.matched(), deleted_titles.len());
+
+        let is_deleted = |n: usize| n.is_multiple_of(97);
+
+        // Verify search against the un-compacted table first. These same
+        // expectations must hold after the IVF merge chooses a new FTS doc order.
+        let check_search = |phase: &str| {
+            for &n in &[0usize, 1, 97, 977, 2500, 4095, 4096, 4799] {
+                let expected = all_titles[n].clone();
+                let query = format!("uq{n}");
+
+                let bm25 = st
+                    .bm25_search(
+                        "title",
+                        &query,
+                        TOP_K,
+                        Bm25SearchOptions::new().with_mode(BoolMode::And),
+                        Some(&["title"]),
+                    )
+                    .unwrap_or_else(|e| panic!("{phase}: BM25 for {query}: {e}"));
+
+                let bm25_titles = titles_of(&bm25);
+
+                if is_deleted(n) {
+                    assert!(
+                        !bm25_titles.contains(&expected),
+                        "{phase}: deleted document {expected:?} appeared in BM25"
+                    );
+                } else {
+                    assert_eq!(
+                        bm25_titles,
+                        vec![expected.clone()],
+                        "{phase}: BM25 for {query} named the wrong row"
+                    );
+                }
+
+                let mut q_vec = vec![0.0_f32; VECTOR_DIM];
+                q_vec[n % VECTOR_DIM] = 1.0;
+
+                let hybrid = st
+                    .hybrid_search(
+                        "title",
+                        &query,
+                        BoolMode::And,
+                        "emb",
+                        &q_vec,
+                        VectorSearchOptions::new().with_nprobe(64),
+                        TOP_K,
+                        Some(&["title"]),
+                    )
+                    .unwrap_or_else(|e| panic!("{phase}: hybrid search for {query}: {e}"));
+
+                let hybrid_titles = titles_of(&hybrid);
+
+                if is_deleted(n) {
+                    assert!(
+                        !hybrid_titles.contains(&expected),
+                        "{phase}: deleted document {expected:?} appeared in hybrid search"
+                    );
+                } else {
+                    assert!(
+                        hybrid_titles.contains(&expected),
+                        "{phase}: hybrid search failed to return {expected:?}; \
+                     got {hybrid_titles:?}"
+                    );
+                }
+            }
+        };
+
+        check_search("before compaction");
+
+        let before_compact = st.manifest_id();
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+
+        let reader = st.reader().expect("reader after compaction");
+        assert!(
+            reader.manifest_id() > before_compact,
+            "compaction must have run"
+        );
+        assert_eq!(
+            reader.n_superfiles(),
+            1,
+            "the fixture should produce one merged superfile large enough to reorder"
+        );
+
+        let entry = &reader.manifest().get_all_superfiles()[0];
+        assert_eq!(entry.vector_layout, VectorLayout::MultiCellIvf);
+
+        let (bytes, _) = storage
+            .get(&entry.storage_path())
+            .await
+            .expect("read merged superfile");
+        let merged = SuperfileReader::open(bytes).expect("open merged superfile");
+
+        assert_eq!(
+            merged.n_docs(),
+            (TOTAL - deleted_titles.len()) as u64,
+            "compaction must remove tombstoned rows"
+        );
+        assert!(
+            merged.vec().is_some_and(|v| v.is_multi_cell()),
+            "the merged output must contain a multi-cell IVF vector index"
+        );
+        assert!(
+            merged.fts().expect("merged FTS index").has_doc_map(),
+            "the merged FTS index must use a doc map for the reordered corpus"
+        );
+
+        // Regression check: FTS results must still identify the correct Parquet
+        // rows, hybrid search must retain those results, and deleted rows must
+        // not reappear after the IVF merge.
+        check_search("after compaction");
     }
 
     /// A `WHERE` on an indexed column pushes a row-keyed allow-set into

@@ -7358,7 +7358,6 @@ fn build_shard_parquet_and_fts(
         ordered_vectors.push(ordered);
     }
     let vector_slices: Vec<&[f32]> = ordered_vectors.iter().map(Vec::as_slice).collect();
-
     let mut builder = SuperfileBuilder::new(
         builder_options_of(manifest).with_vector_layout(VectorLayout::MultiCellIvf),
     )?;
