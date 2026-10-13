@@ -161,8 +161,8 @@ use crate::{
         hidden_deleted::{self, encode_deleted_ids},
         manifest::{
             CellVectorSummary, ClusterCentroids, FtsSummaryAgg, ManifestSnapshot,
-            RabitqAdmitContext, RoutingRef, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry,
-            SuperfileUri, VectorSummary,
+            RabitqAdmitContext, RebuiltParts, RoutingRef, ScalarStatsAgg, SubsectionOffsets,
+            SuperfileEntry, SuperfileUri, VectorSummary,
             bloom::BloomBuilder,
             commit::{get_current_manifest_etag, manifest_uri},
             list::{
@@ -9830,6 +9830,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             &[],
             None,
             None,
+            None,
         )
         .await
         {
@@ -11029,6 +11030,7 @@ pub(in crate::supertable) async fn persist_commit_async(
                 contributions,
                 None,
                 None,
+                None,
             )
             .await
             {
@@ -11415,6 +11417,9 @@ pub(crate) async fn try_commit_attempt(
     // Set by a caller that retries: the delta is built once at a reserved
     // ordinal and kept here across attempts (see `term_index::append_reserved`).
     reserved_segment: Option<&mut Option<ReservedSegment>>,
+    // Set by a caller that retries a commit with removals: parts rebuilt by
+    // an earlier attempt are reused (see `RebuiltParts`).
+    mut rebuilt_parts: Option<&mut RebuiltParts>,
     // Checked immediately before the pointer PUT; see [`CommitFence`].
     fence: Option<&mut dyn CommitFence>,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
@@ -11437,7 +11442,11 @@ pub(crate) async fn try_commit_attempt(
             }
             NewEntryBirthVersions::Preserve => {
                 current_manifest
-                    .update_preserving_birth_versions(new_entries, entries_to_remove)
+                    .update_preserving_birth_versions(
+                        new_entries,
+                        entries_to_remove,
+                        rebuilt_parts.as_deref_mut(),
+                    )
                     .await
             }
         }
@@ -11611,9 +11620,9 @@ pub(crate) async fn try_commit_attempt(
     //    content-hashes) are unchanged in the new list. Each touched
     //    part ships both wire forms: full and the routing sibling the
     //    list entry references.
-    let encoded_refs: Vec<&[u8]> = parts_to_write
+    let encoded_parts: Vec<Bytes> = parts_to_write
         .iter()
-        .flat_map(|ep| [Some(ep.encoded.as_slice()), ep.routing_encoded.as_deref()])
+        .flat_map(|ep| [Some(ep.encoded.clone()), ep.routing_encoded.clone()])
         .flatten()
         .collect();
     // Whatever this commit's safety rests on has to still hold here. What is left after it is the
@@ -11626,7 +11635,7 @@ pub(crate) async fn try_commit_attempt(
         })?;
     }
     new_manifest
-        .write(storage.as_ref(), prev_etag.as_deref(), &encoded_refs)
+        .write(storage.as_ref(), prev_etag.as_deref(), &encoded_parts)
         .await?;
     // Silence the unused-import warning when no path uses
     // `PartId` / `part_mod` directly (helpers consume them
@@ -15862,6 +15871,7 @@ mod lost_write_span_tests {
                 &mut Vec::new(),
                 &mut Vec::new(),
                 &[],
+                None,
                 None,
                 fence,
             )
