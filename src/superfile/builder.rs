@@ -1899,7 +1899,6 @@ impl SuperfileBuilder {
                 train_ms = tracing::field::Empty,
                 n_cent = tracing::field::Empty,
                 bucket_ms = tracing::field::Empty,
-                fsync_ms = tracing::field::Empty,
                 write_ms = tracing::field::Empty,
                 crc_ms = tracing::field::Empty,
             )

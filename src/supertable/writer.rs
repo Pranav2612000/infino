@@ -5457,6 +5457,16 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 spill,
                                 &vector_config,
                             )?;
+                            // The checkpoint below reopens these files on
+                            // resume, so they must reach disk first. Its
+                            // directory fsync makes the renames durable.
+                            let fsync_t0 = time::Instant::now();
+                            for path in [&cell.subsection_path, &cell.stable_ids_path] {
+                                File::open(path).and_then(|file| file.sync_all()).map_err(
+                                    |error| BuildError::Store(format!("cell fsync: {error}")),
+                                )?;
+                            }
+                            record("fsync_ms", fsync_t0.elapsed().as_millis() as u64);
                             let checkpoint_t0 = time::Instant::now();
                             {
                                 let mut state = checkpoint.lock().map_err(|_| {
@@ -8627,7 +8637,6 @@ pub(in crate::supertable) async fn split_repack_bulk(
                                 train_ms = tracing::field::Empty,
                                 n_cent = tracing::field::Empty,
                                 bucket_ms = tracing::field::Empty,
-                                fsync_ms = tracing::field::Empty,
                                 write_ms = tracing::field::Empty,
                                 crc_ms = tracing::field::Empty,
                             )
