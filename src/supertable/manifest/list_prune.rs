@@ -225,6 +225,7 @@ mod tests {
                     title_terms.len() as u32,
                     term_range,
                     ColumnLengthStats::default(),
+                    None,
                 ),
             );
         }
@@ -270,6 +271,7 @@ mod tests {
             id_range: aggs.id_range,
             scalar_stats_agg: aggs.scalar_stats_agg,
             fts_summary_agg: aggs.fts_summary_agg,
+            fts_length_totals: None,
         }
     }
 
@@ -337,6 +339,7 @@ mod tests {
                 0,
                 (Vec::new(), Vec::new()),
                 ColumnLengthStats::default(),
+                None,
             ),
         );
         let s_c = Arc::new(SuperfileEntry {
@@ -375,6 +378,7 @@ mod tests {
                 0,
                 (Vec::new(), Vec::new()),
                 ColumnLengthStats::default(),
+                None,
             ),
         );
         let s = Arc::new(SuperfileEntry {

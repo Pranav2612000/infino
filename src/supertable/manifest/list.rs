@@ -691,6 +691,13 @@ pub struct ManifestPartEntry {
     /// Per-FTS-column aggregate bloom-union + range-union.
     /// Empty → always-keep.
     pub fts_summary_agg: BTreeMap<FieldId, FtsSummaryAgg>,
+    /// Per-FTS-column length totals, summed exactly over every superfile in
+    /// this part, so table-wide scoring statistics fold from the list
+    /// without loading a part. A column no superfile here carries is
+    /// absent. `None` on an entry written without them; the first FTS
+    /// query or commit derives them from the part, and that commit
+    /// persists them.
+    pub fts_length_totals: Option<BTreeMap<FieldId, ColumnLengthStats>>,
 }
 
 impl ManifestPartEntry {
@@ -1161,6 +1168,12 @@ pub struct FtsSummaryAgg {
     /// Every persisted per-superfile summary carries them; `None` means
     /// unknown, and an unknown side makes any fold over it unknown.
     pub length_stats: Option<ColumnLengthStats>,
+    /// The average document length this superfile's column was built at,
+    /// which its stored score bounds assume. A query scoring at the table's
+    /// average scales those bounds by it before opening the file. `None` on
+    /// a summary written without it, and on a part's aggregate, where it
+    /// has no meaning.
+    pub baked_avgdl: Option<f32>,
 }
 
 impl PartialEq for FtsSummaryAgg {
@@ -1177,6 +1190,7 @@ impl PartialEq for FtsSummaryAgg {
             && self.n_terms_distinct == other.n_terms_distinct
             && self.term_range == other.term_range
             && self.length_stats == other.length_stats
+            && self.baked_avgdl == other.baked_avgdl
     }
 }
 
@@ -1222,6 +1236,8 @@ impl FtsSummaryAgg {
         self.n_terms_distinct = self.n_terms_distinct.max(other.n_terms_distinct);
         // See `ColumnLengthStats::fold` for why an unknown side wins.
         self.length_stats = ColumnLengthStats::fold(self.length_stats, other.length_stats);
+        // A merged summary covers files built at different averages.
+        self.baked_avgdl = None;
     }
 
     /// Merge two per-FTS-column summary tables
@@ -1268,6 +1284,7 @@ impl FtsSummaryAgg {
         n_terms_distinct: u32,
         term_range: (Vec<u8>, Vec<u8>),
         length_stats: ColumnLengthStats,
+        baked_avgdl: Option<f32>,
     ) -> Self {
         let term_range = if term_range.0.is_empty() && term_range.1.is_empty() {
             None
@@ -1279,6 +1296,7 @@ impl FtsSummaryAgg {
             n_terms_distinct: u64::from(n_terms_distinct),
             term_range,
             length_stats: Some(length_stats),
+            baked_avgdl,
         }
     }
 
@@ -1561,6 +1579,8 @@ struct ManifestPartEntryDto {
     id_range: (String, String),
     scalar_stats_agg: BTreeMap<String, ScalarStatsAggDto>,
     fts_summary_agg: BTreeMap<String, FtsSummaryAggDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fts_length_totals: Option<BTreeMap<String, ColumnLengthStatsDto>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1719,6 +1739,20 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
                 )
             })
             .collect(),
+        fts_length_totals: e.fts_length_totals.as_ref().map(|totals| {
+            totals
+                .iter()
+                .map(|(k, ls)| {
+                    (
+                        wire_key(*k),
+                        ColumnLengthStatsDto {
+                            total_tokens: ls.total_tokens,
+                            n_scored_docs: ls.n_scored_docs,
+                        },
+                    )
+                })
+                .collect()
+        }),
     })
 }
 
@@ -1818,6 +1852,7 @@ fn entry_from_dto(
                     total_tokens: ls.total_tokens,
                     n_scored_docs: ls.n_scored_docs,
                 }),
+                baked_avgdl: None,
             },
         );
     }
@@ -1850,6 +1885,20 @@ fn entry_from_dto(
         },
         scalar_stats_agg,
         fts_summary_agg,
+        fts_length_totals: d.fts_length_totals.map(|totals| {
+            totals
+                .into_iter()
+                .filter_map(|(k, ls)| {
+                    Some((
+                        parse_wire_key(&k, legacy)?,
+                        ColumnLengthStats {
+                            total_tokens: ls.total_tokens,
+                            n_scored_docs: ls.n_scored_docs,
+                        },
+                    ))
+                })
+                .collect()
+        }),
     })
 }
 
@@ -2863,6 +2912,7 @@ mod tests {
                     total_tokens: 1_234_567,
                     n_scored_docs: 9_800,
                 }),
+                baked_avgdl: None,
             },
         );
         // "body": no bloom info, no range (the all-None / always-keep shape).
@@ -2873,6 +2923,7 @@ mod tests {
                 n_terms_distinct: 0,
                 term_range: None,
                 length_stats: None,
+                baked_avgdl: None,
             },
         );
 
@@ -2892,6 +2943,7 @@ mod tests {
             id_range: (0, 245_678_901),
             scalar_stats_agg: scalar,
             fts_summary_agg: fts,
+            fts_length_totals: None,
         }
     }
 
@@ -3679,6 +3731,7 @@ mod tests {
             n_terms_distinct: terms.len() as u64,
             term_range: range.map(|(mn, mx)| (mn.to_vec(), mx.to_vec())),
             length_stats: None,
+            baked_avgdl: None,
         }
     }
 
@@ -3794,6 +3847,7 @@ mod tests {
             7,
             (b"a".to_vec(), b"z".to_vec()),
             ColumnLengthStats::default(),
+            None,
         );
         assert!(
             agg.term_bloom
@@ -3811,6 +3865,7 @@ mod tests {
             0,
             (Vec::new(), Vec::new()),
             ColumnLengthStats::default(),
+            None,
         );
         assert_eq!(empty.term_range, None);
         assert!(
@@ -3828,6 +3883,7 @@ mod tests {
             n_terms_distinct: 1,
             term_range: None,
             length_stats: None,
+            baked_avgdl: None,
         };
         assert!(agg.may_contain(b"present"));
         assert!(!agg.may_contain(b"definitely-absent-term"));
@@ -3842,6 +3898,7 @@ mod tests {
             n_terms_distinct: 0,
             term_range: Some((b"bravo".to_vec(), b"mango".to_vec())),
             length_stats: None,
+            baked_avgdl: None,
         };
         assert!(
             agg.may_match_prefix(b"echo"),
@@ -4160,6 +4217,7 @@ mod tests {
             n_terms_distinct: 42,
             term_range: Some((b"apple".to_vec(), b"zebra".to_vec())),
             length_stats: None,
+            baked_avgdl: None,
         };
         other.insert(fid("col1"), summary.clone());
         FtsSummaryAgg::merge(&mut into, &other);
@@ -4179,6 +4237,7 @@ mod tests {
             n_terms_distinct: 10,
             term_range: Some((b"a".to_vec(), b"z".to_vec())),
             length_stats: None,
+            baked_avgdl: None,
         };
         into.insert(fid("only_in_into"), summary.clone());
         FtsSummaryAgg::merge(&mut into, &other);
@@ -4201,12 +4260,14 @@ mod tests {
             n_terms_distinct: 10,
             term_range: Some((b"apple".to_vec(), b"mango".to_vec())),
             length_stats: None,
+            baked_avgdl: None,
         };
         let summary2 = FtsSummaryAgg {
             term_bloom: Some(bloom2),
             n_terms_distinct: 15,
             term_range: Some((b"banana".to_vec(), b"zebra".to_vec())),
             length_stats: None,
+            baked_avgdl: None,
         };
         into.insert(fid("shared"), summary1);
         other.insert(fid("shared"), summary2);
@@ -4240,12 +4301,14 @@ mod tests {
             n_terms_distinct: 10,
             term_range: Some((b"a".to_vec(), b"z".to_vec())),
             length_stats: None,
+            baked_avgdl: None,
         };
         let summary2 = FtsSummaryAgg {
             term_bloom: Some(bloom2),
             n_terms_distinct: 15,
             term_range: Some((b"a".to_vec(), b"z".to_vec())),
             length_stats: None,
+            baked_avgdl: None,
         };
         into.insert(fid("col"), summary1);
         other.insert(fid("col"), summary2);
@@ -4272,6 +4335,7 @@ mod tests {
                 n_terms_distinct: 10,
                 term_range: Some((b"a".to_vec(), b"z".to_vec())),
                 length_stats: None,
+                baked_avgdl: None,
             },
         );
         other.insert(
@@ -4281,6 +4345,7 @@ mod tests {
                 n_terms_distinct: 20,
                 term_range: Some((b"a".to_vec(), b"z".to_vec())),
                 length_stats: None,
+                baked_avgdl: None,
             },
         );
         FtsSummaryAgg::merge(&mut into, &other);
@@ -4298,12 +4363,14 @@ mod tests {
             n_terms_distinct: 0,
             term_range: None,
             length_stats: None,
+            baked_avgdl: None,
         };
         let summary2 = FtsSummaryAgg {
             term_bloom: None,
             n_terms_distinct: 0,
             term_range: None,
             length_stats: None,
+            baked_avgdl: None,
         };
         into.insert(fid("col"), summary1);
         other.insert(fid("col"), summary2);

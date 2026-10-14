@@ -64,9 +64,67 @@ const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
 /// Maximum total gap bytes tolerated in one coalesced postings request.
 const TERM_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
 
-/// Per-term table-wide BM25 idf, keyed by term. A term absent from the
-/// map falls back to that superfile's local idf.
+/// What a query scores a superfile at in place of what its columns
+/// declare. The default changes nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ScoringView<'a> {
+    /// The BM25 parameters for every column.
+    pub params: Option<bm25::Bm25Params>,
+    /// The average document length for the one column named, as this file
+    /// labels it.
+    pub avgdl: Option<(&'a str, f32)>,
+}
+
+/// Per-term table-wide BM25 idf, keyed by term.
 pub(crate) type GlobalTermIdf = std::collections::HashMap<String, f32>;
+
+/// The corpus a query's terms are weighted against.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum QueryIdf<'a> {
+    /// The whole table's: the map holds every scored term.
+    Table(&'a GlobalTermIdf),
+    /// This superfile's own statistics, for a superfile searched by itself,
+    /// which is then the whole corpus.
+    #[default]
+    ThisFile,
+}
+
+impl QueryIdf<'_> {
+    /// The idf source for one `term`.
+    pub(crate) fn term(self, term: &str) -> TermIdf {
+        match self {
+            QueryIdf::Table(map) => map
+                .get(term)
+                .copied()
+                .map_or(TermIdf::Absent, TermIdf::Table),
+            QueryIdf::ThisFile => TermIdf::ThisFile,
+        }
+    }
+}
+
+/// The idf one term is weighted with.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TermIdf {
+    /// The table-wide value.
+    Table(f32),
+    /// This superfile's own, from its document frequency here.
+    ThisFile,
+    /// None was supplied: fine for a cursor that never scores, an error for
+    /// one that does.
+    Absent,
+}
+
+impl TermIdf {
+    /// The idf to score with, given the term's document frequency `df` in
+    /// this superfile's column `col`.
+    pub(super) fn resolve(self, col: &ColumnMeta, df: u64) -> Result<f32, FtsError> {
+        match self {
+            TermIdf::Table(idf) => Ok(idf),
+            TermIdf::ThisFile => Ok(bm25::idf(col.scored_doc_count(), df)),
+            TermIdf::Absent => Err(FtsError::MissingIdf),
+        }
+    }
+}
 
 /// A query's parsed clause lists, borrowed for one search call —
 /// terms and phrases per polarity, with the default operator already
@@ -80,9 +138,8 @@ pub(crate) struct ClauseLists<'a> {
     pub must_phrases: &'a [Phrase<String>],
     pub should_phrases: &'a [Phrase<String>],
     pub negative_phrases: &'a [Phrase<String>],
-    /// Per-term table-wide idf; `None` scores with this superfile's local
-    /// statistics, which is what a single-superfile read wants.
-    pub global_idf: Option<&'a GlobalTermIdf>,
+    /// The corpus the scored terms are weighted against.
+    pub idf: QueryIdf<'a>,
     /// Open-wave fetches for the scored terms (global stats): the
     /// cursor builds serve these terms from the memo instead of
     /// re-reading the dictionary and postings ranges the df gather
@@ -498,34 +555,57 @@ pub struct FtsReader {
 }
 
 impl FtsReader {
-    /// A view of this reader that scores every column with `params`
-    /// instead of the pair that column declared.
+    /// A view of this reader that scores at `scoring` instead of what its
+    /// columns declare, or `None` when that changes no column.
     ///
     /// Two things change per column, and nothing else: the norm decode
-    /// table is re-derived at `params` (the per-doc length buckets are
-    /// shared, not copied — they carry no parameters), and
+    /// table is re-derived at the new parameters and average length (the
+    /// per-doc length buckets are shared, not copied), and
     /// [`ColumnMeta::bound_scale`] picks up the factor that keeps the
-    /// *stored* bounds — which belong to the declared pair — upper
-    /// bounds under the new one. Results stay exact; only pruning power
-    /// is traded, which is why this is an opt-in per query and never the
-    /// default path.
-    ///
-    /// A column whose declared pair already equals `params` is left
-    /// untouched, so a query that "overrides" with what the column
-    /// already uses costs nothing.
-    pub(crate) fn with_bm25_override(&self, params: bm25::Bm25Params) -> Self {
+    /// *stored* bounds, which belong to what the file declares, upper bounds
+    /// under the new values. Results stay exact; only pruning power is
+    /// traded.
+    pub(crate) fn with_scoring(&self, scoring: &ScoringView<'_>) -> Option<Self> {
+        let target = |col: &ColumnMeta| {
+            let params = scoring.params.unwrap_or(col.params);
+            let avgdl = match scoring.avgdl {
+                Some((column, avgdl)) if column == col.name => avgdl,
+                _ => col.score_avgdl,
+            };
+            (params, avgdl)
+        };
+        if self
+            .columns
+            .iter()
+            .all(|col| target(col) == (col.params, col.score_avgdl))
+        {
+            return None;
+        }
         let mut view = self.clone();
         for col in &mut view.columns {
-            if col.params == params {
+            let (params, avgdl) = target(col);
+            if (params, avgdl) == (col.params, col.score_avgdl) {
                 continue;
             }
-            // The view scores at `params`; its norms are derived from the
-            // declared-parameter norms on first use (`ColumnMeta::norms`),
-            // composing the bound factor rather than replacing it.
+            // The view's norms are derived from the declared ones on first
+            // use (`ColumnMeta::norms`), composing the bound factor rather
+            // than replacing it.
             col.params = params;
+            col.score_avgdl = avgdl;
             col.view_norms = Arc::new(OnceLock::new());
         }
-        view
+        Some(view)
+    }
+
+    /// [`Self::with_scoring`] at `params` alone, unchanged when no column
+    /// moves.
+    #[cfg(test)]
+    pub(crate) fn with_bm25_override(&self, params: bm25::Bm25Params) -> Self {
+        let scoring = ScoringView {
+            params: Some(params),
+            avgdl: None,
+        };
+        self.with_scoring(&scoring).unwrap_or_else(|| self.clone())
     }
 
     /// Open with default options (CRC verification on).
@@ -872,6 +952,7 @@ impl FtsReader {
                 source: source.clone(),
                 n_docs,
                 baked_avgdl,
+                score_avgdl: baked_avgdl,
                 declared_params: params,
                 verify_crc: opts.verify_crc,
                 base_norms: Arc::new(OnceLock::new()),
@@ -989,6 +1070,13 @@ impl FtsReader {
             return Ok(None);
         };
         self.columns[id as usize].try_length_stats().map(Some)
+    }
+
+    /// The average document length `column` was built at, which its stored
+    /// bounds assume; `None` when the index has no such column.
+    pub(crate) fn column_baked_avgdl(&self, column: &str) -> Option<f32> {
+        let id = self.resolve_column_id(column).ok()?;
+        Some(self.columns[id as usize].baked_avgdl)
     }
 
     test_visible! {
@@ -1191,7 +1279,7 @@ impl FtsReader {
         column_id: u32,
         terms: &[&str],
         phrases: &[Phrase<String>],
-        global_idf: Option<&GlobalTermIdf>,
+        idf: QueryIdf<'_>,
         prefetched: Option<&FetchedTermMemo>,
         purpose: CursorUse,
     ) -> Result<(Vec<Option<AnyCursor>>, u64), FtsError> {
@@ -1215,9 +1303,7 @@ impl FtsReader {
         // dictionary range for the whole batch.
         if !terms.is_empty() {
             let term_cursors = self
-                .build_term_cursors_opt(
-                    column_id, terms, global_idf, purpose, None, prefetched, None,
-                )
+                .build_term_cursors_opt(column_id, terms, idf, purpose, None, prefetched, None)
                 .await?;
             dict_ranges += 1;
             for cursor in term_cursors {
@@ -1229,16 +1315,9 @@ impl FtsReader {
             // A phrase's score is Σ member idf (see `PhraseCursor::new`), so
             // globalizing the members' idf globalizes the phrase — the
             // per-member rescale ratio cancels out of the phrase's tf/length
-            // bound. Build members with the same `global_idf` as bare terms.
+            // bound. Build members with the same `idf` as bare terms.
             let cursors = self
-                .build_term_cursors(
-                    column_id,
-                    &member_refs,
-                    global_idf,
-                    purpose,
-                    None,
-                    prefetched,
-                )
+                .build_term_cursors(column_id, &member_refs, idf, purpose, None, prefetched)
                 .await?;
             dict_ranges += 1;
             if cursors.len() != member_refs.len() {
@@ -1511,8 +1590,13 @@ impl FtsReader {
                     // This walk carries postings across into a merge; it
                     // reads doc ids, tfs and positions and never consults
                     // a score bound.
-                    let mut cursor =
-                        TermCursor::new(term_bytes, col_meta, None, 1, CursorUse::Match)?;
+                    let mut cursor = TermCursor::new(
+                        term_bytes,
+                        col_meta,
+                        TermIdf::Absent,
+                        1,
+                        CursorUse::Match,
+                    )?;
                     // Each block's runs are one group, decoded whole at the
                     // block's start and sliced per pair.
                     let mut group = GroupIndex::default();
@@ -1618,8 +1702,13 @@ impl FtsReader {
                         // A `Count` cursor decodes a block's doc ids and
                         // skips its tfs.
                         false => {
-                            let mut cursor =
-                                TermCursor::new(term_bytes, col_meta, None, 1, CursorUse::Count)?;
+                            let mut cursor = TermCursor::new(
+                                term_bytes,
+                                col_meta,
+                                TermIdf::Absent,
+                                1,
+                                CursorUse::Count,
+                            )?;
                             while !cursor.is_exhausted() {
                                 for &doc in &cursor.block_doc_ids[cursor.pos..cursor.block_n] {
                                     on_doc(&carry, doc);
@@ -1737,13 +1826,6 @@ pub(crate) struct OrCursorSet {
 }
 
 impl OrCursorSet {
-    /// Number of expanded terms this set was built from — used to gate
-    /// ranged-kernel pool dispatch by scan cost, the same signal the
-    /// plain multi-should path gates on.
-    pub(crate) fn len(&self) -> usize {
-        self.cursors.len()
-    }
-
     /// Posting-list bytes this set's cursors index into — see
     /// [`PreparedClauses::postings_bytes`]. Counted once per superfile
     /// even when ranged slices share the set.

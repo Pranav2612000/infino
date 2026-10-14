@@ -227,6 +227,18 @@ pub(crate) fn listed_once<T>(
     items.into_iter().filter(move |item| seen.insert(id(item)))
 }
 
+/// One part's per-FTS-column length totals; `None` when unknown.
+type PartLengthTotals = Option<BTreeMap<FieldId, ColumnLengthStats>>;
+
+/// The sum of `summaries`' length totals; `None` when any is unknown.
+fn fold_length_stats<'a>(
+    mut summaries: impl Iterator<Item = &'a FtsSummaryAgg>,
+) -> Option<ColumnLengthStats> {
+    summaries.try_fold(ColumnLengthStats::default(), |acc, summary| {
+        ColumnLengthStats::fold(Some(acc), summary.length_stats)
+    })
+}
+
 impl SuperfileList {
     /// Empty initial state at `manifest_id = 0`.
     pub fn empty(options: Arc<SupertableOptions>) -> Self {
@@ -296,27 +308,44 @@ async fn parts_holding_routed_superfiles(
         let Some(routed) = index.route_leaf(leaf, snapshot).await else {
             continue;
         };
-        let mut id_mins: Vec<i128> = routed
-            .iter()
-            .map(|id| index.id_min_of(id))
-            .collect::<Option<_>>()?;
-        id_mins.sort_unstable();
-        let parts: HashSet<PartId> = list
-            .parts
-            .iter()
-            .filter(|p| {
-                let (lo, hi) = p.id_range;
-                let i = id_mins.partition_point(|m| *m < lo);
-                id_mins.get(i).is_some_and(|m| *m <= hi)
-            })
-            .map(|p| p.part_id)
-            .collect();
+        let id_mins = sorted_id_mins(index, &routed)?;
+        let parts: HashSet<PartId> = parts_covering(&list.parts, &id_mins).collect();
         kept = Some(match kept {
             None => parts,
             Some(existing) => existing.intersection(&parts).copied().collect(),
         });
     }
     kept
+}
+
+/// The smallest id of each of `superfiles`, sorted, as the term index
+/// records them; `None` when it records none for one of them.
+fn sorted_id_mins<'a>(
+    index: &TermIndex,
+    superfiles: impl IntoIterator<Item = &'a Uuid>,
+) -> Option<Vec<i128>> {
+    let mut id_mins: Vec<i128> = superfiles
+        .into_iter()
+        .map(|id| index.id_min_of(id))
+        .collect::<Option<_>>()?;
+    id_mins.sort_unstable();
+    Some(id_mins)
+}
+
+/// The parts whose id range holds at least one of `sorted_id_mins`: the
+/// only parts a superfile with one of those smallest ids can live in.
+fn parts_covering<'a>(
+    parts: &'a [ManifestPartEntry],
+    sorted_id_mins: &'a [i128],
+) -> impl Iterator<Item = PartId> + 'a {
+    parts
+        .iter()
+        .filter(|p| {
+            let (lo, hi) = p.id_range;
+            let i = sorted_id_mins.partition_point(|m| *m < lo);
+            sorted_id_mins.get(i).is_some_and(|m| *m <= hi)
+        })
+        .map(|p| p.part_id)
 }
 
 /// The hierarchical manifest. Outer wrapper around the
@@ -361,6 +390,11 @@ pub struct ManifestSnapshot {
     /// The schema a commit stamped before the first list write lands, and
     /// the in-memory table's only schema slot. Mirrors the other stamps.
     stamped_schema: Option<Arc<TableSchema>>,
+    /// FTS length totals of parts whose list entry was written without
+    /// them, keyed by part id. Filled on first need, so opening an older
+    /// list loads no part. A part's content never changes, so successor
+    /// snapshots share the map.
+    derived_length_totals: Arc<DashMap<PartId, PartLengthTotals>>,
 }
 
 impl fmt::Debug for ManifestSnapshot {
@@ -421,6 +455,7 @@ impl ManifestSnapshot {
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
                 stamped_schema: None,
+                derived_length_totals: Default::default(),
             }
         } else {
             Self {
@@ -432,6 +467,7 @@ impl ManifestSnapshot {
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
                 stamped_schema: None,
+                derived_length_totals: Default::default(),
             }
         }
     }
@@ -456,6 +492,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         }
     }
 
@@ -475,6 +512,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         }
     }
 
@@ -523,6 +561,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         }
     }
 
@@ -602,6 +641,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: Some(schema),
+            derived_length_totals: Arc::clone(&self.derived_length_totals),
         }
     }
 
@@ -655,50 +695,113 @@ impl ManifestSnapshot {
         builder_options_for(&self.table_schema(), &self.superfile_list.options)
     }
 
-    /// One FTS column's length statistics over the whole table — the
-    /// documents that carry tokens and their token total — folded from
-    /// every superfile's summary. `None` when any summary's totals are
-    /// unknown: a partial sum would describe some other corpus.
-    pub fn fts_length_stats(&self, column: &str) -> Option<ColumnLengthStats> {
-        let id = self.field_id(column)?;
-        Self::fts_length_stats_over(self.superfiles.iter(), id)
+    /// Derives the FTS length totals of every part whose list entry was
+    /// written without them, so [`Self::fts_length_stats`] and
+    /// [`Self::fts_corpus_stats`] can answer. A part already resident is
+    /// read from its cell; any other is read through the loader without
+    /// being cached, so a handle keeps no extra part resident. The next
+    /// commit persists what this derived. A no-op once every entry has
+    /// totals, and on a table without FTS columns.
+    pub(crate) async fn derive_length_totals(&self) -> Result<(), ManifestLoadError> {
+        let missing: Vec<PartId> = self
+            .get_all_list_entries()
+            .iter()
+            .filter(|entry| {
+                entry.fts_length_totals.is_none()
+                    && !self.derived_length_totals.contains_key(&entry.part_id)
+            })
+            .map(|entry| entry.part_id)
+            .collect();
+        if missing.is_empty() || self.fts_configs().is_empty() {
+            return Ok(());
+        }
+        let loader = self
+            .loader
+            .as_ref()
+            .ok_or(ManifestLoadError::NoLoaderAttached)?;
+        let loads = missing
+            .iter()
+            .map(|id| {
+                let resident = self
+                    .parts
+                    .get(id)
+                    .and_then(|cell| cell.value().get().cloned());
+                async move {
+                    match resident {
+                        Some(part) => Ok(part),
+                        None => loader.load(*id).await,
+                    }
+                }
+            })
+            .collect();
+        for (id, part) in missing.iter().zip(load_parts_bounded(loads).await) {
+            self.derived_length_totals
+                .insert(*id, aggregates::fts_length_totals(&part?.superfiles));
+        }
+        Ok(())
     }
 
-    fn fts_length_stats_over<'a>(
-        superfiles: impl Iterator<Item = &'a Arc<SuperfileEntry>>,
-        column: FieldId,
-    ) -> Option<ColumnLengthStats> {
-        superfiles
-            .filter_map(|sf| sf.fts_summary.get(&column))
-            .try_fold(ColumnLengthStats::default(), |acc, summary| {
-                ColumnLengthStats::fold(Some(acc), summary.length_stats)
+    /// `entry`'s FTS length totals: recorded on the entry, or derived by
+    /// [`Self::derive_length_totals`]. `None` when neither has them.
+    fn part_length_totals(&self, entry: &ManifestPartEntry) -> PartLengthTotals {
+        match &entry.fts_length_totals {
+            Some(totals) => Some(totals.clone()),
+            None => self
+                .derived_length_totals
+                .get(&entry.part_id)
+                .and_then(|derived| derived.value().clone()),
+        }
+    }
+
+    /// One FTS column's length statistics over the whole table: the
+    /// documents that carry tokens and their token total. `None` when any
+    /// contributor's totals are unknown, since a partial sum would describe
+    /// some other corpus.
+    pub fn fts_length_stats(&self, column: &str) -> Option<ColumnLengthStats> {
+        self.table_length_stats(self.field_id(column)?)
+    }
+
+    /// Read from the list's per-part totals (see
+    /// [`ManifestPartEntry::fts_length_totals`]) and those
+    /// [`Self::derive_length_totals`] filled in, so no part has to be
+    /// resident. A manifest without parts (in-process, or a hidden vector
+    /// index) keeps every superfile resident, and those are folded instead.
+    fn table_length_stats(&self, column: FieldId) -> Option<ColumnLengthStats> {
+        let parts = self.get_all_list_entries();
+        if parts.is_empty() {
+            return fold_length_stats(
+                self.superfiles
+                    .iter()
+                    .filter_map(|sf| sf.fts_summary.get(&column)),
+            );
+        }
+        parts
+            .iter()
+            .try_fold(ColumnLengthStats::default(), |mut acc, part| {
+                if let Some(stats) = self.part_length_totals(part)?.get(&column) {
+                    acc.merge_with(stats);
+                }
+                Some(acc)
             })
     }
 
-    /// [`Self::fts_length_stats`] for every FTS column, over the superfiles
-    /// a new file will sit beside — all of them for an append, all but the
-    /// inputs a compaction `replaces` — keyed by column; columns without
-    /// complete totals are absent. What a writer hands the new file's
-    /// builder so it bakes the table-wide average rather than its own.
-    pub fn fts_corpus_stats(&self, replaces: &HashSet<Uuid>) -> HashMap<String, ColumnLengthStats> {
-        let kept: Vec<&Arc<SuperfileEntry>> = self
-            .superfiles
-            .iter()
-            .filter(|sf| !replaces.contains(&sf.superfile_id))
-            .collect();
-        let columns: BTreeSet<FieldId> = kept
-            .iter()
-            .flat_map(|sf| sf.fts_summary.keys().copied())
-            .collect();
-        let schema = self.table_schema();
-        columns
+    /// [`Self::fts_length_stats`] for every FTS column, less the superfiles
+    /// a compaction `replaces` (none for an append), keyed by column name;
+    /// columns without complete totals are absent. What a writer hands the
+    /// new file's builder so it bakes the table-wide average rather than
+    /// its own.
+    pub fn fts_corpus_stats(
+        &self,
+        replaces: &[Arc<SuperfileEntry>],
+    ) -> HashMap<String, ColumnLengthStats> {
+        self.fts_configs()
             .into_iter()
-            .filter_map(|id| {
-                // The builder consumes corpus stats by column name; a column
-                // the table no longer has contributes nothing.
-                let name = schema.name_of(id)?;
-                let stats = Self::fts_length_stats_over(kept.iter().copied(), id)?;
-                Some((name.to_owned(), stats))
+            .filter_map(|fc| {
+                let id = self.field_id(&fc.column)?;
+                let replaced =
+                    fold_length_stats(replaces.iter().filter_map(|sf| sf.fts_summary.get(&id)))?;
+                let kept = self.table_length_stats(id)?.without(&replaced)?;
+                Some((fc.column, kept))
             })
             .collect()
     }
@@ -1197,6 +1300,10 @@ impl ManifestSnapshot {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: current_manifest
+                .as_ref()
+                .map(|cur| Arc::clone(&cur.derived_length_totals))
+                .unwrap_or_default(),
         };
 
         record("parts", new_manifest.parts.len() as u64);
@@ -1408,6 +1515,36 @@ impl ManifestSnapshot {
             || !entries.iter().all(|e| index.is_indexed(&e.superfile_id))
     }
 
+    /// The superfiles among `candidates`, as `index` names them, that are
+    /// live in this snapshot. Loads only the parts whose id range covers a
+    /// candidate, and nothing when the resident view is the whole table.
+    pub(crate) async fn live_among(
+        &self,
+        index: &TermIndex,
+        candidates: &HashSet<Uuid>,
+    ) -> Result<HashSet<Uuid>, ManifestLoadError> {
+        let loaded;
+        let resident = match self.complete_flat_superfiles() {
+            Some(all) => all,
+            None => {
+                loaded = match sorted_id_mins(index, candidates) {
+                    Some(id_mins) => {
+                        let parts: Vec<PartId> =
+                            parts_covering(self.get_all_list_entries(), &id_mins).collect();
+                        hierarchical_iter::load_and_flatten(self, &parts).await?
+                    }
+                    None => self.get_all_superfiles_loaded().await?,
+                };
+                &loaded
+            }
+        };
+        Ok(resident
+            .iter()
+            .map(|e| e.superfile_id)
+            .filter(|id| candidates.contains(id))
+            .collect())
+    }
+
     /// All superfile entries, loaded through the hierarchical part loader in
     /// manifest (time) order. Vector search fans over every entry — cell
     /// routing (nearest global centroids) is the selection mechanism, not a
@@ -1518,6 +1655,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
+            derived_length_totals: Arc::clone(&self.derived_length_totals),
         }
     }
 
@@ -1567,6 +1705,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
+            derived_length_totals: Arc::clone(&self.derived_length_totals),
         }
     }
 
@@ -1689,6 +1828,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
+            derived_length_totals: Arc::clone(&self.derived_length_totals),
         }
     }
 
@@ -1729,6 +1869,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
+            derived_length_totals: Arc::clone(&self.derived_length_totals),
         }
     }
 
@@ -1786,6 +1927,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
+            derived_length_totals: Arc::clone(&self.derived_length_totals),
         }
     }
 
@@ -1808,6 +1950,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: Some(index),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
+            derived_length_totals: Arc::clone(&self.derived_length_totals),
         }
     }
 
@@ -1831,6 +1974,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: Some(ranges),
             stamped_schema: self.stamped_schema.clone(),
+            derived_length_totals: Arc::clone(&self.derived_length_totals),
         }
     }
 
@@ -1854,6 +1998,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
+            derived_length_totals: Arc::clone(&self.derived_length_totals),
         }
     }
 
@@ -1882,6 +2027,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
+            derived_length_totals: Arc::clone(&self.derived_length_totals),
         }
     }
 
@@ -1904,6 +2050,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
+            derived_length_totals: Arc::clone(&self.derived_length_totals),
         }
     }
 
@@ -1979,6 +2126,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
             stamped_schema: self.stamped_schema.clone(),
+            derived_length_totals: Arc::clone(&self.derived_length_totals),
         })
     }
 
@@ -2167,6 +2315,13 @@ impl ManifestSnapshot {
         preserve_birth_versions: bool,
         rebuilt: Option<&mut RebuiltParts>,
     ) -> Result<(ManifestSnapshot, Vec<EncodedPart>), ManifestError> {
+        // Persist the length totals an older list lacks, so later commits
+        // need not derive them. A part that cannot be read leaves its entry
+        // without totals; only the FTS queries that need them fail.
+        if let Err(error) = self.derive_length_totals().await {
+            warn!(%error, "deriving FTS length totals failed; committing without them");
+        }
+
         // 1. Resolve the effective partition strategy. Locked at
         //    first commit: read from the existing manifest list
         //    if present, else use the options default.
@@ -2508,7 +2663,15 @@ impl ManifestSnapshot {
             // set), so it is cleared here like the centroid section and the
             // settle restamps it for the new generation — never carried forward.
             slow_vector_state_centroid_graph: None,
-            parts: out_list_entries_after_removal,
+            parts: out_list_entries_after_removal
+                .into_iter()
+                .map(|mut entry| {
+                    if entry.fts_length_totals.is_none() {
+                        entry.fts_length_totals = self.part_length_totals(&entry);
+                    }
+                    entry
+                })
+                .collect(),
         };
         let mut new_superfile_list = self
             .get_all_superfiles()
@@ -2586,6 +2749,7 @@ impl ManifestSnapshot {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Arc::clone(&self.derived_length_totals),
         };
 
         Ok((new_manifest, parts_to_write))
@@ -2722,6 +2886,7 @@ fn rebuild_part_and_entry(
         id_range: aggregates.id_range,
         scalar_stats_agg: aggregates.scalar_stats_agg,
         fts_summary_agg: aggregates.fts_summary_agg,
+        fts_length_totals: aggregates::fts_length_totals(&part.superfiles),
     };
     (
         entry,
@@ -5624,6 +5789,7 @@ mod tests {
                     id_range: (0, 0),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 });
             }
             (objects, entries)
@@ -5682,6 +5848,7 @@ mod tests {
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
                 stamped_schema: None,
+                derived_length_totals: Default::default(),
             }
         }
 
@@ -5791,6 +5958,7 @@ mod tests {
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
                 stamped_schema: None,
+                derived_length_totals: Default::default(),
             };
             assert_eq!(before.parts.len(), n_parts, "all parts start resident");
 
@@ -6171,6 +6339,7 @@ mod tests {
                 id_range: (0, 0),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
+                fts_length_totals: None,
             }],
         };
         let m = ManifestSnapshot {
@@ -6182,6 +6351,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         };
         let dbg = format!("{m:?}");
         assert!(dbg.contains("n_parts: 1"), "{dbg}");
@@ -6352,6 +6522,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         })
     }
 
@@ -6458,6 +6629,7 @@ mod tests {
             id_range: (0, 0),
             scalar_stats_agg: Default::default(),
             fts_summary_agg: Default::default(),
+            fts_length_totals: None,
         };
 
         let list = Manifest {
@@ -6507,6 +6679,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         // Remove every superfile from part A only → A is emptied, B untouched.
@@ -6704,6 +6877,7 @@ mod tests {
                 id_range: (0, 99),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
+                fts_length_totals: None,
             }],
         };
         let lw = write_manifest(storage.as_ref(), &list)
@@ -6920,6 +7094,7 @@ mod tests {
                 id_range: (0, 149),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
+                fts_length_totals: None,
             }],
         };
         let lw = write_manifest(storage.as_ref(), &list)
@@ -7180,6 +7355,7 @@ mod tests {
                 id_range: (0, 99),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
+                fts_length_totals: None,
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -7204,6 +7380,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         // Add new entry to the SAME partition (not a new/cold partition)
@@ -7295,6 +7472,7 @@ mod tests {
                 id_range: (0, 0),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
+                fts_length_totals: None,
             }
         };
 
@@ -7361,6 +7539,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         // Commit one new superfile. Keep `new_entry` around — the second
@@ -7552,6 +7731,7 @@ mod tests {
                 id_range: (0, 149),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
+                fts_length_totals: None,
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -7576,6 +7756,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         // Add 1 new superfile to same partition (2 + 1 = 3, within target)
@@ -7659,6 +7840,7 @@ mod tests {
                 id_range: (0, 149),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
+                fts_length_totals: None,
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -7683,6 +7865,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         // Add 2 new superfiles to same partition (2 + 2 = 4, exceeds target of 2)
@@ -7793,6 +7976,7 @@ mod tests {
                 id_range: (0, 149),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
+                fts_length_totals: None,
             }],
         };
         let frozen_part_id = pw.part_id;
@@ -7819,6 +8003,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         // 2 + 1 = 3 superfiles — far under the 10_000 count target, so only
@@ -7918,6 +8103,7 @@ mod tests {
                     id_range: (0, 99),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_latest.part_id,
@@ -7930,6 +8116,7 @@ mod tests {
                     id_range: (0, 149),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
             ],
         };
@@ -7955,6 +8142,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         // Add one new entry for the partition
@@ -8058,6 +8246,7 @@ mod tests {
                     id_range: (0, 99),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_b.part_id,
@@ -8070,6 +8259,7 @@ mod tests {
                     id_range: (0, 199),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
             ],
         };
@@ -8098,6 +8288,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         let new_entries = vec![make_new_entry_hinted(50, 0), make_new_entry_hinted(80, 1)];
@@ -8208,6 +8399,7 @@ mod tests {
                     id_range: (0, 99),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_b.part_id,
@@ -8220,6 +8412,7 @@ mod tests {
                     id_range: (0, 199),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
             ],
         };
@@ -8248,6 +8441,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         // Only touch partition A
@@ -8372,6 +8566,7 @@ mod tests {
                     id_range: (0, 99),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_a_latest.part_id,
@@ -8384,6 +8579,7 @@ mod tests {
                     id_range: (0, 149),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_b_old.part_id,
@@ -8396,6 +8592,7 @@ mod tests {
                     id_range: (0, 199),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_b_latest.part_id,
@@ -8408,6 +8605,7 @@ mod tests {
                     id_range: (0, 249),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
             ],
         };
@@ -8436,6 +8634,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         let new_entries = vec![make_new_entry_hinted(75, 0), make_new_entry_hinted(90, 1)];
@@ -8597,6 +8796,7 @@ mod tests {
                 id_range: (0, 149),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
+                fts_length_totals: None,
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -8620,6 +8820,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         let (new_manifest, parts) = old_manifest
@@ -8701,6 +8902,7 @@ mod tests {
                 id_range: (0, 149),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
+                fts_length_totals: None,
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -8724,6 +8926,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         let sf_new = make_new_entry(75);
@@ -8822,6 +9025,7 @@ mod tests {
                     id_range: (0, 149),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_b.part_id,
@@ -8834,6 +9038,7 @@ mod tests {
                     id_range: (0, 199),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
             ],
         };
@@ -8862,6 +9067,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         let (new_manifest, parts) = old_manifest
@@ -8965,6 +9171,7 @@ mod tests {
                     id_range: (0, 99),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_a_latest.part_id,
@@ -8977,6 +9184,7 @@ mod tests {
                     id_range: (0, 199),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
             ],
         };
@@ -9009,6 +9217,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -9104,6 +9313,7 @@ mod tests {
                 id_range: (0, 149),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
+                fts_length_totals: None,
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -9127,6 +9337,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         let (new_manifest, parts) = old_manifest
@@ -9198,6 +9409,7 @@ mod tests {
                 id_range: (0, 149),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
+                fts_length_totals: None,
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -9221,6 +9433,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         // sf_ghost was never added to any part; its superfile_id won't match anything
@@ -9312,6 +9525,7 @@ mod tests {
                     id_range: (0, 149),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
                 ManifestPartEntry {
                     part_id: pw_a_latest.part_id,
@@ -9324,6 +9538,7 @@ mod tests {
                     id_range: (0, 199),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
                 },
             ],
         };
@@ -9356,6 +9571,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -9409,6 +9625,7 @@ mod tests {
                 id_range: (0, 0),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
+                fts_length_totals: None,
             })
             .collect();
         Manifest {
@@ -9450,6 +9667,7 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
             stamped_schema: None,
+            derived_length_totals: Default::default(),
         }
     }
 

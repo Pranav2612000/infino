@@ -630,7 +630,7 @@ pub(in crate::supertable) fn with_id_column(
 pub(in crate::supertable) fn builder_options_of(manifest: &ManifestSnapshot) -> BuilderOptions {
     manifest
         .builder_options()
-        .with_fts_corpus_stats(manifest.fts_corpus_stats(&HashSet::new()))
+        .with_fts_corpus_stats(manifest.fts_corpus_stats(&[]))
 }
 
 /// Ingested work accumulated across the buffered appends of one commit.
@@ -3348,6 +3348,9 @@ pub(crate) fn build_fts_summary(
         let length_stats = fts_reader
             .column_length_stats(&fc.column)?
             .expect("column just registered in this superfile's FTS index");
+        let baked_avgdl = fts_reader
+            .column_baked_avgdl(&fc.column)
+            .expect("column just registered in this superfile's FTS index");
         let Some(id) = manifest.field_id(&fc.column) else {
             continue;
         };
@@ -3367,6 +3370,7 @@ pub(crate) fn build_fts_summary(
                 n_terms_distinct,
                 (min_term, max_term),
                 length_stats,
+                Some(baked_avgdl),
             ),
         );
     }
