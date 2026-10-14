@@ -102,6 +102,11 @@ const RESIDENT_RUNS: usize = 4096;
 /// beyond the resident set while their terms decode.
 const SLICE_FETCH_CONCURRENCY: usize = 8;
 
+/// Slices one build writes at once. A full rebuild writes hundreds of
+/// slices of several MB each, and one after another the upload alone took
+/// minutes; this overlaps them while bounding the requests in flight.
+const SLICE_WRITE_CONCURRENCY: usize = 8;
+
 /// Ordinals a reserved segment leaves free past the root it was built
 /// against, for the deltas other commits append while its own commit
 /// retries. Ingest commits land a few times a second and a retrying commit
@@ -221,11 +226,14 @@ pub(crate) async fn write_slices(
     storage: &dyn StorageProvider,
     slices: Vec<(ContentHash, Vec<u8>)>,
 ) -> Result<(), TermIndexError> {
-    for (hash, bytes) in slices {
+    stream::iter(slices.into_iter().map(|(hash, bytes)| async move {
         let reference = write_slice(storage, bytes).await?;
         debug_assert_eq!(reference.content_hash, hash);
-    }
-    Ok(())
+        Ok::<(), TermIndexError>(())
+    }))
+    .buffer_unordered(SLICE_WRITE_CONCURRENCY)
+    .try_collect()
+    .await
 }
 
 /// Persist a finished build — slices first, then the root — and return
