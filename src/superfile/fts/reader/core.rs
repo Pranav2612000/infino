@@ -28,7 +28,9 @@ use rustc_hash::FxHashMap;
 use super::{
     cursor::{CursorUse, TermCursor, TermMeta},
     filter::ExcludeFilter,
-    metadata::{ColumnLengthStats, ColumnMeta, FtsColumnConfig, LENGTH_ARRAY, OpenOptions},
+    metadata::{
+        ColumnLengthStats, ColumnMeta, FtsColumnConfig, LENGTH_ARRAY, OpenOptions, StoredNorms,
+    },
     phrase::{AnyCursor, PhraseCursor},
     search::FetchedTermMemo,
     sink::{LiveFloor, TopKEntry, drain_top_k_desc},
@@ -46,7 +48,7 @@ use crate::{
         fts::{
             analysis::{chain_tokenizer, check_recorded_tokenizer},
             bm25,
-            builder::DOC_LENGTHS_ENTRY_SIZE,
+            builder::doc_lengths_entry_size,
             positions::GroupIndex,
             posting::{BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
             short::{SHORT_MAX_DF, decode_short},
@@ -636,12 +638,13 @@ impl FtsReader {
         // Length of the FTS subsection itself (≈ `kv::FTS_LENGTH`), not
         // the whole superfile: `source` is the FTS-scoped sub-source.
         let fts_blob_len = source.size() as usize;
-        // One GET covers the header: every version's header is this wide,
-        // `V8` included, because the doc-id map's position is derived from
-        // the document count rather than stored in a field of its own.
-        // Fetching a byte more would overfetch, and eight spare bytes are
-        // enough to break the coalesced group a cold query's reads form --
-        // the same bytes then arrive as two requests instead of one.
+        // One GET covers the header, at the width of the widest version
+        // rather than of this blob's: the version is inside the bytes being
+        // fetched, so sizing the read by it would cost a round trip to learn
+        // what the read should have been. Overfetching at most eight bytes on
+        // an older blob is the cheaper mistake; fetching twice would break
+        // the coalesced group a cold query's reads form, and the same bytes
+        // would then arrive as two requests instead of one.
         let header_fetch = HEADER_SIZE.min(fts_blob_len);
         let header = fetch_lazy_range(source.as_ref(), 0..header_fetch, "fts header").await?;
         if header.len() < HEADER_SIZE {
@@ -654,9 +657,8 @@ impl FtsReader {
                 actual: header[0..MAGIC_BYTES].to_vec(),
             }));
         }
-        check_version(read_u32_le(
-            &header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES],
-        ))?;
+        let version = read_u32_le(&header[hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES]);
+        check_version(version)?;
 
         let doc_lengths_table_offset =
             read_u64_le(&header[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
@@ -672,19 +674,20 @@ impl FtsReader {
         // column's length array on its first scored use, and postings per
         // term — so a cold open costs the header and the directory, both
         // of which a manifest that carries them serves without a read.
-        let dir_len = n_columns * DOC_LENGTHS_ENTRY_SIZE + 4;
+        let dir_len = n_columns * doc_lengths_entry_size(version) + 4;
+        // Start the span at the doc-id map's length trailer rather than at the
+        // directory: it is the eight bytes immediately before, so the open
+        // reads it in the same request instead of a second one.
+        let dir_start =
+            doc_lengths_table_offset.saturating_sub(format::fts::doc_map_len_trailer(version));
         let dir_end = doc_lengths_table_offset
             .saturating_add(dir_len)
             .min(fts_blob_len);
-        let directory = fetch_lazy_range(
-            source.as_ref(),
-            doc_lengths_table_offset..dir_end,
-            "fts/doc_lengths_dir",
-        )
-        .await?;
+        let directory =
+            fetch_lazy_range(source.as_ref(), dir_start..dir_end, "fts/doc_lengths_dir").await?;
         let mut overlay = PrefetchedSource::new(Arc::clone(&source));
         overlay.install(0, header);
-        overlay.install(doc_lengths_table_offset as u64, directory);
+        overlay.install(dir_start as u64, directory);
         let reader = Self::open_with_source(Source::Lazy(Arc::new(overlay)), columns_json, opts)?;
 
         Ok(reader)
@@ -740,12 +743,49 @@ impl FtsReader {
         // less the map's own length. That keeps every version's header
         // the same width, which is what lets a cold open read one header
         // span and no more.
-        let doc_map_len = (n_docs as usize)
+        let derived_map_len = (n_docs as usize)
             .saturating_mul(U32_BYTES)
             .saturating_add(format::CRC_BYTES);
-        let doc_map_offset: Option<usize> = match version == format::fts::VERSION_V8 {
-            true => Some(doc_lengths_table_offset.saturating_sub(doc_map_len)),
-            false => None,
+        // From `V9` the length is written, as the eight bytes immediately
+        // before the directory, so a blob with no map says so rather than
+        // being a different version. Reading it costs nothing: the lazy open
+        // fetches the directory anyway and starts its span at the trailer.
+        let trailer = format::fts::doc_map_len_trailer(version);
+        let doc_map_len = match trailer {
+            0 => match version == format::fts::VERSION_V8 {
+                true => derived_map_len,
+                false => 0,
+            },
+            n => {
+                if doc_lengths_table_offset < n || doc_lengths_table_offset > source_len {
+                    return Err(FtsError::Read(ReadError::Malformed(format!(
+                        "doc-lengths directory at {doc_lengths_table_offset} leaves no room \
+                         for the doc-id map length that precedes it"
+                    ))));
+                }
+                let at = doc_lengths_table_offset - n;
+                let bytes = fetch_source_range(&source, at..at + n, "fts/doc-map len")?;
+                let stored = read_u64_le(&bytes);
+                // The trailer sits between the map's CRC and the directory's,
+                // covered by neither, so it is held to the document count
+                // instead: a map is one id per document plus its CRC, or
+                // there is no map. Anything else is a corrupt trailer. Taken
+                // at its word, a length past the blob would overflow the
+                // arithmetic that places the map, and one a few bytes short
+                // would open cleanly without CRC checks and shift every row
+                // the map resolves by one.
+                if stored != 0 && stored != derived_map_len as u64 {
+                    return Err(FtsError::Read(ReadError::Malformed(format!(
+                        "fts doc-id map length {stored} is neither 0 nor the \
+                         {derived_map_len} bytes a map over {n_docs} docs takes"
+                    ))));
+                }
+                stored as usize
+            }
+        };
+        let doc_map_offset: Option<usize> = match doc_map_len {
+            0 => None,
+            len => Some(doc_lengths_table_offset.saturating_sub(trailer.saturating_add(len))),
         };
 
         // Bounds-check every offset against the blob length before
@@ -759,7 +799,10 @@ impl FtsReader {
         // short-circuit, the postings region body is zero bytes and
         // only the trailing 4-byte CRC32C(empty) sits between
         // `postings_offset` and `doc_lengths_table_offset`.
-        let regions_end = doc_map_offset.unwrap_or(doc_lengths_table_offset);
+        // Where the regions before the tail stop: the map's start when there
+        // is one, otherwise the length trailer that sits in its place.
+        let regions_end =
+            doc_map_offset.unwrap_or(doc_lengths_table_offset.saturating_sub(trailer));
         let postings_end = positions_offset;
         if dict_offset < HEADER_SIZE
             || postings_offset < dict_offset + 4
@@ -857,7 +900,7 @@ impl FtsReader {
         // and installed it in the overlay, so reading it here costs no GET.
         // On the eager path the whole subsection is in memory, so every
         // read below is a zero-copy slice.
-        let dir_size = n_columns * DOC_LENGTHS_ENTRY_SIZE;
+        let dir_size = n_columns * doc_lengths_entry_size(version);
         let dir_end = doc_lengths_table_offset + dir_size;
         if dir_end + 4 > source_len {
             return Err(FtsError::Read(ReadError::Malformed(
@@ -885,7 +928,7 @@ impl FtsReader {
         let mut columns = Vec::with_capacity(n_columns);
         let mut column_id_by_name = HashMap::with_capacity(n_columns);
         for (i, col_cfg) in cols.iter().enumerate() {
-            let entry_off = i * DOC_LENGTHS_ENTRY_SIZE;
+            let entry_off = i * doc_lengths_entry_size(version);
             let column_id = u32::from_le_bytes([
                 dir_bytes[entry_off],
                 dir_bytes[entry_off + 1],
@@ -917,6 +960,31 @@ impl FtsReader {
                     "doc-lengths array {i} runs past blob end"
                 ))));
             }
+            // What a blob that stores its buckets recorded for this column:
+            // the array beside the lengths, and the totals the writer's own
+            // pass produced, so the reader repeats none of it.
+            let stored_norms = match format::fts::has_stored_buckets(version) {
+                false => None,
+                true => {
+                    let buckets_start = doc_lengths_offset + array_byte_len;
+                    let buckets_end = buckets_start
+                        .saturating_add(n_docs as usize * format::fts::DOC_LENGTH_BUCKET_BYTES);
+                    if buckets_end + format::CRC_BYTES > source_len {
+                        return Err(FtsError::Read(ReadError::Malformed(format!(
+                            "doc-lengths bucket array {i} runs past blob end"
+                        ))));
+                    }
+                    let stats = ColumnLengthStats {
+                        total_tokens: read_u64_le(&dir_bytes[entry_off + 16..entry_off + 24]),
+                        n_scored_docs: read_u64_le(&dir_bytes[entry_off + 24..entry_off + 32]),
+                    };
+                    Some(Box::new(StoredNorms {
+                        buckets: buckets_start..buckets_end,
+                        stats,
+                        occupied: (dir_bytes[entry_off + 32], dir_bytes[entry_off + 33]),
+                    }))
+                }
+            };
             let baked_avgdl = (avgdl_x1000 as f32) / format::fts::AVGDL_FIXED_POINT_SCALE;
             let params = col_cfg.params();
             check_recorded_tokenizer(&col_cfg.name, col_cfg.tokenizer.as_deref())
@@ -939,6 +1007,7 @@ impl FtsReader {
             // object-store options turn verification off, and the check
             // then runs when the array is first read.
             let column = ColumnMeta {
+                stored_norms,
                 name: col_cfg.name.clone(),
                 field_id: col_cfg.field_id.map(FieldId),
                 doc_lengths_range: doc_lengths_offset..array_end,
@@ -959,8 +1028,10 @@ impl FtsReader {
                 view_norms: Arc::new(OnceLock::new()),
             };
             if opts.verify_crc {
+                // The span the CRC covers, which on a blob that stores its
+                // buckets is the lengths and the buckets together.
                 let array =
-                    fetch_source_range(&source, doc_lengths_offset..array_end + 4, LENGTH_ARRAY)?;
+                    fetch_source_range(&source, column.array_with_crc_range(), LENGTH_ARRAY)?;
                 column.check_array_crc(&array)?;
             }
             columns.push(column);
@@ -972,11 +1043,15 @@ impl FtsReader {
         let doc_map: DocMap = match doc_map_offset {
             None => DocMap::Identity,
             Some(mo) => {
-                let body_end = doc_lengths_table_offset.saturating_sub(format::CRC_BYTES);
-                // The map's start is derived, so it cannot disagree with
-                // its length; what a corrupt header can still do is put
-                // the directory too early for a map of this many
-                // documents to fit between it and the regions before it.
+                let body_end = doc_lengths_table_offset
+                    .saturating_sub(format::fts::doc_map_len_trailer(version))
+                    .saturating_sub(format::CRC_BYTES);
+                // The map's length is the document count's, derived from it
+                // on an older blob and checked against it where a blob
+                // stores it, so the start cannot disagree with the length;
+                // what a corrupt header can still do is put the directory
+                // too early for a map of this many documents to fit between
+                // it and the regions before it.
                 if doc_lengths_table_offset < doc_map_len {
                     return Err(FtsError::Read(ReadError::Malformed(format!(
                         "fts doc-map of {doc_map_len} bytes for {n_docs} docs does not fit \
@@ -2173,7 +2248,7 @@ pub(super) fn read_doc_length(region: &[u8], d: usize) -> u32 {
 /// unknown as unsupported.
 fn check_version(version: u32) -> Result<(), FtsError> {
     match version {
-        format::fts::VERSION_V7 | format::fts::VERSION_V8 => Ok(()),
+        format::fts::VERSION_V7 | format::fts::VERSION_V8 | format::fts::VERSION_V9 => Ok(()),
         v if v < VERSION_MIN => Err(FtsError::IndexTooOld { version: v }),
         v => Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
             "fts section version {v}"
@@ -2183,6 +2258,70 @@ fn check_version(version: u32) -> Result<(), FtsError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// What the writer stores for a column's norms must be exactly what the
+    /// reader used to derive from its lengths. The scorer indexes the buckets
+    /// and divides by the totals, so a writer that disagreed with the old
+    /// derivation would change scores silently, on files that still open and
+    /// still pass their CRCs.
+    ///
+    /// Documents are built at a spread of lengths so the quantization is
+    /// exercised across buckets rather than landing them all in one.
+    #[test]
+    fn stored_norms_match_what_deriving_them_would_give() {
+        /// Documents in the fixture.
+        const N_DOCS: u32 = 512;
+
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for doc in 0..N_DOCS {
+            // Lengths from 1 to 64 tokens, so the buckets spread.
+            let n_tokens = (doc % 64) + 1;
+            let text = (0..n_tokens)
+                .map(|t| format!("t{t}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            b.add_doc(0, doc, &text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let reader = FtsReader::open(blob, json).expect("open");
+
+        let column = &reader.columns[0];
+        let stored = column
+            .stored_norms
+            .as_ref()
+            .expect("the current version stores its norms");
+
+        let lengths = reader.read_doc_lengths(0).expect("doc lengths");
+        assert_eq!(lengths.len(), N_DOCS as usize);
+
+        let norms = column.norms();
+        let derived: Vec<u8> = lengths.iter().map(|&dl| bm25::quantize_len(dl)).collect();
+        assert_eq!(
+            norms.dl_norm_k1.buckets(),
+            derived.as_slice(),
+            "the stored buckets must equal quantizing the stored lengths"
+        );
+
+        let expected_stats = ColumnLengthStats::from_lengths(lengths.iter().copied());
+        assert_eq!(
+            stored.stats, expected_stats,
+            "the stored totals must equal summing the stored lengths"
+        );
+        assert_eq!(
+            norms.length_stats, expected_stats,
+            "and the totals the scorer divides by must be those"
+        );
+
+        let lo = derived.iter().copied().min().expect("a non-empty column");
+        let hi = derived.iter().copied().max().expect("a non-empty column");
+        assert_eq!(
+            stored.occupied,
+            (lo, hi),
+            "the stored occupied range must be the buckets the documents actually use"
+        );
+    }
 
     /// The reader refuses to open a column whose entry names a filter
     /// this engine cannot reproduce, and names the field and the value
@@ -2307,7 +2446,7 @@ mod tests {
         assert!(matches!(err, FtsError::IndexTooOld { .. }), "{err:?}");
 
         let err =
-            FtsReader::open(stamp(format::fts::VERSION_V8 + 1), json).expect_err("a future blob");
+            FtsReader::open(stamp(format::fts::VERSION_V9 + 1), json).expect_err("a future blob");
         assert!(
             matches!(err, FtsError::Read(ReadError::UnsupportedVersion(_))),
             "{err:?}"
@@ -2487,15 +2626,19 @@ mod tests {
         reordered.doc_map = Some(map.clone());
         let reordered_blob = Bytes::from(reordered.finish().expect("finish"));
 
+        // The map no longer moves the version: its length is recorded in the
+        // trailer before the doc-lengths directory, so one version covers a
+        // blob with a map and one without. What still has to differ is
+        // whether the reader finds a map at all.
         assert_eq!(
             read_u32_le(&reordered_blob[VERSION_FIELD]),
-            format::fts::VERSION_V8,
-            "a blob with a map is V8"
+            format::fts::VERSION_CURRENT,
+            "a blob with a map is written at the current version"
         );
         assert_eq!(
             read_u32_le(&plain_blob[VERSION_FIELD]),
-            format::fts::VERSION_V7,
-            "and one without is unchanged"
+            format::fts::VERSION_CURRENT,
+            "and so is one without"
         );
         let reordered_reader = FtsReader::open(reordered_blob, json).expect("open reordered");
         assert!(reordered_reader.has_doc_map());
@@ -2570,7 +2713,7 @@ mod tests {
         let blob = b.finish().expect("finish");
         assert_eq!(
             read_u32_le(&blob[VERSION_FIELD]),
-            format::fts::VERSION_V8,
+            format::fts::VERSION_CURRENT,
             "fixture must be a mapped blob"
         );
         FtsReader::open(Bytes::from(blob.clone()), json).expect("the fixture opens clean");
@@ -3928,6 +4071,72 @@ mod tests {
         }
     }
 
+    /// The doc-id map's length trailer is the one field between the map and
+    /// the directory that no CRC covers, so it is held to the document
+    /// count: a map is one id per document plus its CRC, or there is none.
+    /// Both ways a corrupt trailer could lie are refused, eager and lazy,
+    /// with CRC checks on and off: a length past the blob, which would
+    /// overflow the arithmetic placing the map, and one a few bytes short,
+    /// which would open and shift every row the map resolves by one.
+    #[tokio::test]
+    async fn a_doc_map_length_that_disagrees_with_the_document_count_is_refused() {
+        const N_DOCS: u32 = 64;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        let map: Vec<u32> = (0..N_DOCS).rev().collect();
+        for (id, &row) in map.iter().enumerate() {
+            b.add_doc(0, id as u32, &format!("alpha uq{row}"))
+                .expect("add doc");
+        }
+        b.doc_map = Some(map);
+        let blob = Bytes::from(b.finish().expect("finish"));
+        assert!(
+            format::fts::has_stored_buckets(read_u32_le(&blob[VERSION_FIELD])),
+            "fixture must store its map length"
+        );
+
+        let dir_off =
+            read_u64_le(&blob[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
+                as usize;
+        let trailer = dir_off - format::fts::DOC_MAP_LEN_TRAILER_BYTES..dir_off;
+        let map_len = N_DOCS as u64 * U32_BYTES as u64 + format::CRC_BYTES as u64;
+        assert_eq!(read_u64_le(&blob[trailer.clone()]), map_len);
+        let stamp = |len: u64| {
+            let mut bytes = blob.to_vec();
+            bytes[trailer.clone()].copy_from_slice(&len.to_le_bytes());
+            Bytes::from(bytes)
+        };
+
+        for (bad, what) in [(u64::MAX, "past the blob"), (map_len - 4, "one id short")] {
+            let err = FtsReader::open(stamp(bad), json).expect_err(what);
+            assert!(
+                matches!(err, FtsError::Read(ReadError::Malformed(_))),
+                "{what}, eager: {err:?}"
+            );
+            for opts in [OpenOptions::default(), OpenOptions::for_object_store()] {
+                let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(stamp(bad)));
+                let err = FtsReader::open_lazy(src, json, opts).await.expect_err(what);
+                assert!(
+                    matches!(err, FtsError::Read(ReadError::Malformed(_))),
+                    "{what}, lazy: {err:?}"
+                );
+            }
+        }
+
+        // The honest value still opens, and resolves the rows it names.
+        let r = FtsReader::open(stamp(map_len), json).expect("the written length");
+        assert!(r.has_doc_map());
+        let hits = r
+            .search("body", &["uq7"], 10, BoolMode::Or)
+            .await
+            .expect("search");
+        assert_eq!(
+            hits.iter().map(|(d, _)| d.get()).collect::<Vec<_>>(),
+            vec![7]
+        );
+    }
+
     /// Opening a blob that stores its documents in an order of its own
     /// must work on a source that cannot be read synchronously.
     ///
@@ -3951,7 +4160,7 @@ mod tests {
         let blob = Bytes::from(b.finish().expect("finish"));
         assert_eq!(
             read_u32_le(&blob[VERSION_FIELD]),
-            format::fts::VERSION_V8,
+            format::fts::VERSION_CURRENT,
             "fixture must be a mapped blob"
         );
 
