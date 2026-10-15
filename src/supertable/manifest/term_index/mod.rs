@@ -350,6 +350,36 @@ pub(crate) struct ReservedSegment {
     segment: Segment,
 }
 
+impl ReservedSegment {
+    /// The ordinal just past the segment's last superfile.
+    pub(crate) fn end(&self) -> u32 {
+        self.base + self.superfiles.len() as u32
+    }
+}
+
+/// Build `contributions` into a segment numbered from `base` and write its
+/// slices, for a later [`append_reserved`].
+pub(crate) async fn reserve_segment(
+    storage: &dyn StorageProvider,
+    contributions: &[Contribution],
+    policy: &BuildPolicy,
+    base: u32,
+) -> Result<ReservedSegment, TermIndexError> {
+    let built = detail_span!(
+        "term_index.build_segment",
+        inputs = contributions.len(),
+        ordinal_base = base,
+    )
+    .in_scope(|| build_segment(contributions, policy, base))?;
+    write_slices(storage, built.slices).await?;
+    Ok(ReservedSegment {
+        base,
+        superfiles: built.superfiles,
+        id_mins: built.id_mins,
+        segment: built.segment,
+    })
+}
+
 /// [`append_delta`] for a commit that may retry: the segment is built once,
 /// [`RESERVED_ORDINAL_SLACK`] ordinals past `prior`'s length, and kept in
 /// `reserved`. Each call pads `prior` with nil entries up to the reserved
@@ -379,19 +409,7 @@ pub(crate) async fn append_reserved(
     });
     if !reusable {
         let base = len as u32 + RESERVED_ORDINAL_SLACK;
-        let built = detail_span!(
-            "term_index.build_segment",
-            inputs = contributions.len(),
-            ordinal_base = base,
-        )
-        .in_scope(|| build_segment(contributions, policy, base))?;
-        write_slices(storage, built.slices).await?;
-        *reserved = Some(ReservedSegment {
-            base,
-            superfiles: built.superfiles,
-            id_mins: built.id_mins,
-            segment: built.segment,
-        });
+        *reserved = Some(reserve_segment(storage, contributions, policy, base).await?);
     }
     let segment = reserved.as_ref().expect("reserved above");
     let padding = segment.base as usize - len;

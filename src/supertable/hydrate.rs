@@ -177,7 +177,7 @@ fn hydrate_with_budget(
         }
         let output_stats = op_stats.as_ref().map(|_| commit_output_stats(&batch));
         bridge_on_runtime(
-            persist_superfile_publish_batch_async(inner, batch, CommitListMetadata::empty()),
+            persist_superfile_publish_batch_async(inner, batch, CommitListMetadata::empty(), None),
             &inner.query_runtime(),
         )?;
         // Counted only once the commit lands, as in `append`.

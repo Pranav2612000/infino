@@ -12,9 +12,10 @@
 //! one per piece of the split buffer.
 //!
 //! Acquired via [`Supertable::writer`](crate::supertable::Supertable::writer);
-//! at most one writer is outstanding per supertable at a time
-//! (enforced by the inner state's `writer_outstanding` flag, with
-//! release on `Drop`). Holds an in-memory buffer of
+//! at most one exclusive writer is outstanding per supertable at a time,
+//! while same-schema appends share the slot and build in parallel
+//! (enforced by the inner state's `writer_slot`, with release on
+//! `Drop`). Holds an in-memory buffer of
 //! `(scalar_batch, vectors_per_column)` payloads that
 //! [`SupertableWriter::commit`] partitions across the writer
 //! pool's rayon workers — each worker constructs its own
@@ -61,7 +62,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     str::from_utf8,
-    sync::{Arc, Mutex, OnceLock, atomic::Ordering},
+    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, atomic::Ordering},
     thread::available_parallelism,
     time,
 };
@@ -377,14 +378,17 @@ const BUILD_VECTOR_NUM: usize = 13;
 // not instead of it: the same text bytes are held as a column and drive the index build at once.
 const BUILD_FTS_NUM: usize = 3;
 
-/// Single-writer append + commit handle.
+/// Append + commit handle.
 ///
-/// At most one outstanding per supertable. Acquire via
-/// [`Supertable::writer`]; uncommitted buffer data is **lost on
-/// drop** (no implicit flush) — callers must invoke `commit()`
-/// to publish.
+/// At most one exclusive writer per supertable, acquired via
+/// [`Supertable::writer`]; same-schema appends share the slot instead.
+/// Uncommitted buffer data is **lost on drop** (no implicit flush) —
+/// callers must invoke `commit()` to publish.
 pub struct SupertableWriter {
     inner: Arc<SupertableInner>,
+    /// Holds a shared append slot rather than the exclusive one, and
+    /// publishes through [`SupertableInner::append_queue`].
+    shared: bool,
     /// Accumulated input from append() calls. The writer (not the
     /// SuperfileBuilder) owns the buffer so commit() can rayon-
     /// shard it across workers, each running its own builder.
@@ -986,6 +990,10 @@ impl Supertable {
     /// `append` == one commit == one sealed superfile, so callers batch
     /// rows per call rather than calling once per row.
     ///
+    /// Concurrent appends build in parallel and may block the calling thread
+    /// while they publish in turn; from async code, call it off the runtime's
+    /// workers (e.g. `spawn_blocking`).
+    ///
     /// ```
     /// # use std::sync::Arc;
     /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
@@ -1007,7 +1015,7 @@ impl Supertable {
     )]
     pub fn append(&self, batch: &RecordBatch) -> Result<(), InfinoError> {
         let mut w = self
-            .writer()
+            .append_writer(batch)
             .map_err(|e| InfinoError::from(e).with_context("append", None))?;
         w.append(batch)
             .map_err(|e| InfinoError::from(e).with_context("append", None))?;
@@ -1038,7 +1046,7 @@ impl Supertable {
     )]
     pub fn append_named(&self, batch: &RecordBatch, source_name: &str) -> Result<(), InfinoError> {
         let mut w = self
-            .writer()
+            .append_writer(batch)
             .map_err(|e| InfinoError::from(e).with_context("append_named", None))?;
         w.append_named(batch, source_name)
             .map_err(|e| InfinoError::from(e).with_context("append_named", None))?;
@@ -1189,10 +1197,10 @@ impl Supertable {
     ///
     /// Returns [`BuildError::SupertableInUse`] if another
     /// `SupertableWriter` is already outstanding (drop it before
-    /// acquiring a new one). Each `Supertable` has exactly one
-    /// active writer slot at a time, enforced atomically; when
-    /// the writer is dropped, the slot is released and a
-    /// subsequent `writer()` call succeeds.
+    /// acquiring a new one). Appends in flight are not refused:
+    /// this waits for them to finish, turning new ones away
+    /// meanwhile. When the writer is dropped, the slot is
+    /// released and a subsequent `writer()` call succeeds.
     ///
     /// Consumer-memory-mode handles
     /// (`summary_centroids_from_superfiles`) are read-only by
@@ -1201,6 +1209,27 @@ impl Supertable {
     /// stripped summaries into the durable full wire form. Refused
     /// here — at acquisition, not deep inside a commit.
     fn writer(&self) -> Result<SupertableWriter, BuildError> {
+        self.acquire_writer(false)
+    }
+    }
+
+    /// The writer for appending `batch`: shared with other appends when the
+    /// batch adds no column and the table already has its vector grid, so
+    /// neither the schema nor the grid changes under them; exclusive otherwise.
+    fn append_writer(&self, batch: &RecordBatch) -> Result<SupertableWriter, BuildError> {
+        let manifest = self.inner().manifest.load();
+        let schema = manifest.table_schema();
+        let adds_no_column = batch
+            .schema()
+            .fields()
+            .iter()
+            .all(|field| schema.id_of(field.name()).is_some());
+        let has_grid =
+            manifest.vector_configs().is_empty() || manifest.get_global_vector_index().is_some();
+        self.acquire_writer(adds_no_column && has_grid)
+    }
+
+    fn acquire_writer(&self, shared: bool) -> Result<SupertableWriter, BuildError> {
         if self.inner().options.summary_centroids_from_superfiles {
             return Err(BuildError::Store(
                 "this handle opened in consumer memory mode \
@@ -1209,28 +1238,157 @@ impl Supertable {
                     .into(),
             ));
         }
-        match self.inner().writer_outstanding.compare_exchange(
-            false,
-            true,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(SupertableWriter {
-                pending_stem: None,
-                inner: Arc::clone(self.inner()),
-                buffer: Vec::new(),
-                buffer_scalar_bytes: 0,
-                buffer_visible_scalar_bytes: 0,
-                buffer_vector_bytes: 0,
-                buffer_fts_bytes: 0,
-                pending_ingest: IngestTally::default(),
-                pending_updates: Vec::new(),
-                pending_deletes: Vec::new(),
-                op_stats: op_stats::current(),
-            }),
-            Err(_) => Err(BuildError::SupertableInUse),
+        if !self.inner().writer_slot.acquire(shared) {
+            return Err(BuildError::SupertableInUse);
+        }
+        Ok(SupertableWriter {
+            pending_stem: None,
+            inner: Arc::clone(self.inner()),
+            shared,
+            buffer: Vec::new(),
+            buffer_scalar_bytes: 0,
+            buffer_visible_scalar_bytes: 0,
+            buffer_vector_bytes: 0,
+            buffer_fts_bytes: 0,
+            pending_ingest: IngestTally::default(),
+            pending_updates: Vec::new(),
+            pending_deletes: Vec::new(),
+            op_stats: op_stats::current(),
+        })
+    }
+}
+
+/// The writer slot: held by one exclusive writer, or shared by any number of
+/// same-schema appends. An exclusive writer that finds appends in flight
+/// refuses new ones and waits for those to finish, so a steady stream of
+/// appends cannot starve it.
+#[derive(Default)]
+pub(super) struct WriterSlot {
+    state: Mutex<WriterSlotState>,
+    drained: Condvar,
+}
+
+#[derive(Default)]
+struct WriterSlotState {
+    shared: usize,
+    /// Held, or claimed by a writer waiting for `shared` to drain.
+    exclusive: bool,
+}
+
+impl WriterSlot {
+    fn lock(&self) -> MutexGuard<'_, WriterSlotState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `false` when an exclusive writer holds or has claimed the slot.
+    fn acquire(&self, shared: bool) -> bool {
+        let mut state = self.lock();
+        if state.exclusive {
+            return false;
+        }
+        if shared {
+            state.shared += 1;
+            return true;
+        }
+        state.exclusive = true;
+        while state.shared > 0 {
+            state = self
+                .drained
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        true
+    }
+
+    fn release(&self, shared: bool) {
+        let mut state = self.lock();
+        if !shared {
+            state.exclusive = false;
+            return;
+        }
+        state.shared -= 1;
+        if state.shared == 0 {
+            self.drained.notify_all();
         }
     }
+}
+
+/// Orders the publishes of shared append writers. Each takes a ticket and a
+/// term-index base once its superfiles are uploaded, then publishes in ticket
+/// order, so every base is still at or past the root's length on its turn and
+/// its prebuilt segment is appended as is.
+#[derive(Default)]
+pub(super) struct AppendQueue {
+    state: Mutex<AppendQueueState>,
+    turn: Condvar,
+}
+
+#[derive(Default)]
+struct AppendQueueState {
+    issued: u64,
+    serving: u64,
+    /// Past every segment reserved or published through this queue. `None`
+    /// until the first reservation, which reads the root's length instead.
+    next_base: Option<u32>,
+}
+
+impl AppendQueue {
+    fn lock(&self) -> MutexGuard<'_, AppendQueueState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn needs_root_len(&self) -> bool {
+        self.lock().next_base.is_none()
+    }
+
+    /// A ticket and the base for a segment of `superfiles`, given the root
+    /// holds at least `root_len` superfiles.
+    fn reserve(&self, root_len: u32, superfiles: u32) -> (AppendTicket<'_>, u32) {
+        let mut state = self.lock();
+        let base = state.next_base.unwrap_or(0).max(root_len);
+        state.next_base = Some(base.saturating_add(superfiles));
+        let ticket = AppendTicket {
+            queue: self,
+            number: state.issued,
+        };
+        state.issued += 1;
+        (ticket, base)
+    }
+}
+
+/// A place in the [`AppendQueue`]. Dropping it waits for its turn and passes
+/// the turn on, so an append that fails before publishing never stalls the
+/// ones behind it.
+struct AppendTicket<'a> {
+    queue: &'a AppendQueue,
+    number: u64,
+}
+
+impl AppendTicket<'_> {
+    /// Record that this append's segment ends at `end`: past its reservation
+    /// when the commit rebuilt it behind a root another process extended.
+    fn published_until(&self, end: u32) {
+        let mut state = self.queue.lock();
+        state.next_base = Some(state.next_base.unwrap_or(0).max(end));
+    }
+
+    fn wait_turn(&self) -> MutexGuard<'_, AppendQueueState> {
+        let mut state = self.queue.lock();
+        while state.serving != self.number {
+            state = self
+                .queue
+                .turn
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        state
+    }
+}
+
+impl Drop for AppendTicket<'_> {
+    fn drop(&mut self) {
+        self.wait_turn().serving += 1;
+        self.queue.turn.notify_all();
     }
 }
 
@@ -1358,10 +1516,8 @@ impl SupertableWriter {
         // are tied to `batch`, which the caller reclaims after this returns.
         let vectors = owned_vector_arrays(batch, &manifest)?;
 
-        // Mint one id per row and prepend the id column. Lock
-        // is uncontended in practice (writer-slot exclusivity
-        // serializes append per supertable handle); held only
-        // long enough to drain N ids into the Vec.
+        // Mint one id per row and prepend the id column. The lock
+        // is held only long enough to drain N ids into the Vec.
         let n_rows = scalar_no_id.num_rows();
         let mut ids: Vec<i128> = Vec::with_capacity(n_rows);
         {
@@ -2525,10 +2681,7 @@ impl SupertableWriter {
                 .as_ref()
                 .map(|_| commit_output_stats(&user_batch));
             let publish_t0 = time::Instant::now();
-            bridge_on_runtime(
-                persist_superfile_publish_batch_async(&self.inner, user_batch, list_metadata),
-                &self.inner.query_runtime(),
-            )?;
+            self.publish_appended(user_batch, list_metadata)?;
             if let (Some(stats), Some((superfiles, bytes, fts_terms))) =
                 (&self.op_stats, output_stats)
             {
@@ -2671,10 +2824,7 @@ impl SupertableWriter {
             .op_stats
             .as_ref()
             .map(|_| commit_output_stats(&user_batch));
-        bridge_on_runtime(
-            persist_superfile_publish_batch_async(&user_inner, user_batch, list_metadata),
-            &self.inner.query_runtime(),
-        )?;
+        self.publish_appended(user_batch, list_metadata)?;
         if let (Some(stats), Some((n_superfiles, bytes, fts_terms))) =
             (&self.op_stats, output_stats)
         {
@@ -2688,6 +2838,87 @@ impl SupertableWriter {
 
         Ok(())
     }
+
+    /// Publish an append's superfiles. A shared writer uploads them and builds
+    /// its term-index segment before taking its turn in the append queue, so
+    /// only the manifest and root writes are serialized between appends.
+    fn publish_appended(
+        &self,
+        mut batch: SuperfilePublishBatch,
+        list_metadata: CommitListMetadata,
+    ) -> Result<(), BuildError> {
+        let runtime = self.inner.query_runtime();
+        if !self.shared || batch.new_entries.is_empty() {
+            return bridge_on_runtime(
+                persist_superfile_publish_batch_async(&self.inner, batch, list_metadata, None),
+                &runtime,
+            );
+        }
+        let mut segment = None;
+        let ticket = match &self.inner.options.storage {
+            None => self.inner.append_queue.reserve(0, 0).0,
+            Some(storage) => {
+                bridge_on_runtime(
+                    write_superfile_list(
+                        storage,
+                        &self.inner.options,
+                        &mut batch.pending_storage_writes,
+                        &mut Vec::new(),
+                    ),
+                    &runtime,
+                )?;
+                let contributions = &batch.term_contributions;
+                let root_len = match self.inner.manifest.load().term_index_ref() {
+                    Some(reference)
+                        if !contributions.is_empty()
+                            && self.inner.append_queue.needs_root_len() =>
+                    {
+                        bridge_on_runtime(
+                            term_index::load_root(storage.as_ref(), reference),
+                            &runtime,
+                        )
+                        .map_or(0, |root| root.superfiles.len() as u32)
+                    }
+                    _ => 0,
+                };
+                let (ticket, base) = self
+                    .inner
+                    .append_queue
+                    .reserve(root_len, contributions.len() as u32);
+                if !contributions.is_empty() {
+                    let policy = term_index::BuildPolicy::default();
+                    segment = Some(
+                        bridge_on_runtime(
+                            term_index::reserve_segment(
+                                storage.as_ref(),
+                                contributions,
+                                &policy,
+                                base,
+                            ),
+                            &runtime,
+                        )
+                        .map_err(|e| BuildError::Store(e.to_string()))?,
+                    );
+                }
+                ticket
+            }
+        };
+        drop(ticket.wait_turn());
+        let published = bridge_on_runtime(
+            persist_superfile_publish_batch_async(
+                &self.inner,
+                batch,
+                list_metadata,
+                Some(&mut segment),
+            ),
+            &runtime,
+        );
+        if let (Ok(()), Some(segment)) = (&published, &segment) {
+            ticket.published_until(segment.end());
+        }
+        drop(ticket);
+        published
+    }
 }
 
 impl Drop for SupertableWriter {
@@ -2695,9 +2926,7 @@ impl Drop for SupertableWriter {
         // Release the writer slot. Uncommitted buffer is
         // intentionally lost — callers must invoke commit()
         // explicitly to publish.
-        self.inner
-            .writer_outstanding
-            .store(false, Ordering::Release);
+        self.inner.writer_slot.release(self.shared);
     }
 }
 
@@ -3879,6 +4108,7 @@ pub(crate) fn commit_built_superfile(st: &Supertable, bytes: Bytes) -> Result<()
         inner,
         publish,
         CommitListMetadata::empty(),
+        None,
     ))
 }
 
@@ -3967,12 +4197,13 @@ pub(super) async fn persist_superfile_publish_batch_async(
     inner: &SupertableInner,
     batch: SuperfilePublishBatch,
     list_metadata: CommitListMetadata,
+    reserved_segment: Option<&mut Option<ReservedSegment>>,
 ) -> Result<(), BuildError> {
     if batch.new_entries.is_empty() {
         return Ok(());
     }
     if let Some(storage) = inner.options.storage.as_ref().cloned() {
-        let new_manifest = persist_commit_async(
+        let new_manifest = persist_commit_with_segment_async(
             inner,
             storage,
             batch.new_entries,
@@ -3981,6 +4212,7 @@ pub(super) async fn persist_superfile_publish_batch_async(
             Vec::new(),
             list_metadata,
             batch.term_contributions,
+            reserved_segment,
         )
         .await
         .map_err(BuildError::from)?;
@@ -11369,10 +11601,37 @@ pub(in crate::supertable) async fn persist_commit_async(
     storage: Arc<dyn StorageProvider>,
     new_entries: Vec<Arc<SuperfileEntry>>,
     entries_to_remove: &[Arc<SuperfileEntry>],
+    pending_storage_writes: Vec<(String, Bytes)>,
+    pending_storage_replaces: Vec<(String, Bytes)>,
+    list_metadata: CommitListMetadata,
+    term_contributions: Vec<TermContribution>,
+) -> Result<Arc<ManifestSnapshot>, SupertableCommitError> {
+    persist_commit_with_segment_async(
+        inner,
+        storage,
+        new_entries,
+        entries_to_remove,
+        pending_storage_writes,
+        pending_storage_replaces,
+        list_metadata,
+        term_contributions,
+        None,
+    )
+    .await
+}
+
+/// [`persist_commit_async`] appending `reserved_segment`, when given, as the
+/// commit's term-index delta (see `term_index::append_reserved`).
+async fn persist_commit_with_segment_async(
+    inner: &SupertableInner,
+    storage: Arc<dyn StorageProvider>,
+    new_entries: Vec<Arc<SuperfileEntry>>,
+    entries_to_remove: &[Arc<SuperfileEntry>],
     mut pending_storage_writes: Vec<(String, Bytes)>,
     mut pending_storage_replaces: Vec<(String, Bytes)>,
     list_metadata: CommitListMetadata,
     term_contributions: Vec<TermContribution>,
+    mut reserved_segment: Option<&mut Option<ReservedSegment>>,
 ) -> Result<Arc<ManifestSnapshot>, SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
@@ -11416,7 +11675,7 @@ pub(in crate::supertable) async fn persist_commit_async(
                 pending_writes,
                 pending_replaces,
                 contributions,
-                None,
+                reserved_segment.as_deref_mut(),
                 None,
                 None,
             )
@@ -12530,6 +12789,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+        thread,
         time::{Duration, Instant},
     };
 
@@ -15580,6 +15840,256 @@ supertable:
             vec![Arc::new(LargeStringArray::from(vec![title]))],
         )
         .expect("row batch")
+    }
+
+    #[test]
+    fn concurrent_same_schema_appends_all_land_in_the_manifest_and_term_index() {
+        const THREADS: usize = 8;
+        const APPENDS: usize = 4;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_id_title().with_storage(Arc::clone(&storage)))
+            .expect("create");
+
+        thread::scope(|scope| {
+            for t in 0..THREADS {
+                let st = &st;
+                scope.spawn(move || {
+                    for i in 0..APPENDS {
+                        st.append(&row(&format!("doc t{t} n{i}")))
+                            .expect("same-schema appends run side by side");
+                    }
+                });
+            }
+        });
+
+        let manifest = st.inner().manifest.load_full();
+        let superfiles = manifest.get_all_superfiles();
+        assert_eq!(superfiles.len(), THREADS * APPENDS);
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            (THREADS * APPENDS) as u64
+        );
+        assert!(manifest.term_index_complete());
+        let root = st
+            .block_on_query(term_index::load_root(
+                storage.as_ref(),
+                manifest.term_index_ref().expect("a term index"),
+            ))
+            .expect("root");
+        let listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+        assert!(
+            superfiles.iter().all(|e| listed.contains(&e.superfile_id)),
+            "every superfile is in the term index"
+        );
+        assert!(
+            !listed.contains(&Uuid::nil()),
+            "each prebuilt segment was appended at its reserved base, never rebuilt with padding"
+        );
+    }
+
+    /// Runs `exclusive` while a shared append is open, and checks that it
+    /// claims the slot (new appends are refused) and gets it once the append
+    /// is dropped.
+    fn assert_waits_for_appends_in_flight<F>(st: &Supertable, exclusive: F)
+    where
+        F: FnOnce() -> Result<SupertableWriter, BuildError> + Send,
+    {
+        let shared = st.append_writer(&row("held")).expect("shared");
+        thread::scope(|scope| {
+            let waiting = scope.spawn(move || exclusive().map(drop));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while st.append_writer(&row("probe")).is_ok() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the exclusive writer never claimed the slot"
+                );
+                thread::yield_now();
+            }
+            drop(shared);
+            assert!(
+                waiting.join().expect("join").is_ok(),
+                "the exclusive writer gets the slot once the append drains"
+            );
+        });
+    }
+
+    #[test]
+    fn an_exclusive_writer_waits_for_appends_in_flight_and_turns_new_ones_away() {
+        let st = Supertable::create(options_id_title()).expect("create");
+
+        let first = st.append_writer(&row("a")).expect("shared");
+        let second = st.append_writer(&row("b")).expect("appends share the slot");
+        drop((first, second));
+
+        assert_waits_for_appends_in_flight(&st, || st.writer());
+
+        let _exclusive = st.writer().expect("exclusive");
+        assert!(matches!(
+            st.append_writer(&row("c")),
+            Err(BuildError::SupertableInUse)
+        ));
+        assert!(matches!(st.writer(), Err(BuildError::SupertableInUse)));
+    }
+
+    #[test]
+    fn an_append_that_adds_a_column_takes_the_exclusive_slot() {
+        let st = Supertable::create(options_id_title()).expect("create");
+        let wider = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("title", DataType::LargeUtf8, false),
+                Field::new("extra", DataType::LargeUtf8, true),
+            ])),
+            vec![
+                Arc::new(LargeStringArray::from(vec!["e"])),
+                Arc::new(LargeStringArray::from(vec!["x"])),
+            ],
+        )
+        .expect("wider batch");
+        assert_waits_for_appends_in_flight(&st, || st.append_writer(&wider));
+    }
+
+    #[test]
+    fn concurrent_appends_to_a_vector_table_with_its_grid_all_land() {
+        const THREADS: usize = 4;
+        const APPENDS: usize = 3;
+        const ROWS: usize = 64;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st =
+            Supertable::create(options_title_emb_sq16(32).with_storage(storage)).expect("create");
+        st.append(&build_axis_vector_batch(256, 32))
+            .expect("the first append trains the grid");
+        assert!(
+            st.inner()
+                .manifest
+                .load()
+                .get_global_vector_index()
+                .is_some(),
+            "precondition: the grid exists, so later appends share the slot"
+        );
+
+        thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..APPENDS {
+                        st.append(&build_axis_vector_batch(ROWS, 32))
+                            .expect("vector appends run side by side");
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            (256 + THREADS * APPENDS * ROWS) as u64
+        );
+    }
+
+    #[test]
+    fn a_ticket_dropped_before_its_turn_passes_the_turn_on() {
+        let queue = AppendQueue::default();
+        let (failed, failed_base) = queue.reserve(10, 2);
+        let (next, next_base) = queue.reserve(10, 3);
+        assert_eq!((failed_base, next_base), (10, 12));
+
+        drop(failed);
+        drop(next.wait_turn());
+        drop(next);
+
+        let (_later, later_base) = queue.reserve(10, 1);
+        assert_eq!(
+            later_base, 15,
+            "the failed range stays a gap the root pads, never handed out again"
+        );
+    }
+
+    #[test]
+    fn a_segment_rebuilt_past_its_reservation_moves_the_next_base_past_it() {
+        let queue = AppendQueue::default();
+        let (ticket, base) = queue.reserve(10, 2);
+        assert_eq!(base, 10);
+        ticket.published_until(300);
+        drop(ticket);
+        assert_eq!(queue.reserve(0, 1).1, 300);
+    }
+
+    #[test]
+    fn appends_and_concurrent_compaction_keep_every_row() {
+        const THREADS: usize = 4;
+        const APPENDS: usize = 4;
+        const SEED: usize = 8;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = || options_id_title().with_storage(Arc::clone(&storage));
+        let st = Supertable::create(options()).expect("create");
+        for i in 0..SEED {
+            st.append(&row(&format!("seed {i}"))).expect("seed");
+        }
+        let settings = crate::CompactionSettings {
+            min_fill_percent: 1,
+            min_superfiles_for_merge: 2,
+            ..crate::CompactionSettings::default()
+        };
+
+        let appending = AtomicUsize::new(THREADS);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                while appending.load(Ordering::SeqCst) > 0 {
+                    st.compact(&settings).expect("compact");
+                }
+            });
+            for t in 0..THREADS {
+                let (st, appending) = (&st, &appending);
+                scope.spawn(move || {
+                    for i in 0..APPENDS {
+                        st.append(&row(&format!("doc t{t} n{i}"))).expect("append");
+                    }
+                    appending.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+
+        let reopened = Supertable::open(options()).expect("reopen");
+        let manifest = reopened.inner().manifest.load_full();
+        let live: HashSet<Uuid> = manifest
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect();
+        assert!(
+            live.len() < SEED + THREADS * APPENDS,
+            "precondition: compaction merged while appends ran"
+        );
+        assert_eq!(
+            reopened.reader().expect("reader").n_docs_total(),
+            (SEED + THREADS * APPENDS) as u64
+        );
+        let root = reopened
+            .block_on_query(term_index::load_root(
+                storage.as_ref(),
+                manifest.term_index_ref().expect("a term index"),
+            ))
+            .expect("root");
+        let listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+        assert!(
+            live.is_subset(&listed),
+            "every live superfile is in the term index"
+        );
+    }
+
+    #[test]
+    fn the_first_append_to_a_vector_table_is_exclusive() {
+        let st = Supertable::create(options_title_emb_sq16(32)).expect("create");
+        let batch = build_axis_vector_batch(8, 32);
+        let _first = st.append_writer(&batch).expect("writer");
+        assert!(
+            matches!(st.append_writer(&batch), Err(BuildError::SupertableInUse)),
+            "no grid yet, so the append trains it alone"
+        );
     }
 
     #[test]
