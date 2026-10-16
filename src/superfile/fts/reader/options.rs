@@ -64,6 +64,39 @@ pub struct Bm25SearchOptions {
     /// traded. A column whose declared pair already equals the override
     /// pays nothing either.
     pub bm25: Option<Bm25Params>,
+    /// How far below the running k-th score a superfile's score ceiling may
+    /// sit and still be skipped, as a fraction of that score. `0.0`, the
+    /// default, is exact: a superfile is skipped only when it provably cannot
+    /// place a document in the top k. `0.01` allows a one percent shortfall.
+    ///
+    /// Only the decision to read a superfile at all is relaxed. Inside one the
+    /// engine has opened, scoring and pruning stay exact, so every document
+    /// returned carries its true score and the error is confined to documents
+    /// in superfiles that went unread.
+    ///
+    /// It buys less than it appears to, and costs more. The decision compares
+    /// against the largest ceiling among unread superfiles, and where those
+    /// sit close together, as on a table whose superfiles hold similar
+    /// documents, that figure stays near the global maximum until almost
+    /// nothing is left. So a tolerance small enough to leave the top k intact
+    /// tends to skip nothing at all, while one large enough to skip a useful
+    /// number of superfiles tends to lose most of the true top k rather than
+    /// trim its edge. The fraction is a bound on score, not on how much of
+    /// the ranking survives. Measure both on your own corpus before reaching
+    /// for it.
+    ///
+    /// It also does nothing on a small table. A ranked query opens its first
+    /// [`bound_ordered_open_window`] candidates at once, 64 by default, so
+    /// until that many have been read there is no k-th score to fall short of
+    /// and nothing to skip. A table with no more candidate superfiles than
+    /// that behaves identically at every tolerance.
+    ///
+    /// A negative or non-finite value is exact. A table reached over the
+    /// network ignores this field, as it ignores [`Self::bm25`], because the
+    /// request carries neither: the result is exact rather than wrong.
+    ///
+    /// [`bound_ordered_open_window`]: crate::supertable::SupertableOptions::bound_ordered_open_window
+    pub score_tolerance: f32,
 }
 
 impl Bm25SearchOptions {
@@ -90,6 +123,18 @@ impl Bm25SearchOptions {
     /// are built with it and the correction disappears.
     pub fn with_bm25(mut self, k1: f32, b: f32) -> Self {
         self.bm25 = Some(Bm25Params::new(k1, b));
+        self
+    }
+
+    /// Allow a superfile to be skipped when its score ceiling falls short of
+    /// the running k-th score by up to `fraction` of that score, rather than
+    /// only when it provably cannot compete. See
+    /// [`Bm25SearchOptions::score_tolerance`], which the field documents in
+    /// full, including why it buys less than it appears to.
+    ///
+    /// `0.0` restores exact scoring, which is the default.
+    pub fn with_score_tolerance(mut self, fraction: f32) -> Self {
+        self.score_tolerance = fraction;
         self
     }
 }
