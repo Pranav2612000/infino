@@ -93,6 +93,15 @@ pub struct Supertable {
     inner: Arc<SupertableInner>,
 }
 
+#[cfg(test)]
+impl Supertable {
+    /// The manifest this handle serves from now, for tests that measure what
+    /// a handle holds.
+    pub(crate) fn manifest_snapshot(&self) -> Arc<ManifestSnapshot> {
+        self.inner.manifest.load_full()
+    }
+}
+
 /// Internal shared state. Every `Supertable` clone holds one Arc
 /// pointing at the same `SupertableInner`. The writer module
 /// reaches in to mutate `manifest` (via `ArcSwap::store`) on
@@ -2344,7 +2353,7 @@ mod tests {
         },
         supertable::{
             manifest::{
-                SuperfileEntry, SuperfileUri,
+                ScalarStats, SuperfileEntry, SuperfileUri,
                 commit::{POINTER_PATH, get_current_manifest_etag},
                 list::PartitionStrategy,
             },
@@ -2410,7 +2419,7 @@ mod tests {
             n_docs,
             id_min: 0,
             id_max: n_docs.saturating_sub(1) as i128,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
