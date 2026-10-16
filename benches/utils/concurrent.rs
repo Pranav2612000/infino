@@ -635,7 +635,7 @@ pub fn run() {
         };
         rows.push(vec![
             text(format!("{label} / {modality}")),
-            text(format!("{readers}r+1w")),
+            text(format!("{readers}r+{}w", n_writers())),
             metric(cp50, fmt_time(cp50), Better::Lower),
             metric(cp95, fmt_time(cp95), Better::Lower),
             metric(cp99, fmt_time(cp99), Better::Lower),

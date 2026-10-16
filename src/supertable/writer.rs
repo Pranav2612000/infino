@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! `SupertableWriter` — the single-writer append + commit path.
+//! `SupertableWriter` — the append + commit path.
 //!
 //! **Naming convention.** `SupertableWriter` is a long-lived
 //! append handle — `append×N → commit`, repeated across many
@@ -1092,7 +1092,8 @@ impl Supertable {
     }
 
     /// Merge `patch` into the schema and commit the result; see
-    /// [`SupertableWriter::apply_schema`].
+    /// [`SupertableWriter::apply_schema`]. Like [`Self::update`], it waits
+    /// for appends in flight to commit first.
     pub fn apply_schema(
         &self,
         patch: &SchemaPatch,
@@ -1108,6 +1109,12 @@ impl Supertable {
     /// Replace every row matching `predicate` with `new_rows`, then
     /// commit. `new_rows.num_rows()` must equal the match count.
     /// Durable when this returns.
+    ///
+    /// Takes the writer exclusively, so it first waits for appends in
+    /// flight to commit (their conflict retries included) and blocks the
+    /// calling thread meanwhile; from async code, call it off the runtime's
+    /// workers. Fails with [`InfinoError::Conflict`] only when another
+    /// update, delete, schema change or hydrate holds the writer.
     ///
     /// A predicate matching no rows is a no-op rather than an error — the 1:1
     /// rule holds at zero, and every returned count is zero.
@@ -1157,7 +1164,8 @@ impl Supertable {
     }
 
     /// Tombstone every row matching `predicate`, then commit. Durable
-    /// when this returns.
+    /// when this returns. Waits for appends in flight first, as
+    /// [`Self::update`] does.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -1193,13 +1201,17 @@ impl Supertable {
     }
 
     test_visible! {
-    /// Acquire the single writer for this supertable.
+    /// Acquire the exclusive writer for this supertable.
     ///
-    /// Returns [`BuildError::SupertableInUse`] if another
-    /// `SupertableWriter` is already outstanding (drop it before
-    /// acquiring a new one). Appends in flight are not refused:
-    /// this waits for them to finish, turning new ones away
-    /// meanwhile. When the writer is dropped, the slot is
+    /// **Blocks while appends are in flight.** Same-schema appends
+    /// share the slot, so this claims it (refusing new appends) and
+    /// waits until those already running have committed, including
+    /// their conflict retries and backoff. Call it off async runtime
+    /// workers.
+    ///
+    /// Returns [`BuildError::SupertableInUse`] only when another
+    /// exclusive writer holds or has claimed the slot (drop it before
+    /// acquiring a new one). When the writer is dropped, the slot is
     /// released and a subsequent `writer()` call succeeds.
     ///
     /// Consumer-memory-mode handles
@@ -1333,6 +1345,9 @@ struct AppendQueueState {
     published_end: u32,
     /// Superfiles reserved by tickets not yet served.
     pending: u32,
+    /// Prebuilt segments the commit had to rebuild on their turn.
+    #[cfg(test)]
+    rebuilt: usize,
 }
 
 impl AppendQueue {
@@ -1356,6 +1371,7 @@ impl AppendQueue {
             queue: self,
             number: state.issued,
             superfiles,
+            published: None,
         };
         state.issued += 1;
         (ticket, base)
@@ -1369,17 +1385,17 @@ struct AppendTicket<'a> {
     queue: &'a AppendQueue,
     number: u64,
     superfiles: u32,
+    /// The root this append published and its length, recorded on drop in
+    /// the same critical section that passes the turn on.
+    published: Option<(Option<RoutingRef>, u32)>,
 }
 
-impl AppendTicket<'_> {
-    /// Record that this append published `root`, whose length is `end`.
-    fn published(&self, root: Option<RoutingRef>, end: u32) {
-        let mut state = self.queue.lock();
-        state.published_root = root;
-        state.published_end = end;
+impl<'a> AppendTicket<'a> {
+    fn published(&mut self, root: Option<RoutingRef>, end: u32) {
+        self.published = Some((root, end));
     }
 
-    fn wait_turn(&self) -> MutexGuard<'_, AppendQueueState> {
+    fn wait_turn(&self) -> MutexGuard<'a, AppendQueueState> {
         let mut state = self.queue.lock();
         while state.serving != self.number {
             state = self
@@ -1394,7 +1410,12 @@ impl AppendTicket<'_> {
 
 impl Drop for AppendTicket<'_> {
     fn drop(&mut self) {
+        let published = self.published.take();
         let mut state = self.wait_turn();
+        if let Some((root, end)) = published {
+            state.published_root = root;
+            state.published_end = end;
+        }
         state.pending -= self.superfiles;
         state.serving += 1;
         drop(state);
@@ -2864,11 +2885,17 @@ impl SupertableWriter {
             return bridge_on_runtime(
                 persist_superfile_publish_batch_async(&self.inner, batch, list_metadata, None),
                 &runtime,
-            );
+            )
+            .map(drop);
         }
+        // A schema that already moved would throw away the upload below.
+        list_metadata
+            .check_schema(&self.inner.manifest.load())
+            .map_err(BuildError::from)?;
         let current_root = || self.inner.manifest.load().term_index_ref().cloned();
         let mut segment = None;
-        let ticket = match &self.inner.options.storage {
+        let mut prebuilt_end = None;
+        let mut ticket = match &self.inner.options.storage {
             None => self.inner.append_queue.reserve(None, 0).0,
             Some(storage) => {
                 bridge_on_runtime(
@@ -2887,7 +2914,10 @@ impl SupertableWriter {
                     .reserve(current_root().as_ref(), contributions.len() as u32);
                 if !contributions.is_empty() {
                     let base = match base {
-                        Some(base) => base,
+                        Some(base) => {
+                            prebuilt_end = Some(base + contributions.len() as u32);
+                            base
+                        }
                         None => {
                             drop(ticket.wait_turn());
                             match current_root() {
@@ -2927,11 +2957,21 @@ impl SupertableWriter {
             ),
             &runtime,
         );
-        if let (Ok(()), Some(segment)) = (&published, &segment) {
-            ticket.published(current_root(), segment.end());
+        if let (Ok(root), Some(segment)) = (&published, &segment) {
+            ticket.published(root.clone(), segment.end());
+            if prebuilt_end.is_some_and(|end| end != segment.end()) {
+                debug!(
+                    end = segment.end(),
+                    "append's prebuilt term-index segment was rebuilt on its turn"
+                );
+                #[cfg(test)]
+                {
+                    self.inner.append_queue.lock().rebuilt += 1;
+                }
+            }
         }
         drop(ticket);
-        published
+        published.map(drop)
     }
 }
 
@@ -4124,6 +4164,7 @@ pub(crate) fn commit_built_superfile(st: &Supertable, bytes: Bytes) -> Result<()
         CommitListMetadata::empty(),
         None,
     ))
+    .map(drop)
 }
 
 pub(super) fn commit_output_stats(batch: &SuperfilePublishBatch) -> (u64, u64, u64) {
@@ -4207,14 +4248,16 @@ pub(super) fn prepare_user_superfile_batch(
         .install(|| prepare_user_superfile_batch_in_scope(inner, manifest, outputs, hints, stem))
 }
 
+/// Publish `batch`, returning the term-index root of the manifest it
+/// published, if any.
 pub(super) async fn persist_superfile_publish_batch_async(
     inner: &SupertableInner,
     batch: SuperfilePublishBatch,
     list_metadata: CommitListMetadata,
     reserved_segment: Option<&mut Option<ReservedSegment>>,
-) -> Result<(), BuildError> {
+) -> Result<Option<RoutingRef>, BuildError> {
     if batch.new_entries.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     if let Some(storage) = inner.options.storage.as_ref().cloned() {
         let new_manifest = persist_commit_with_segment_async(
@@ -4230,6 +4273,7 @@ pub(super) async fn persist_superfile_publish_batch_async(
         )
         .await
         .map_err(BuildError::from)?;
+        let published_root = new_manifest.term_index_ref().cloned();
         inner.manifest.store(new_manifest);
         apply_pending_store_inserts(inner, batch.pending_store_inserts);
         // Already async — await the warm-cache fill directly. Do NOT call
@@ -4245,7 +4289,7 @@ pub(super) async fn persist_superfile_publish_batch_async(
         ) {
             cache.sweep_for_budget(budget);
         }
-        return Ok(());
+        return Ok(published_root);
     }
     let old = inner.manifest.load();
     list_metadata.check_schema(&old)?;
@@ -4269,8 +4313,9 @@ pub(super) async fn persist_superfile_publish_batch_async(
             .insert(uri, bytes)
             .map_err(|e| BuildError::Store(format!("store insert for {uri:?}: {e}")))?;
     }
+    let published_root = new.term_index_ref().cloned();
     inner.manifest.store(Arc::new(new));
-    Ok(())
+    Ok(published_root)
 }
 
 /// Rayon pool for hidden-maintenance CPU work (cell-split planning, child
@@ -12838,6 +12883,7 @@ mod tests {
                 CellVectorSummary, ClusterCentroids, VectorSummary,
                 commit::{MANIFEST_DIR, POINTER_PATH, manifest_uri},
             },
+            query::vector::assemble_hnsw_incremental,
             schema::change::SchemaChange,
             slow_vector_state::STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX,
             storage::LocalFsStorageProvider,
@@ -13115,6 +13161,80 @@ mod tests {
         assert!(
             nearest(&prior, 1) < 0.05,
             "full-build graph must serve a batch-1 row"
+        );
+    }
+
+    /// Concurrent appends publish out of id order. Rows that land after the
+    /// graph was built over later-minted ones sit below its high water, so
+    /// the incremental extend must refuse rather than leave them out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rows_published_below_the_graph_high_water_force_a_full_rebuild() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let (dim, rows) = (32usize, 256usize);
+        let table = Supertable::create(
+            options_title_emb_sq16(dim)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_batch_superfiles(1),
+        )
+        .expect("create");
+        table
+            .append(&build_axis_vector_batch_range(rows, dim, 0, 8))
+            .expect("the first append trains the grid");
+
+        let early_rows = build_axis_vector_batch_range(rows, dim, 16, 24);
+        let mut early = table.append_writer(&early_rows).expect("shared");
+        early.append(&early_rows).expect("mints its ids first");
+        table
+            .append(&build_axis_vector_batch_range(rows, dim, 8, 16))
+            .expect("later-minted rows publish first");
+
+        let (hidden, _epoch) = current_drain_epoch(&table).await;
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("first drain");
+        let graph_ref = build_hnsw_graph_ref(
+            storage.as_ref(),
+            hidden.reader().expect("reader").manifest(),
+        )
+        .await
+        .expect("full build registers a graph");
+        let sections = slow_vector_state::hydrate_resident_index(
+            storage.as_ref(),
+            &graph_ref,
+            slow_vector_state::WalkPlaneRequest::AsStored,
+        )
+        .await
+        .expect("fetch built graph");
+        let prior = match sections.data {
+            Some(slow_vector_state::ResidentIndexKind::Graph(graph)) => graph,
+            _ => panic!("a data graph after the full build"),
+        };
+
+        early.commit().expect("earlier-minted rows publish last");
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("second drain");
+
+        let outcome = assemble_hnsw_incremental(
+            hidden.reader().expect("reader").manifest(),
+            "emb",
+            &None,
+            prior,
+            sections.high_water_id,
+        )
+        .await
+        .expect("assemble");
+        assert!(
+            matches!(outcome, IndexOutcome::Unavailable(_)),
+            "rows below the high water are not a clean append, so the caller rebuilds"
         );
     }
 
@@ -15901,6 +16021,11 @@ supertable:
             !listed.contains(&Uuid::nil()),
             "each prebuilt segment was appended at its reserved base, never rebuilt with padding"
         );
+        assert_eq!(
+            st.inner().append_queue.lock().rebuilt,
+            0,
+            "without another writer, every prebuilt segment is appended as built"
+        );
     }
 
     /// Runs `exclusive` while a shared append is open, and checks that it
@@ -16006,7 +16131,7 @@ supertable:
     fn a_ticket_dropped_before_its_turn_passes_the_turn_on() {
         let queue = AppendQueue::default();
         let (failed, failed_base) = queue.reserve(None, 2);
-        let (next, next_base) = queue.reserve(None, 3);
+        let (mut next, next_base) = queue.reserve(None, 3);
         assert_eq!((failed_base, next_base), (Some(0), Some(2)));
 
         drop(failed);
@@ -16025,10 +16150,10 @@ supertable:
     #[test]
     fn the_next_base_follows_where_the_last_segment_ended() {
         let queue = AppendQueue::default();
-        let (ticket, _) = queue.reserve(None, 2);
+        let (mut ticket, _) = queue.reserve(None, 2);
         ticket.published(None, 300);
         drop(ticket);
-        let (ticket, base) = queue.reserve(None, 1);
+        let (mut ticket, base) = queue.reserve(None, 1);
         assert_eq!(base, Some(300));
         ticket.published(None, 31);
         drop(ticket);
@@ -16046,7 +16171,7 @@ supertable:
             content_hash: part_mod::ContentHash::of(name.as_bytes()),
         };
         let queue = AppendQueue::default();
-        let (ticket, _) = queue.reserve(None, 2);
+        let (mut ticket, _) = queue.reserve(None, 2);
         ticket.published(Some(root("ours")), 5);
         drop(ticket);
 
@@ -16086,6 +16211,11 @@ supertable:
         let root = term_root(&Supertable::open(options()).expect("reopen"), &storage);
         assert_eq!(root.superfiles.len(), APPENDS);
         assert!(!root.superfiles.contains(&Uuid::nil()));
+        assert!(
+            first.inner().append_queue.lock().rebuilt + second.inner().append_queue.lock().rebuilt
+                > 0,
+            "each handle's view goes stale behind the other's appends, so some rebuild"
+        );
     }
 
     #[test]
@@ -16125,7 +16255,7 @@ supertable:
         let options = || options_id_title().with_storage(Arc::clone(&storage));
         let st = Supertable::create(options()).expect("create");
         for i in 0..SEED {
-            st.append(&row(&format!("seed {i}"))).expect("seed");
+            st.append(&row(&format!("seed s{i}"))).expect("seed");
         }
         let settings = CompactionSettings {
             min_fill_percent: 1,
@@ -16144,7 +16274,7 @@ supertable:
                 let (st, appending) = (&st, &appending);
                 scope.spawn(move || {
                     for i in 0..APPENDS {
-                        st.append(&row(&format!("doc t{t} n{i}"))).expect("append");
+                        st.append(&row(&format!("doc t{t}n{i}"))).expect("append");
                     }
                     appending.fetch_sub(1, Ordering::SeqCst);
                 });
@@ -16177,6 +16307,45 @@ supertable:
             live.is_subset(&listed),
             "every live superfile is in the term index"
         );
+
+        // Ordinals: each planted token must route to exactly its own row.
+        let planted = (0..SEED)
+            .map(|i| format!("s{i}"))
+            .chain((0..THREADS).flat_map(|t| (0..APPENDS).map(move |i| format!("t{t}n{i}"))));
+        for token in planted {
+            let hits = reopened
+                .bm25_search(
+                    "title",
+                    &token,
+                    10,
+                    Bm25SearchOptions::new(),
+                    Some(&["title"]),
+                )
+                .expect("bm25");
+            let titles: Vec<String> = hits
+                .iter()
+                .flat_map(|batch| {
+                    let column = batch
+                        .column_by_name("title")
+                        .expect("title")
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .expect("large utf8");
+                    (0..column.len())
+                        .map(|r| column.value(r).to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(
+                titles.len(),
+                1,
+                "`{token}` finds exactly one row: {titles:?}"
+            );
+            assert!(
+                titles[0].split(' ').any(|word| word == token),
+                "`{token}` finds its own row: {titles:?}"
+            );
+        }
     }
 
     #[test]
