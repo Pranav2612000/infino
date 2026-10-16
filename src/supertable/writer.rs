@@ -1315,8 +1315,9 @@ impl WriterSlot {
 
 /// Orders the publishes of shared append writers. Each takes a ticket and a
 /// term-index base once its superfiles are uploaded, then publishes in ticket
-/// order, so every base is still at or past the root's length on its turn and
-/// its prebuilt segment is appended as is.
+/// order, so its base is the root's length on its turn and its prebuilt
+/// segment is appended as is. A base the root no longer matches (another
+/// writer or an optimize moved it) costs a rebuild at the root's length.
 #[derive(Default)]
 pub(super) struct AppendQueue {
     state: Mutex<AppendQueueState>,
@@ -1327,9 +1328,11 @@ pub(super) struct AppendQueue {
 struct AppendQueueState {
     issued: u64,
     serving: u64,
-    /// Past every segment reserved or published through this queue. `None`
-    /// until the first reservation, which reads the root's length instead.
-    next_base: Option<u32>,
+    /// The root the queue last published, and its length.
+    published_root: Option<RoutingRef>,
+    published_end: u32,
+    /// Superfiles reserved by tickets not yet served.
+    pending: u32,
 }
 
 impl AppendQueue {
@@ -1337,19 +1340,22 @@ impl AppendQueue {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn needs_root_len(&self) -> bool {
-        self.lock().next_base.is_none()
-    }
-
-    /// A ticket and the base for a segment of `superfiles`, given the root
-    /// holds at least `root_len` superfiles.
-    fn reserve(&self, root_len: u32, superfiles: u32) -> (AppendTicket<'_>, u32) {
+    /// A ticket and the base for a segment of `superfiles`, or no base when
+    /// `root` is not the root the queue last published: its length is then
+    /// unknown, so the segment is built on the ticket's turn instead.
+    fn reserve(
+        &self,
+        root: Option<&RoutingRef>,
+        superfiles: u32,
+    ) -> (AppendTicket<'_>, Option<u32>) {
         let mut state = self.lock();
-        let base = state.next_base.unwrap_or(0).max(root_len);
-        state.next_base = Some(base.saturating_add(superfiles));
+        let base = (state.published_root.as_ref() == root)
+            .then_some(state.published_end.saturating_add(state.pending));
+        state.pending += superfiles;
         let ticket = AppendTicket {
             queue: self,
             number: state.issued,
+            superfiles,
         };
         state.issued += 1;
         (ticket, base)
@@ -1362,14 +1368,15 @@ impl AppendQueue {
 struct AppendTicket<'a> {
     queue: &'a AppendQueue,
     number: u64,
+    superfiles: u32,
 }
 
 impl AppendTicket<'_> {
-    /// Record that this append's segment ends at `end`: past its reservation
-    /// when the commit rebuilt it behind a root another process extended.
-    fn published_until(&self, end: u32) {
+    /// Record that this append published `root`, whose length is `end`.
+    fn published(&self, root: Option<RoutingRef>, end: u32) {
         let mut state = self.queue.lock();
-        state.next_base = Some(state.next_base.unwrap_or(0).max(end));
+        state.published_root = root;
+        state.published_end = end;
     }
 
     fn wait_turn(&self) -> MutexGuard<'_, AppendQueueState> {
@@ -1387,7 +1394,10 @@ impl AppendTicket<'_> {
 
 impl Drop for AppendTicket<'_> {
     fn drop(&mut self) {
-        self.wait_turn().serving += 1;
+        let mut state = self.wait_turn();
+        state.pending -= self.superfiles;
+        state.serving += 1;
+        drop(state);
         self.queue.turn.notify_all();
     }
 }
@@ -2841,7 +2851,9 @@ impl SupertableWriter {
 
     /// Publish an append's superfiles. A shared writer uploads them and builds
     /// its term-index segment before taking its turn in the append queue, so
-    /// only the manifest and root writes are serialized between appends.
+    /// only the manifest and root writes are serialized between appends. When
+    /// the root is not one the queue published, its length is unknown until
+    /// the turn, so the segment is built then, once.
     fn publish_appended(
         &self,
         mut batch: SuperfilePublishBatch,
@@ -2854,9 +2866,10 @@ impl SupertableWriter {
                 &runtime,
             );
         }
+        let current_root = || self.inner.manifest.load().term_index_ref().cloned();
         let mut segment = None;
         let ticket = match &self.inner.options.storage {
-            None => self.inner.append_queue.reserve(0, 0).0,
+            None => self.inner.append_queue.reserve(None, 0).0,
             Some(storage) => {
                 bridge_on_runtime(
                     write_superfile_list(
@@ -2868,32 +2881,33 @@ impl SupertableWriter {
                     &runtime,
                 )?;
                 let contributions = &batch.term_contributions;
-                let root_len = match self.inner.manifest.load().term_index_ref() {
-                    Some(reference)
-                        if !contributions.is_empty()
-                            && self.inner.append_queue.needs_root_len() =>
-                    {
-                        bridge_on_runtime(
-                            term_index::load_root(storage.as_ref(), reference),
-                            &runtime,
-                        )
-                        .map_or(0, |root| root.superfiles.len() as u32)
-                    }
-                    _ => 0,
-                };
                 let (ticket, base) = self
                     .inner
                     .append_queue
-                    .reserve(root_len, contributions.len() as u32);
+                    .reserve(current_root().as_ref(), contributions.len() as u32);
                 if !contributions.is_empty() {
-                    let policy = term_index::BuildPolicy::default();
+                    let base = match base {
+                        Some(base) => base,
+                        None => {
+                            drop(ticket.wait_turn());
+                            match current_root() {
+                                Some(root) => bridge_on_runtime(
+                                    term_index::load_root(storage.as_ref(), &root),
+                                    &runtime,
+                                )
+                                .map_or(0, |root| root.superfiles.len() as u32),
+                                None => 0,
+                            }
+                        }
+                    };
                     segment = Some(
                         bridge_on_runtime(
                             term_index::reserve_segment(
                                 storage.as_ref(),
                                 contributions,
-                                &policy,
+                                &term_index::BuildPolicy::default(),
                                 base,
+                                true,
                             ),
                             &runtime,
                         )
@@ -2914,7 +2928,7 @@ impl SupertableWriter {
             &runtime,
         );
         if let (Ok(()), Some(segment)) = (&published, &segment) {
-            ticket.published_until(segment.end());
+            ticket.published(current_root(), segment.end());
         }
         drop(ticket);
         published
@@ -12809,7 +12823,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::Config,
+        config::{CompactionSettings, Config, OptimizeOptions},
         superfile::{
             BytesLazyByteSource, LazyByteSource, LazyByteSourceError, PrefetchedSource,
             builder::{FtsConfig, VectorConfig},
@@ -15991,29 +16005,113 @@ supertable:
     #[test]
     fn a_ticket_dropped_before_its_turn_passes_the_turn_on() {
         let queue = AppendQueue::default();
-        let (failed, failed_base) = queue.reserve(10, 2);
-        let (next, next_base) = queue.reserve(10, 3);
-        assert_eq!((failed_base, next_base), (10, 12));
+        let (failed, failed_base) = queue.reserve(None, 2);
+        let (next, next_base) = queue.reserve(None, 3);
+        assert_eq!((failed_base, next_base), (Some(0), Some(2)));
 
         drop(failed);
         drop(next.wait_turn());
+        // Its base no longer matches the root, so the commit rebuilt it there.
+        next.published(None, 3);
         drop(next);
 
-        let (_later, later_base) = queue.reserve(10, 1);
         assert_eq!(
-            later_base, 15,
-            "the failed range stays a gap the root pads, never handed out again"
+            queue.reserve(None, 1).1,
+            Some(3),
+            "the next base is where the root ends, not past the failed range"
         );
     }
 
     #[test]
-    fn a_segment_rebuilt_past_its_reservation_moves_the_next_base_past_it() {
+    fn the_next_base_follows_where_the_last_segment_ended() {
         let queue = AppendQueue::default();
-        let (ticket, base) = queue.reserve(10, 2);
-        assert_eq!(base, 10);
-        ticket.published_until(300);
+        let (ticket, _) = queue.reserve(None, 2);
+        ticket.published(None, 300);
         drop(ticket);
-        assert_eq!(queue.reserve(0, 1).1, 300);
+        let (ticket, base) = queue.reserve(None, 1);
+        assert_eq!(base, Some(300));
+        ticket.published(None, 31);
+        drop(ticket);
+        assert_eq!(
+            queue.reserve(None, 1).1,
+            Some(31),
+            "down as well as up, as when optimize shrinks the root"
+        );
+    }
+
+    #[test]
+    fn a_root_the_queue_did_not_publish_leaves_the_base_unknown() {
+        let root = |name: &str| RoutingRef {
+            uri: name.to_owned(),
+            content_hash: part_mod::ContentHash::of(name.as_bytes()),
+        };
+        let queue = AppendQueue::default();
+        let (ticket, _) = queue.reserve(None, 2);
+        ticket.published(Some(root("ours")), 5);
+        drop(ticket);
+
+        assert_eq!(
+            queue.reserve(Some(&root("theirs")), 1).1,
+            None,
+            "another writer moved the root, so its length is unknown"
+        );
+        assert_eq!(queue.reserve(Some(&root("ours")), 1).1, Some(5));
+    }
+
+    /// The term-index root `st`'s manifest references.
+    fn term_root(st: &Supertable, storage: &Arc<dyn StorageProvider>) -> Root {
+        let manifest = st.inner().manifest.load_full();
+        st.block_on_query(term_index::load_root(
+            storage.as_ref(),
+            manifest.term_index_ref().expect("a term index"),
+        ))
+        .expect("root")
+    }
+
+    #[test]
+    fn appends_from_two_handles_never_pad_the_term_index() {
+        const APPENDS: usize = 12;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = || options_id_title().with_storage(Arc::clone(&storage));
+        let first = Supertable::create(options()).expect("create");
+        let second = Supertable::open(options()).expect("open");
+
+        for i in 0..APPENDS {
+            let st = if i % 2 == 0 { &first } else { &second };
+            st.append(&row(&format!("doc {i}"))).expect("append");
+        }
+
+        let root = term_root(&Supertable::open(options()).expect("reopen"), &storage);
+        assert_eq!(root.superfiles.len(), APPENDS);
+        assert!(!root.superfiles.contains(&Uuid::nil()));
+    }
+
+    #[test]
+    fn an_append_after_optimize_shrinks_the_root_does_not_pad_it_back() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_id_title().with_storage(Arc::clone(&storage)))
+            .expect("create");
+        for i in 0..40 {
+            st.append(&row(&format!("doc {i}"))).expect("append");
+        }
+        st.optimize(&OptimizeOptions::compact(CompactionSettings {
+            min_fill_percent: 1,
+            min_superfiles_for_merge: 2,
+            ..CompactionSettings::default()
+        }))
+        .expect("optimize");
+        let shrunk = term_root(&st, &storage).superfiles.len();
+        assert!(shrunk < 40, "precondition: optimize rebuilt a shorter root");
+
+        st.append(&row("after")).expect("append");
+
+        let root = term_root(&st, &storage);
+        assert_eq!(root.superfiles.len(), shrunk + 1);
+        assert!(!root.superfiles.contains(&Uuid::nil()));
     }
 
     #[test]
@@ -16029,10 +16127,10 @@ supertable:
         for i in 0..SEED {
             st.append(&row(&format!("seed {i}"))).expect("seed");
         }
-        let settings = crate::CompactionSettings {
+        let settings = CompactionSettings {
             min_fill_percent: 1,
             min_superfiles_for_merge: 2,
-            ..crate::CompactionSettings::default()
+            ..CompactionSettings::default()
         };
 
         let appending = AtomicUsize::new(THREADS);
