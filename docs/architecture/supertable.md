@@ -517,7 +517,9 @@ other. A reader holds an immutable manifest snapshot; a writer builds
 new superfiles and a new manifest independently.
 - **Atomic publication.** A reader sees either the manifest before a
 commit or the manifest after it, never an intermediate state.
-- **Single writer.** One writer is active per table at a time.
+- **Writers.** Appends that keep the table's schema build in parallel and
+publish one at a time; updates, deletes and schema changes take the table's
+writer exclusively, waiting for appends in flight to finish.
 - **Separate pools.** Query fan-out and superfile builds use separate
 worker pools, so background writes do not starve foreground reads.
 
@@ -525,6 +527,7 @@ worker pools, so background writes do not starve foreground reads.
 
 - Superfiles are immutable; updates are expressed by publishing a new
 manifest over different superfiles.
-- One writer is active per table at a time.
+- Within one process, commits to a table publish one at a time;
+appends that keep the schema build in parallel before publishing.
 - Full-text and vector search are distinct query paths; combined
 relevance scoring is left to the caller.

@@ -183,9 +183,10 @@ pub struct SuperfileList {
     /// derives `manifest_id = old.next_manifest_id()` — normally
     /// `old.manifest_id + 1`, past that when a crash-orphaned list
     /// occupies an id (ids may gap; readers follow the pointer, never
-    /// id arithmetic). With a single writer at a time, no separate
-    /// counter or atomic is needed — the read-then-store sequence is
-    /// exclusive by construction.
+    /// id arithmetic). No separate counter or atomic is needed: within
+    /// a process, commits publish one at a time (an exclusive writer,
+    /// or a shared append on its turn in the append queue), and across
+    /// processes the pointer compare-and-swap refuses all but one.
     pub manifest_id: u64,
     /// Pointer back to the immutable per-supertable configuration.
     /// Same Arc across all manifests of one supertable.

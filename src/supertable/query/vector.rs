@@ -3460,10 +3460,9 @@ pub(crate) async fn assemble_hnsw_sections(
 
 /// Incrementally extend a prior persisted `hnsw` graph with a
 /// freshly-drained append delta — no full rebuild. Reads only rows whose
-/// `stable_id > prior_high_water` (the append boundary from the prior
-/// bundle header; ids are assigned monotonically at drain), concatenates
-/// their code plane + stable ids onto the prior graph's, and inserts only
-/// the new nodes via [`Hnsw::extend`]. Returns
+/// `stable_id > prior_high_water` (the largest id in the prior graph),
+/// concatenates their code plane + stable ids onto the prior graph's, and
+/// inserts only the new nodes via [`Hnsw::extend`]. Returns
 /// `(data_bundle_bytes, new_high_water, inserted_node_count)`.
 ///
 /// `Ok(None)` means "cannot incrementally extend — do a full rebuild
@@ -3471,6 +3470,13 @@ pub(crate) async fn assemble_hnsw_sections(
 /// (the prior count plus the delta does not equal the current row count,
 /// so rows were removed or ids are not a clean monotonic extension). This
 /// guard keeps the incremental path strictly for pure appends.
+///
+/// Ids are minted at append, and concurrent appends (in one process or
+/// across processes) can publish out of id order. A batch that lands after
+/// the graph was built over a later-minted one sits below the high water,
+/// so this returns `NoNewRows` or `NotPureAppend` and the caller rebuilds:
+/// out-of-order publishing costs a full rebuild, never a row missing from
+/// the graph.
 pub(crate) async fn assemble_hnsw_incremental(
     manifest: &ManifestSnapshot,
     column: &str,
