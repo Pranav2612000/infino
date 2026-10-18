@@ -54,13 +54,25 @@ supertable:
   # than the core count. Set 0 to fall back to one piece per writer-pool thread.
   superfile_buffer_split_mb: 64
 
-  # Verify the trailing whole-blob CRC and per-subsection CRCs
-  # on every SuperfileReader::open. Defaults to true. Set to
-  # false only when the underlying storage already validates
-  # checksums (content-addressed object store, ZFS, etc.) —
-  # skipping the scan trades that storage-layer guarantee for
-  # faster cold opens.
-  verify_crc_on_open: true
+  # When the engine verifies a superfile's stored checksums.
+  #
+  #   auto   - verify where bytes arrive and not where they are read, which
+  #            is what Lucene, Elasticsearch and OpenSearch do. The default.
+  #   always - verify the whole blob and every subsection on each open. The
+  #            strictest and by far the most expensive setting.
+  #   never  - never verify; appropriate only where the storage beneath
+  #            already guarantees integrity end to end.
+  #
+  # Left commented deliberately. This file is merged underneath an
+  # operator's own, so setting the key here would make it present in every
+  # configuration, and the deprecated `verify_crc_on_open` below could then
+  # never be reached. Unset, the default comes from the engine instead.
+  # crc_verification: auto
+
+  # Deprecated, still honoured so a configuration naming it keeps the
+  # behaviour it asked for: true means `always`, false means `never`.
+  # `crc_verification` wins when both are set.
+  # verify_crc_on_open: true
 
 # Persistent storage wiring. Defaults to in-memory-only. Set
 # `backend: s3` plus `bucket` / `prefix` to make
