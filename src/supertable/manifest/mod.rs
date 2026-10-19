@@ -2563,7 +2563,7 @@ impl ManifestSnapshot {
                     }
                 });
             stream::iter(to_load)
-                .buffered(MANIFEST_PART_LOAD_CONCURRENCY)
+                .buffer_unordered(MANIFEST_PART_LOAD_CONCURRENCY)
                 .try_collect::<Vec<()>>()
                 .await?;
             for entry in out_list_entries {
