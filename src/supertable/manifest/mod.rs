@@ -2539,122 +2539,165 @@ impl ManifestSnapshot {
                 cache.by_source.clear();
                 cache.bytes = 0;
             }
-            // Load the base parts the loop reads, a bounded number at a
-            // time, so its loads below find them in their cells instead of
-            // fetching one after another. Stop at the first failure rather
-            // than waiting on every other load.
-            let to_load = out_list_entries
-                .iter()
-                .filter(|entry| {
-                    !parts_to_write
-                        .iter()
-                        .any(|ep| ep.part.part_id == entry.part_id)
-                        && !rebuilt
-                            .as_deref()
-                            .is_some_and(|cache| cache.by_source.contains_key(&entry.content_hash))
-                })
-                .map(|entry| {
-                    let part_id = entry.part_id;
-                    async move {
-                        self.get_part_by_id(part_id)
-                            .await
-                            .map(drop)
-                            .map_err(|_| ManifestError::UnknownPartId(part_id))
-                    }
-                });
-            stream::iter(to_load)
-                .buffer_unordered(MANIFEST_PART_LOAD_CONCURRENCY)
-                .try_collect::<Vec<()>>()
-                .await?;
-            for entry in out_list_entries {
-                // TODO: Handle merging 2 parts into one if their sum is within threshold
-
-                // A part from the base an earlier attempt already rebuilt for
-                // these removals. A part this commit appended to is new, so
-                // never found here.
-                let source = entry.content_hash;
-                let from_base = !parts_to_write
+            // A base part whose birth-version range holds none of the removed
+            // superfiles' versions cannot hold them, so it is kept without
+            // being loaded. If that pass finds fewer removed superfiles than
+            // asked for, an entry's version disagreed with its part's range:
+            // run again over every part rather than leave one listed.
+            let mut removal_versions: Vec<u64> =
+                entries_to_remove.iter().map(|r| r.birth_version).collect();
+            removal_versions.sort_unstable();
+            removal_versions.dedup();
+            let parts_written_before_removal = parts_to_write.clone();
+            for skip_by_birth_version in [true, false] {
+                if !skip_by_birth_version {
+                    parts_to_write = parts_written_before_removal.clone();
+                    out_list_entries_after_removal.clear();
+                }
+                let mut skipped_any = false;
+                let mut n_removed = 0;
+                let may_hold_removal = |entry: &ManifestPartEntry| {
+                    !skip_by_birth_version || may_hold_birth_version(entry, &removal_versions)
+                };
+                // Load the base parts the loop reads, a bounded number at a
+                // time, so its loads below find them in their cells instead of
+                // fetching one after another. Stop at the first failure rather
+                // than waiting on every other load.
+                let to_load = out_list_entries
                     .iter()
-                    .any(|ep| ep.part.part_id == entry.part_id);
-                let done = rebuilt
-                    .as_deref()
-                    .filter(|_| from_base)
-                    .and_then(|cache| cache.by_source.get(&source).cloned());
-                if let Some(done) = done {
-                    match done {
-                        RebuiltPart::Unchanged => out_list_entries_after_removal.push(entry),
-                        RebuiltPart::Dropped => {}
-                        RebuiltPart::Rebuilt(rebuilt_part) => {
-                            let (fresh_entry, fresh_encoded_part) = *rebuilt_part;
-                            parts_to_write.push(fresh_encoded_part);
-                            out_list_entries_after_removal.push(fresh_entry);
+                    .filter(|entry| {
+                        !parts_to_write
+                            .iter()
+                            .any(|ep| ep.part.part_id == entry.part_id)
+                            && !rebuilt.as_deref().is_some_and(|cache| {
+                                cache.by_source.contains_key(&entry.content_hash)
+                            })
+                            && may_hold_removal(entry)
+                    })
+                    .map(|entry| {
+                        let part_id = entry.part_id;
+                        async move {
+                            self.get_part_by_id(part_id)
+                                .await
+                                .map(drop)
+                                .map_err(|_| ManifestError::UnknownPartId(part_id))
                         }
+                    });
+                stream::iter(to_load)
+                    .buffer_unordered(MANIFEST_PART_LOAD_CONCURRENCY)
+                    .try_collect::<Vec<()>>()
+                    .await?;
+                for entry in out_list_entries.iter().cloned() {
+                    // TODO: Handle merging 2 parts into one if their sum is within threshold
+
+                    // A part from the base an earlier attempt already rebuilt for
+                    // these removals. A part this commit appended to is new, so
+                    // never found here.
+                    let source = entry.content_hash;
+                    let from_base = !parts_to_write
+                        .iter()
+                        .any(|ep| ep.part.part_id == entry.part_id);
+                    let done = rebuilt
+                        .as_deref()
+                        .filter(|_| from_base)
+                        .and_then(|cache| cache.by_source.get(&source).cloned());
+                    if let Some(done) = done {
+                        match done {
+                            RebuiltPart::Unchanged => out_list_entries_after_removal.push(entry),
+                            RebuiltPart::Dropped => n_removed += entry.n_superfiles,
+                            RebuiltPart::Rebuilt(rebuilt_part) => {
+                                let (fresh_entry, fresh_encoded_part) = *rebuilt_part;
+                                n_removed +=
+                                    entry.n_superfiles.saturating_sub(fresh_entry.n_superfiles);
+                                parts_to_write.push(fresh_encoded_part);
+                                out_list_entries_after_removal.push(fresh_entry);
+                            }
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                let mut remember = |outcome: RebuiltPart| {
-                    if from_base && let Some(cache) = rebuilt.as_deref_mut() {
-                        cache.keep(source, outcome);
+                    if from_base && !may_hold_removal(&entry) {
+                        skipped_any = true;
+                        out_list_entries_after_removal.push(entry);
+                        continue;
                     }
-                };
+                    let mut remember = |outcome: RebuiltPart| {
+                        if from_base && let Some(cache) = rebuilt.as_deref_mut() {
+                            cache.keep(source, outcome);
+                        }
+                    };
 
-                // Fetch the part's current superfiles — from parts_to_write (freshly
-                // rebuilt this commit) or the prior manifest.
-                let (superfile_entries_in_part, existing_part_to_update) = if let Some(existing) =
-                    parts_to_write
-                        .iter_mut()
-                        .find(|ep| ep.part.part_id == entry.part_id)
-                {
-                    (existing.part.superfiles.clone(), Some(existing))
-                } else if let Ok(existing_part) = self.get_part_by_id(entry.part_id).await {
-                    (existing_part.superfiles.clone(), None)
-                } else {
-                    return Err(ManifestError::UnknownPartId(entry.part_id));
-                };
-                let final_superfile_entries = superfile_entries_in_part
-                    .iter()
-                    .filter(|s| !removal_ids.contains(&s.superfile_id))
-                    .cloned()
-                    .collect::<Vec<_>>();
+                    // Fetch the part's current superfiles — from parts_to_write (freshly
+                    // rebuilt this commit) or the prior manifest.
+                    let (superfile_entries_in_part, existing_part_to_update) =
+                        if let Some(existing) = parts_to_write
+                            .iter_mut()
+                            .find(|ep| ep.part.part_id == entry.part_id)
+                        {
+                            (existing.part.superfiles.clone(), Some(existing))
+                        } else if let Ok(existing_part) = self.get_part_by_id(entry.part_id).await {
+                            (existing_part.superfiles.clone(), None)
+                        } else {
+                            return Err(ManifestError::UnknownPartId(entry.part_id));
+                        };
+                    let final_superfile_entries = superfile_entries_in_part
+                        .iter()
+                        .filter(|s| !removal_ids.contains(&s.superfile_id))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    n_removed +=
+                        (superfile_entries_in_part.len() - final_superfile_entries.len()) as u64;
 
-                // No superfile removed from this part → keep it unchanged.
-                if final_superfile_entries.len() == superfile_entries_in_part.len() {
-                    remember(RebuiltPart::Unchanged);
-                    out_list_entries_after_removal.push(entry);
-                    continue;
+                    // No superfile removed from this part → keep it unchanged.
+                    if final_superfile_entries.len() == superfile_entries_in_part.len() {
+                        remember(RebuiltPart::Unchanged);
+                        out_list_entries_after_removal.push(entry);
+                        continue;
+                    }
+
+                    // All superfiles removed from this part → drop it from the list
+                    // rather than keeping a zero-superfile stub. A merge that lifts
+                    // every fragment out of a part would otherwise leave the empty
+                    // part live in the list forever (it survives GC as referenced),
+                    // inflating the part count and the open-time GET fan for no data.
+                    // Dropping the last part is safe: a user manifest with zero parts
+                    // is a handled state (an empty table — the load path guards
+                    // `parts.is_empty()`, and hidden vector-index manifests always
+                    // run with zero parts), and nothing else would ever collect a
+                    // retained empty stub (compaction merges superfiles, not parts).
+                    if final_superfile_entries.is_empty() {
+                        remember(RebuiltPart::Dropped);
+                        continue;
+                    }
+
+                    let (fresh_entry, fresh_encoded_part) = rebuild_part_and_entry(
+                        vec![],
+                        final_superfile_entries,
+                        None,
+                        hidden_table,
+                    )?;
+                    if from_base {
+                        remember(RebuiltPart::Rebuilt(Box::new((
+                            fresh_entry.clone(),
+                            fresh_encoded_part.clone(),
+                        ))));
+                    }
+
+                    if let Some(existing) = existing_part_to_update {
+                        *existing = fresh_encoded_part;
+                    } else {
+                        parts_to_write.push(fresh_encoded_part);
+                    }
+
+                    out_list_entries_after_removal.push(fresh_entry);
                 }
-
-                // All superfiles removed from this part → drop it from the list
-                // rather than keeping a zero-superfile stub. A merge that lifts
-                // every fragment out of a part would otherwise leave the empty
-                // part live in the list forever (it survives GC as referenced),
-                // inflating the part count and the open-time GET fan for no data.
-                // Dropping the last part is safe: a user manifest with zero parts
-                // is a handled state (an empty table — the load path guards
-                // `parts.is_empty()`, and hidden vector-index manifests always
-                // run with zero parts), and nothing else would ever collect a
-                // retained empty stub (compaction merges superfiles, not parts).
-                if final_superfile_entries.is_empty() {
-                    remember(RebuiltPart::Dropped);
-                    continue;
+                if !skipped_any || n_removed >= removal_ids.len() as u64 {
+                    break;
                 }
-
-                let (fresh_entry, fresh_encoded_part) =
-                    rebuild_part_and_entry(vec![], final_superfile_entries, None, hidden_table)?;
-                if from_base {
-                    remember(RebuiltPart::Rebuilt(Box::new((
-                        fresh_entry.clone(),
-                        fresh_encoded_part.clone(),
-                    ))));
-                }
-
-                if let Some(existing) = existing_part_to_update {
-                    *existing = fresh_encoded_part;
-                } else {
-                    parts_to_write.push(fresh_encoded_part);
-                }
-
-                out_list_entries_after_removal.push(fresh_entry);
+                warn!(
+                    found = n_removed,
+                    asked = removal_ids.len(),
+                    "skipping parts by birth version missed removed superfiles; scanning every part"
+                );
             }
         }
 
@@ -3122,6 +3165,15 @@ const RESIDENT_PARTS_CARRIED_FORWARD: usize = 4;
 /// is a function of this number instead, and the fetches still overlap enough
 /// to keep the object store busy.
 const MANIFEST_PART_LOAD_CONCURRENCY: usize = 32;
+
+/// Whether `entry`'s recorded birth-version range holds any of `versions`,
+/// which must be sorted. A part with no range recorded may hold any.
+fn may_hold_birth_version(entry: &ManifestPartEntry, versions: &[u64]) -> bool {
+    entry.birth_version_range().is_none_or(|(lo, hi)| {
+        let first_from_lo = versions.partition_point(|v| *v < lo);
+        versions.get(first_from_lo).is_some_and(|v| *v <= hi)
+    })
+}
 
 /// Await `futs` with at most [`MANIFEST_PART_LOAD_CONCURRENCY`] in flight,
 /// returning the results in the order the futures were given.
@@ -6598,7 +6650,8 @@ mod tests {
 
         /// Parts for the removal tests: more than two load waves, one
         /// superfile each, except the last, which holds two so removing one
-        /// rebuilds it instead of dropping it.
+        /// rebuilds it instead of dropping it. Part `i`'s superfiles were
+        /// born at version `i`.
         fn removal_test_parts() -> Vec<ManifestPart> {
             let n_parts = MANIFEST_PART_LOAD_CONCURRENCY * 2 + 3;
             (0..n_parts)
@@ -6606,12 +6659,80 @@ mod tests {
                     let n_superfiles = if i + 1 == n_parts { 2 } else { 1 };
                     ManifestPart {
                         superfiles: (0..n_superfiles)
-                            .map(|_| super::make_superfile_entry(1, vec![0]))
+                            .map(|_| {
+                                Arc::new(SuperfileEntry {
+                                    birth_version: i as u64,
+                                    ..(*super::make_superfile_entry(1, vec![0])).clone()
+                                })
+                            })
                             .collect(),
                         ..make_test_part(i as u8)
                     }
                 })
                 .collect()
+        }
+
+        /// Record each part's birth-version range on its list entry, as a
+        /// commit does.
+        fn stamp_birth_ranges(parts: &[ManifestPart], entries: &mut [ManifestPartEntry]) {
+            for (part, entry) in parts.iter().zip(entries) {
+                entry.scalar_stats_agg =
+                    aggregates::compute(&part.superfiles, None).scalar_stats_agg;
+            }
+        }
+
+        /// What a removal produced: each list entry as (superfile count,
+        /// hash if kept as is), and the superfile ids of every part written.
+        type RemovalShape = (Vec<(u64, Option<ContentHash>)>, Vec<Vec<Uuid>>);
+
+        fn removal_shape(
+            after: &ManifestSnapshot,
+            written: &[EncodedPart],
+            original_hashes: &HashSet<ContentHash>,
+        ) -> RemovalShape {
+            let list = after
+                .get_all_list_entries()
+                .iter()
+                .map(|e| {
+                    let kept = original_hashes.contains(&e.content_hash);
+                    (e.n_superfiles, kept.then_some(e.content_hash))
+                })
+                .collect();
+            let written = written
+                .iter()
+                .map(|ep| ep.part.superfiles.iter().map(|s| s.superfile_id).collect())
+                .collect();
+            (list, written)
+        }
+
+        /// The removal applied over resident parts with no recorded ranges:
+        /// the full scan every other run must match.
+        async fn full_scan_removal(
+            parts: &[ManifestPart],
+            entries: &[ManifestPartEntry],
+            removed: &[Arc<SuperfileEntry>],
+        ) -> RemovalShape {
+            let storage = Arc::new(CountingMockStorage::new(HashMap::new()));
+            let unranged = entries
+                .iter()
+                .map(|e| ManifestPartEntry {
+                    scalar_stats_agg: Default::default(),
+                    ..e.clone()
+                })
+                .collect();
+            let resident = build_manifest_with_loader(fresh_list(unranged), storage);
+            for part in parts {
+                resident.parts.insert(
+                    part.part_id,
+                    Arc::new(OnceCell::new_with(Some(Arc::new(part.clone())))),
+                );
+            }
+            let (after, written) = resident
+                .update_preserving_birth_versions(&[], removed, None)
+                .await
+                .expect("update over resident parts");
+            let original_hashes = entries.iter().map(|e| e.content_hash).collect();
+            removal_shape(&after, &written, &original_hashes)
         }
 
         /// Applying removals reads every part. Cold, those reads go to
@@ -6630,39 +6751,7 @@ mod tests {
                 Arc::clone(&parts[0].superfiles[0]),
                 Arc::clone(&parts[n_parts - 1].superfiles[0]),
             ];
-
-            // Each list entry as (superfile count, hash if kept as is), and
-            // the superfile ids of every part written.
-            let shape = |after: &ManifestSnapshot, written: &[EncodedPart]| {
-                let list: Vec<(u64, Option<ContentHash>)> = after
-                    .get_all_list_entries()
-                    .iter()
-                    .map(|e| {
-                        let kept = original_hashes.contains(&e.content_hash);
-                        (e.n_superfiles, kept.then_some(e.content_hash))
-                    })
-                    .collect();
-                let written: Vec<Vec<Uuid>> = written
-                    .iter()
-                    .map(|ep| ep.part.superfiles.iter().map(|s| s.superfile_id).collect())
-                    .collect();
-                (list, written)
-            };
-
-            let resident_storage = Arc::new(CountingMockStorage::new(objects.clone()));
-            let resident =
-                build_manifest_with_loader(fresh_list(entries.clone()), resident_storage.clone());
-            for part in &parts {
-                resident.parts.insert(
-                    part.part_id,
-                    Arc::new(OnceCell::new_with(Some(Arc::new(part.clone())))),
-                );
-            }
-            let (resident_after, resident_written) = resident
-                .update_preserving_birth_versions(&[], &removed, None)
-                .await
-                .expect("update over resident parts");
-            assert_eq!(resident_storage.get_call_count(), 0);
+            let expected = full_scan_removal(&parts, &entries, &removed).await;
 
             let cold_storage = Arc::new(CountingMockStorage::new(objects));
             let cold = build_manifest_with_loader(fresh_list(entries), cold_storage.clone());
@@ -6683,8 +6772,8 @@ mod tests {
             );
             assert!(peak > 1, "part loads must overlap, saw {peak} in flight");
 
-            let cold_shape = shape(&cold_after, &cold_written);
-            assert_eq!(cold_shape, shape(&resident_after, &resident_written));
+            let cold_shape = removal_shape(&cold_after, &cold_written, &original_hashes);
+            assert_eq!(cold_shape, expected);
             assert_eq!(
                 cold_shape.0.len(),
                 n_parts - 1,
@@ -6722,6 +6811,73 @@ mod tests {
                 "loading must stop with the first wave; saw {gets} of {} parts fetched",
                 parts.len()
             );
+        }
+
+        /// A part whose recorded birth-version range holds none of the
+        /// removed superfiles' versions is never loaded, and the result
+        /// matches the full scan.
+        #[tokio::test]
+        async fn removal_skips_parts_whose_birth_range_excludes_every_removal() {
+            let parts = removal_test_parts();
+            let n_parts = parts.len();
+            let (objects, mut entries) = encode_and_index(&parts);
+            stamp_birth_ranges(&parts, &mut entries);
+            let original_hashes: HashSet<ContentHash> =
+                entries.iter().map(|e| e.content_hash).collect();
+            let removed = vec![
+                Arc::clone(&parts[5].superfiles[0]),
+                Arc::clone(&parts[n_parts - 1].superfiles[0]),
+            ];
+            let expected = full_scan_removal(&parts, &entries, &removed).await;
+
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let snapshot = build_manifest_with_loader(fresh_list(entries), storage.clone());
+            let (after, written) = snapshot
+                .update_preserving_birth_versions(&[], &removed, None)
+                .await
+                .expect("update");
+
+            assert_eq!(
+                storage.get_call_count(),
+                removed.len(),
+                "only the parts holding a removed version are loaded"
+            );
+            assert_eq!(removal_shape(&after, &written, &original_hashes), expected);
+        }
+
+        /// A removed entry whose birth version is not the one its part
+        /// recorded must still be removed: the skip finds too few, so every
+        /// part is scanned.
+        #[tokio::test]
+        async fn removal_scans_every_part_when_a_birth_version_disagrees() {
+            /// Newer than any part's range.
+            const UNRECORDED_VERSION: u64 = 1_000;
+            let parts = removal_test_parts();
+            let (objects, mut entries) = encode_and_index(&parts);
+            stamp_birth_ranges(&parts, &mut entries);
+            let original_hashes: HashSet<ContentHash> =
+                entries.iter().map(|e| e.content_hash).collect();
+            let removed = vec![Arc::new(SuperfileEntry {
+                birth_version: UNRECORDED_VERSION,
+                ..(*parts[5].superfiles[0]).clone()
+            })];
+            let expected = full_scan_removal(&parts, &entries, &removed).await;
+
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let snapshot = build_manifest_with_loader(fresh_list(entries), storage.clone());
+            let (after, written) = snapshot
+                .update_preserving_birth_versions(&[], &removed, None)
+                .await
+                .expect("update");
+
+            let shape = removal_shape(&after, &written, &original_hashes);
+            assert_eq!(shape, expected);
+            assert_eq!(
+                shape.0.len(),
+                parts.len() - 1,
+                "the removed superfile's part is dropped"
+            );
+            assert_eq!(storage.get_call_count(), parts.len());
         }
 
         #[tokio::test]
@@ -11598,10 +11754,12 @@ mod tests {
             .expect("first attempt");
         assert_eq!(first.len(), 1, "only the second part is rebuilt");
         assert_eq!(rebuilt.bytes, 0, "nothing past the cap is kept");
-        // Outcomes that hold no bytes are kept whatever the cap.
+        // Outcomes that hold no bytes are kept whatever the cap. The third
+        // part's birth versions hold no removal, so it is skipped unloaded
+        // and nothing records it.
         let kept = |want: fn(&RebuiltPart) -> bool| rebuilt.by_source.values().any(want);
         assert!(kept(|o| matches!(o, RebuiltPart::Dropped)));
-        assert!(kept(|o| matches!(o, RebuiltPart::Unchanged)));
+        assert!(!kept(|o| matches!(o, RebuiltPart::Unchanged)));
         assert!(!kept(|o| matches!(o, RebuiltPart::Rebuilt(_))));
 
         let (successor, retry) = rt
