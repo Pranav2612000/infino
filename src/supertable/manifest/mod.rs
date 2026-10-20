@@ -64,7 +64,10 @@ use arrow_array::*;
 use arrow_schema::{DataType, TimeUnit};
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures::{future, stream, stream::StreamExt};
+use futures::{
+    future, stream,
+    stream::{StreamExt, TryStreamExt},
+};
 /// Re-export the per-column skip aggregates so callers can refer to them as
 /// `manifest::ScalarStatsAgg` / `manifest::FtsSummaryAgg` (the value types of
 /// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
@@ -2536,6 +2539,33 @@ impl ManifestSnapshot {
                 cache.by_source.clear();
                 cache.bytes = 0;
             }
+            // Load the base parts the loop reads, a bounded number at a
+            // time, so its loads below find them in their cells instead of
+            // fetching one after another. Stop at the first failure rather
+            // than waiting on every other load.
+            let to_load = out_list_entries
+                .iter()
+                .filter(|entry| {
+                    !parts_to_write
+                        .iter()
+                        .any(|ep| ep.part.part_id == entry.part_id)
+                        && !rebuilt
+                            .as_deref()
+                            .is_some_and(|cache| cache.by_source.contains_key(&entry.content_hash))
+                })
+                .map(|entry| {
+                    let part_id = entry.part_id;
+                    async move {
+                        self.get_part_by_id(part_id)
+                            .await
+                            .map(drop)
+                            .map_err(|_| ManifestError::UnknownPartId(part_id))
+                    }
+                });
+            stream::iter(to_load)
+                .buffer_unordered(MANIFEST_PART_LOAD_CONCURRENCY)
+                .try_collect::<Vec<()>>()
+                .await?;
             for entry in out_list_entries {
                 // TODO: Handle merging 2 parts into one if their sum is within threshold
 
@@ -6225,6 +6255,8 @@ mod tests {
         struct CountingMockStorage {
             objects: HashMap<String, Bytes>,
             get_calls: AtomicUsize,
+            gets_in_flight: AtomicUsize,
+            peak_gets_in_flight: AtomicUsize,
         }
 
         impl CountingMockStorage {
@@ -6232,11 +6264,17 @@ mod tests {
                 Self {
                     objects,
                     get_calls: AtomicUsize::new(0),
+                    gets_in_flight: AtomicUsize::new(0),
+                    peak_gets_in_flight: AtomicUsize::new(0),
                 }
             }
 
             fn get_call_count(&self) -> usize {
                 self.get_calls.load(Ordering::Acquire)
+            }
+
+            fn peak_gets_in_flight(&self) -> usize {
+                self.peak_gets_in_flight.load(Ordering::Acquire)
             }
         }
 
@@ -6255,6 +6293,12 @@ mod tests {
 
             async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
                 self.get_calls.fetch_add(1, Ordering::AcqRel);
+                let now = self.gets_in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                self.peak_gets_in_flight.fetch_max(now, Ordering::AcqRel);
+                // Yield so concurrent gets overlap; otherwise each finishes
+                // before the next is polled and the peak reads 1.
+                yield_now().await;
+                self.gets_in_flight.fetch_sub(1, Ordering::AcqRel);
                 match self.objects.get(uri) {
                     Some(b) => Ok((
                         b.clone(),
@@ -6550,6 +6594,134 @@ mod tests {
                 .await
                 .expect("a dropped part reloads on demand");
             assert_eq!(reloaded.part_id, dropped);
+        }
+
+        /// Parts for the removal tests: more than two load waves, one
+        /// superfile each, except the last, which holds two so removing one
+        /// rebuilds it instead of dropping it.
+        fn removal_test_parts() -> Vec<ManifestPart> {
+            let n_parts = MANIFEST_PART_LOAD_CONCURRENCY * 2 + 3;
+            (0..n_parts)
+                .map(|i| {
+                    let n_superfiles = if i + 1 == n_parts { 2 } else { 1 };
+                    ManifestPart {
+                        superfiles: (0..n_superfiles)
+                            .map(|_| super::make_superfile_entry(1, vec![0]))
+                            .collect(),
+                        ..make_test_part(i as u8)
+                    }
+                })
+                .collect()
+        }
+
+        /// Applying removals reads every part. Cold, those reads go to
+        /// storage, so they must overlap (bounded) rather than run one after
+        /// another, and each part is still fetched once. The result must
+        /// match a run over resident parts, including a dropped part and a
+        /// rebuilt one.
+        #[tokio::test]
+        async fn removal_loads_cold_parts_concurrently_and_bounded() {
+            let parts = removal_test_parts();
+            let n_parts = parts.len();
+            let (objects, entries) = encode_and_index(&parts);
+            let original_hashes: HashSet<ContentHash> =
+                entries.iter().map(|e| e.content_hash).collect();
+            let removed = vec![
+                Arc::clone(&parts[0].superfiles[0]),
+                Arc::clone(&parts[n_parts - 1].superfiles[0]),
+            ];
+
+            // Each list entry as (superfile count, hash if kept as is), and
+            // the superfile ids of every part written.
+            let shape = |after: &ManifestSnapshot, written: &[EncodedPart]| {
+                let list: Vec<(u64, Option<ContentHash>)> = after
+                    .get_all_list_entries()
+                    .iter()
+                    .map(|e| {
+                        let kept = original_hashes.contains(&e.content_hash);
+                        (e.n_superfiles, kept.then_some(e.content_hash))
+                    })
+                    .collect();
+                let written: Vec<Vec<Uuid>> = written
+                    .iter()
+                    .map(|ep| ep.part.superfiles.iter().map(|s| s.superfile_id).collect())
+                    .collect();
+                (list, written)
+            };
+
+            let resident_storage = Arc::new(CountingMockStorage::new(objects.clone()));
+            let resident =
+                build_manifest_with_loader(fresh_list(entries.clone()), resident_storage.clone());
+            for part in &parts {
+                resident.parts.insert(
+                    part.part_id,
+                    Arc::new(OnceCell::new_with(Some(Arc::new(part.clone())))),
+                );
+            }
+            let (resident_after, resident_written) = resident
+                .update_preserving_birth_versions(&[], &removed, None)
+                .await
+                .expect("update over resident parts");
+            assert_eq!(resident_storage.get_call_count(), 0);
+
+            let cold_storage = Arc::new(CountingMockStorage::new(objects));
+            let cold = build_manifest_with_loader(fresh_list(entries), cold_storage.clone());
+            let (cold_after, cold_written) = cold
+                .update_preserving_birth_versions(&[], &removed, None)
+                .await
+                .expect("update over cold parts");
+
+            assert_eq!(
+                cold_storage.get_call_count(),
+                n_parts,
+                "each part is fetched once"
+            );
+            let peak = cold_storage.peak_gets_in_flight();
+            assert!(
+                peak <= MANIFEST_PART_LOAD_CONCURRENCY,
+                "at most {MANIFEST_PART_LOAD_CONCURRENCY} part loads may be in flight, saw {peak}"
+            );
+            assert!(peak > 1, "part loads must overlap, saw {peak} in flight");
+
+            let cold_shape = shape(&cold_after, &cold_written);
+            assert_eq!(cold_shape, shape(&resident_after, &resident_written));
+            assert_eq!(
+                cold_shape.0.len(),
+                n_parts - 1,
+                "the emptied part is dropped"
+            );
+            assert_eq!(cold_shape.1.len(), 1, "only the last part is rebuilt");
+        }
+
+        /// A part that cannot be loaded fails the removal at once with
+        /// `UnknownPartId`, without first loading every other part or
+        /// fetching the bad one a second time.
+        #[tokio::test]
+        async fn removal_stops_at_the_first_part_that_fails_to_load() {
+            let parts = removal_test_parts();
+            let (mut objects, entries) = encode_and_index(&parts);
+            objects.remove(&entries[0].uri);
+            let removed = vec![Arc::clone(&parts[1].superfiles[0])];
+
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let snapshot = build_manifest_with_loader(fresh_list(entries), storage.clone());
+            let Err(err) = snapshot
+                .update_preserving_birth_versions(&[], &removed, None)
+                .await
+            else {
+                panic!("a missing part must fail the removal");
+            };
+
+            assert!(
+                matches!(err, ManifestError::UnknownPartId(id) if id == parts[0].part_id),
+                "expected UnknownPartId for the missing part, got {err:?}"
+            );
+            let gets = storage.get_call_count();
+            assert!(
+                gets <= MANIFEST_PART_LOAD_CONCURRENCY,
+                "loading must stop with the first wave; saw {gets} of {} parts fetched",
+                parts.len()
+            );
         }
 
         #[tokio::test]
