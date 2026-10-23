@@ -1416,6 +1416,8 @@ impl Supertable {
     /// ready, taking along whatever else has finished. One commit runs at a
     /// time, beside the merges rather than in front of them: while it runs,
     /// merges keep starting and the ones that finish wait for the next batch.
+    /// A finished merge holds its output in memory until it commits, so the
+    /// ones waiting count against `concurrency` just like the ones running.
     /// A merge that fails, or a batch whose commit is dropped, does not cost
     /// the others their work: the rest still merge and commit. The first
     /// failed merge, lost input, or the dropped batch that stopped the pass
@@ -1425,6 +1427,23 @@ impl Supertable {
         jobs: Vec<CompactionJob>,
         stale_seal_timeout: Duration,
         concurrency: usize,
+    ) -> Result<usize, CompactionError> {
+        self.run_compaction_jobs_with(
+            jobs,
+            stale_seal_timeout,
+            concurrency,
+            host_has_room_for_another_merge,
+        )
+        .await
+    }
+
+    /// As [`Self::run_compaction_jobs`], with the host memory check injected.
+    async fn run_compaction_jobs_with(
+        &self,
+        jobs: Vec<CompactionJob>,
+        stale_seal_timeout: Duration,
+        concurrency: usize,
+        host_check: fn() -> bool,
     ) -> Result<usize, CompactionError> {
         let concurrency = concurrency.max(1);
         let mut queued: VecDeque<(usize, CompactionJob)> = jobs.into_iter().enumerate().collect();
@@ -1487,8 +1506,11 @@ impl Supertable {
             // admitting the rest of the plan only burns each job's retries to
             // reach the same error. One failure on its own is usually that
             // job's, and the rest of the plan still runs.
-            let may_admit = !stop_admitting
-                && admits_another_merge(merging.len(), concurrency, queued.len(), true);
+            // Merges waiting for the commit hold their outputs in memory, so
+            // they take a slot until it lands.
+            let holding = merging.len() + ready.len();
+            let may_admit =
+                !stop_admitting && admits_another_merge(holding, concurrency, queued.len(), true);
             let is_committing = !committing.is_terminated();
             let has_merges = !merging.is_empty();
             let joined = tokio::select! {
@@ -1536,11 +1558,11 @@ impl Supertable {
                 // an idle host. That is the whole feedback loop: admit, let it
                 // land, look at what is left, decide again.
                 _ = time::sleep_until(next_admission), if may_admit => {
-                    let host_has_room = host_has_room_for_another_merge();
-                    // With no merge running, only a commit is: it holds memory
-                    // too, so the merge beside it still needs the host's room.
-                    if admits_another_merge(merging.len(), concurrency, queued.len(), host_has_room)
-                        && (has_merges || host_has_room)
+                    // Something is always running here, a merge or a commit,
+                    // so this merge always needs the host's room.
+                    let host_has_room = host_check();
+                    if host_has_room
+                        && admits_another_merge(holding, concurrency, queued.len(), true)
                     {
                         let (plan_index, job) = queued.pop_front().expect("guarded above");
                         log_merge_admitted(merging.len(), queued.len(), held_back);
@@ -7030,11 +7052,19 @@ mod tests {
         assert_untouched(&dir, &st, &all_inputs).await;
     }
 
-    /// Jobs in the held-commit test: one whose commit is held, and the rest
-    /// that must merge beside it.
-    const HELD_COMMIT_JOBS: usize = 3;
-    /// How long the held-commit test waits for the other merges to upload.
+    /// Width of the held-commit test's pass.
+    const HELD_COMMIT_WIDTH: usize = 1;
+    /// Uploads while the first commit is held: its own, and one merge per slot
+    /// beside it.
+    const HELD_COMMIT_UPLOADS: usize = HELD_COMMIT_WIDTH + 1;
+    /// Jobs in the held-commit test: one more than can upload while the commit
+    /// is held, to show the width caps the merges waiting for it.
+    const HELD_COMMIT_JOBS: usize = HELD_COMMIT_UPLOADS + 1;
+    /// How long the held-commit test waits for the merges beside it to upload.
     const HELD_COMMIT_TIMEOUT: Duration = Duration::from_secs(30);
+    /// How long the held-commit test then waits for a merge that must not
+    /// start: several admission settles.
+    const HELD_COMMIT_SETTLE: Duration = Duration::from_secs(1);
     /// How often the held-commit test checks the upload count.
     const HELD_COMMIT_POLL: Duration = Duration::from_millis(20);
 
@@ -7117,18 +7147,13 @@ mod tests {
         }
     }
 
-    /// A slow commit must not stop merges from starting. With the first
-    /// job's pointer swap held, every other job still merges and uploads
-    /// beside it, even in a serial pass. Commits stay one at a time, and
+    /// A slow commit must not stop merges from starting, but the merges that
+    /// finish beside it still count against the width. With the first job's
+    /// pointer swap held in a serial pass, the next job merges and uploads
+    /// beside it and the one after waits. Commits stay one at a time, and
     /// every job lands once the swap is let through.
     #[tokio::test(flavor = "multi_thread")]
-    async fn merges_keep_starting_while_a_commit_is_held() {
-        // A merge beside a commit needs the host's room, so a host already
-        // short of memory would never start one.
-        if !host_has_room_for_another_merge() {
-            eprintln!("skipped: host is below the merge memory reserve");
-            return;
-        }
+    async fn merges_start_beside_a_held_commit_up_to_the_width() {
         let dir = TempDir::new().expect("tempdir");
         let storage = HeldPointerStorage::new(&dir);
         let provider: Arc<dyn StorageProvider> = Arc::<HeldPointerStorage>::clone(&storage);
@@ -7141,26 +7166,38 @@ mod tests {
         // beside it on this task and always lets the swap through, so a
         // pass that never starts the other merges fails rather than hangs.
         let check = async {
-            let all_uploaded = time::timeout(HELD_COMMIT_TIMEOUT, async {
+            let beside_uploaded = time::timeout(HELD_COMMIT_TIMEOUT, async {
                 while storage.swaps_in_flight.load(Ordering::SeqCst) == 0
-                    || storage.uploads.load(Ordering::SeqCst) < HELD_COMMIT_JOBS
+                    || storage.uploads.load(Ordering::SeqCst) < HELD_COMMIT_UPLOADS
                 {
                     time::sleep(HELD_COMMIT_POLL).await;
                 }
             })
             .await
             .is_ok();
+            time::sleep(HELD_COMMIT_SETTLE).await;
+            let uploads_held = storage.uploads.load(Ordering::SeqCst);
             let swaps_held = storage.swaps_in_flight.load(Ordering::SeqCst);
             storage.release();
-            (all_uploaded, swaps_held)
+            (beside_uploaded, uploads_held, swaps_held)
         };
-        let (pass, (all_uploaded, swaps_held)) = tokio::join!(
-            st.run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 1),
+        // The host always has room, so only the width decides.
+        let (pass, (beside_uploaded, uploads_held, swaps_held)) = tokio::join!(
+            st.run_compaction_jobs_with(
+                jobs,
+                DEFAULT_STALE_SEAL_TIMEOUT,
+                HELD_COMMIT_WIDTH,
+                || true
+            ),
             check
         );
         assert!(
-            all_uploaded,
-            "every merge must start and upload while the first commit is held"
+            beside_uploaded,
+            "a merge must start and upload while the first commit is held"
+        );
+        assert_eq!(
+            uploads_held, HELD_COMMIT_UPLOADS,
+            "a merge waiting for the commit holds its slot"
         );
         assert_eq!(swaps_held, 1, "only the first commit is out");
         let dropped = pass.expect("the pass must commit every job");
