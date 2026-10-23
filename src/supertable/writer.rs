@@ -10934,9 +10934,10 @@ where
 /// earlier build to catch up from.
 ///
 /// The full build runs once. When commits land before it publishes, a retry
-/// folds their delta segments onto it ([`fold_term_index`]), or, when that
-/// cannot list every live superfile, indexes only the superfiles the last
-/// build lacks on top of it.
+/// stacks their delta segments on it as they are (`term_index::rebase`),
+/// which writes only a root. When that cannot list every live superfile it
+/// folds them in ([`fold_term_index`]), or failing that indexes only the
+/// superfiles the last build lacks on top of it.
 pub(in crate::supertable) async fn stamp_term_index(
     inner: &SupertableInner,
 ) -> Result<(), BuildError> {
@@ -10975,12 +10976,30 @@ pub(in crate::supertable) async fn stamp_term_index(
             };
             let folded = match (&last, &current) {
                 (Some((base, Some(prior))), Some(current)) => {
-                    match fold_term_index(&old, base, prior, current, &entries).await {
-                        Ok(folded) => folded,
-                        Err(e) => {
-                            warn!("term index: folding new commits failed, catching up instead: {e}");
-                            None
+                    // Merging the new deltas in costs time in proportion to
+                    // them, so under steady commits each retry falls further
+                    // behind. Stacking them on the build costs one root.
+                    match term_index::rebase(base, prior, current)
+                        .filter(|root| unlisted(root, &entries).is_empty())
+                    {
+                        Some(root) => {
+                            info!(
+                                deltas = root.segments.len() - base.segments.len(),
+                                "term index: publish lost a race, rebased the build onto the commits since"
+                            );
+                            Some(term_index::Built {
+                                root,
+                                slices: Vec::new(),
+                            })
                         }
+                        None => match fold_term_index(&old, base, prior, current, &entries).await
+                        {
+                            Ok(folded) => folded,
+                            Err(e) => {
+                                warn!("term index: folding new commits failed, catching up instead: {e}");
+                                None
+                            }
+                        },
                     }
                 }
                 _ => None,
