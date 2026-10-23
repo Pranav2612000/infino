@@ -2468,6 +2468,11 @@ mod tests {
         for segment in 0..SEGMENTS {
             commit_segment(&st, segment);
         }
+        // A removed superfile stays listed, so every rebase pads.
+        let reader = st.reader().expect("reader");
+        let entries = reader.manifest().get_all_superfiles();
+        commit_without_postings(&st, &storage, Vec::new(), &entries[..1]);
+        st.block_on_query(st.refresh()).expect("refresh");
         let local: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
         let other = crate::supertable::Supertable::open(fresh_options(&local)).expect("open");
@@ -2482,6 +2487,11 @@ mod tests {
             root.segments.len(),
             1 + ROUNDS,
             "the rebuild, then each commit's delta"
+        );
+        assert_eq!(
+            root.superfiles.len(),
+            live.len() + 1,
+            "the removed superfile's ordinal is padded"
         );
         assert!(
             st.reader()
