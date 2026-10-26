@@ -43,6 +43,8 @@ use std::{
     time::Instant,
 };
 
+#[cfg(feature = "detailed-tracing")]
+use rayon::current_thread_index;
 use rayon::{current_num_threads, join, prelude::*};
 use tracing::Span;
 
@@ -135,6 +137,9 @@ pub(crate) struct Bisect<'a> {
     reference: &'a AtomicU64,
     /// Where splits report what they did.
     report: &'a RunReport,
+    /// Parent for the spans splits open. Set explicitly because a rayon task
+    /// stolen by another thread runs under whatever span that thread has open.
+    parent: &'a Span,
 }
 
 impl Bisect<'_> {
@@ -182,6 +187,11 @@ impl Default for BisectParams {
 /// Splits at least this large get a span of their own. Smaller ones only add
 /// to their depth's totals in [`BisectReport`].
 const SPLIT_SPAN_MIN_DOCS: usize = 1 << 20;
+
+/// Parallel partitions at least this large get a span showing the thread they
+/// ran on. Deep enough that a large run spreads over every core, shallow
+/// enough that a 30M-document run opens a few hundred spans, not thousands.
+const PARALLEL_SPAN_MIN_DOCS: usize = 1 << 18;
 
 /// Bisections running in this process right now.
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
@@ -524,6 +534,7 @@ pub(crate) fn bisect_order_reported(
             params,
             reference: &reference,
             report: &report,
+            parent: &report.span,
         };
         split_parallel(fwd, &mut order, 0, &pool, run);
     }
@@ -577,6 +588,23 @@ fn split_parallel(
         });
         return;
     }
+    let span = match order.len() >= PARALLEL_SPAN_MIN_DOCS {
+        true => detail_span!(
+            "reorder_split_parallel",
+            parent: run.parent,
+            depth = depth,
+            docs = order.len(),
+            worker = current_thread_index(),
+        ),
+        false => Span::none(),
+    };
+    let run = match span.is_none() {
+        true => run,
+        false => Bisect {
+            parent: &span,
+            ..run
+        },
+    };
     let mid = order.len() / 2;
     pool.with_state(|state| {
         state.refine(fwd, order, mid, depth, true, run);
@@ -827,7 +855,7 @@ impl BisectState {
         let span = match order.len() >= SPLIT_SPAN_MIN_DOCS {
             true => detail_span!(
                 "reorder_split",
-                parent: &run.report.span,
+                parent: run.parent,
                 depth = depth,
                 docs = order.len(),
                 rounds = tracing::field::Empty,
@@ -1677,6 +1705,7 @@ mod tests {
             params: exhaustive(),
             reference: &reference,
             report: &report,
+            parent: &report.span,
         };
         BisectState::new(fwd.n_terms).split(&fwd, &mut serial, 0, run);
         assert_eq!(bisect_order(&fwd, exhaustive()), serial);
