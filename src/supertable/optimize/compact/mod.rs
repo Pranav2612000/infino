@@ -34,11 +34,9 @@ use tokio::{
     task::{JoinError, JoinSet},
     time,
 };
-#[cfg(not(feature = "detailed-tracing"))]
-use tracing::Span;
 #[cfg(feature = "detailed-tracing")]
 use tracing::info_span;
-use tracing::{Instrument, debug, info, warn};
+use tracing::{Instrument, Span, debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -1637,13 +1635,22 @@ impl Supertable {
         stale_seal_timeout: Duration,
     ) {
         let table = self.clone();
+        let pass = Span::current();
         merging.spawn(async move {
-            let prepared = match table.prepare_compaction_job(job, stale_seal_timeout).await {
-                Ok(prepared) => prepared,
-                Err(e) => return (plan_index, Err(e)),
-            };
-            let uploaded = table.upload_prepared_output(prepared).await;
-            (plan_index, uploaded)
+            // Each merge is a trace of its own, linked back to the pass, so
+            // a pass of many merges does not grow into one huge trace.
+            let span = detail_span!("compaction_merge", plan_index = plan_index);
+            span.follows_from(&pass);
+            async move {
+                let prepared = match table.prepare_compaction_job(job, stale_seal_timeout).await {
+                    Ok(prepared) => prepared,
+                    Err(e) => return (plan_index, Err(e)),
+                };
+                let uploaded = table.upload_prepared_output(prepared).await;
+                (plan_index, uploaded)
+            }
+            .instrument(span)
+            .await
         });
     }
 
