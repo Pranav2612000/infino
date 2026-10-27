@@ -4307,11 +4307,12 @@ impl SuperfileUri {
         format!("seg-{}{SUPERFILE_KEY_SUFFIX}", self.0)
     }
 
-    /// Disk-cache tempfile name for download number `seq` of this superfile. Each download gets its
-    /// own: several can run at once (a foreground fetch, a background fill, a hybrid finalizer),
-    /// and two writers on one tempfile corrupt it.
-    pub fn cache_tmp_filename(self, seq: u64) -> String {
-        format!("{}.{seq}{CACHE_TMP_EXTENSION}", self.cache_filename())
+    /// Disk-cache tempfile name for download number `seq` of this superfile by process `pid`.
+    /// Each download gets its own: several can run at once (a foreground fetch, a background
+    /// fill, a hybrid finalizer, another store over the same directory), and two writers on one
+    /// tempfile corrupt it.
+    pub fn cache_tmp_filename(self, pid: u32, seq: u64) -> String {
+        format!("{}.{pid}.{seq}{CACHE_TMP_EXTENSION}", self.cache_filename())
     }
 
     /// Disk-cache filename for a copy of this superfile that holds everything but its vector blob,
@@ -4340,18 +4341,21 @@ impl SuperfileUri {
     }
 
     /// Inverse of [`Self::cache_tmp_filename`], so the disk cache can find and delete tempfiles a
-    /// crash left behind. Also accepts the unnumbered `seg-<uuid>.sf.parquet.tmp` older builds
-    /// wrote.
+    /// crash left behind. Also accepts the names older builds wrote: `seg-<uuid>.sf.parquet.<seq>.tmp`
+    /// and the unnumbered `seg-<uuid>.sf.parquet.tmp`.
     pub fn from_cache_tmp_filename(name: &str) -> Option<Self> {
-        let body = name.strip_suffix(CACHE_TMP_EXTENSION)?;
-        let body = match body.rsplit_once('.') {
-            Some((cache_name, seq))
-                if !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()) =>
-            {
-                cache_name
+        let mut body = name.strip_suffix(CACHE_TMP_EXTENSION)?;
+        // At most two numbers: the process id and the download number.
+        for _ in 0..2 {
+            match body.rsplit_once('.') {
+                Some((rest, number))
+                    if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    body = rest;
+                }
+                _ => break,
             }
-            _ => body,
-        };
+        }
         Self::from_cache_filename(body)
     }
 
@@ -7378,12 +7382,13 @@ mod tests {
         assert_eq!(uri.storage_path(), format!("data/seg-{id}.sf.parquet"));
         assert_eq!(uri.cache_filename(), format!("seg-{id}.sf.parquet"));
         assert_eq!(
-            uri.cache_tmp_filename(7),
-            format!("seg-{id}.sf.parquet.7.tmp")
+            uri.cache_tmp_filename(42, 7),
+            format!("seg-{id}.sf.parquet.42.7.tmp")
         );
-        // Numbered tempfiles, and the unnumbered ones older builds left behind, both map back.
+        // Numbered tempfiles, and the shapes older builds left behind, all map back.
         for name in [
-            uri.cache_tmp_filename(7),
+            uri.cache_tmp_filename(42, 7),
+            format!("seg-{id}.sf.parquet.7.tmp"),
             format!("seg-{id}.sf.parquet.tmp"),
         ] {
             assert_eq!(SuperfileUri::from_cache_tmp_filename(&name), Some(uri));
