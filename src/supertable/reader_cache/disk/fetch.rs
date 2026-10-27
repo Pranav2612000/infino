@@ -2613,6 +2613,16 @@ mod tests {
         }
     }
 
+    /// Two stores over one directory, as two connections to one table build, number their
+    /// downloads apart: the first download of one superfile in each never shares a tempfile.
+    #[test]
+    fn two_stores_over_one_directory_never_share_a_tempfile() {
+        let (_dir, store) = test_store();
+        let other = reopen_store(&store, |_| {});
+        let uri = SuperfileUri::new_v4();
+        assert_ne!(store.tmp_path(&uri), other.tmp_path(&uri));
+    }
+
     #[tokio::test]
     async fn cold_fetch_uses_caller_storage_not_cache_embedded_storage() {
         use crate::storage::{LocalFsStorageProvider, PrefixedStorageProvider};

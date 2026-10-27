@@ -11,6 +11,7 @@ use std::{
     collections::HashSet,
     fmt, fs,
     path::PathBuf,
+    process,
     sync::{
         Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -87,6 +88,10 @@ const BLOCKS_IDX_TMP_INFIX: &str = ".idx.tmp.";
 /// fetch's tempfile is seconds old, so one this stale can only be a crashed fetch's leftover;
 /// deleting a live one would fail the owner's rename and cost it a retried fetch.
 const TMP_RECLAIM_AGE: Duration = Duration::from_secs(15 * 60);
+
+/// Numbers each download's tempfile across every store in this process, see
+/// [`DiskCacheStore::tmp_path`].
+static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
 /// Process-global count of in-flight foreground queries. Used with
 /// [`foreground_notify`] so a fill's `select!` wakes promptly when a query
@@ -409,8 +414,6 @@ pub struct DiskCacheStore {
     pinned_fn: std::sync::Mutex<Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>>,
     /// Global cap on concurrent background full-superfile fills.
     prefetch_semaphore: Arc<Semaphore>,
-    /// Numbers each download's tempfile, see [`Self::tmp_path`].
-    tmp_seq: AtomicU64,
 }
 
 impl fmt::Debug for DiskCacheStore {
@@ -496,7 +499,6 @@ impl DiskCacheStore {
             n_promotion_waiters: AtomicU64::new(0),
             pinned_fn: std::sync::Mutex::new(pinned_fn),
             prefetch_semaphore,
-            tmp_seq: AtomicU64::new(0),
         });
 
         // Record what is already on disk so the budget is correct from the start. Files are opened
@@ -677,10 +679,14 @@ impl DiskCacheStore {
     }
 
     /// A fresh tempfile for one download of `uri`, renamed to `cache_path` once complete. Every
-    /// call names a new file, since several downloads of one superfile can run at once.
+    /// call names a new file, since several downloads of one superfile can run at once. That
+    /// holds across stores too: two stores over one `cache_root`, in this process or another,
+    /// never share a name, since the number is process-wide and the name carries the process id.
     pub(crate) fn tmp_path(&self, uri: &SuperfileUri) -> PathBuf {
-        let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
-        self.config.cache_root.join(uri.cache_tmp_filename(seq))
+        let seq = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+        self.config
+            .cache_root
+            .join(uri.cache_tmp_filename(process::id(), seq))
     }
 
     // Test and bench helpers. Compiled only for tests and the `test-helpers` feature, never into
