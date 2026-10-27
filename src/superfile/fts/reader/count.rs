@@ -33,7 +33,7 @@ use crate::{
         error::FtsError,
         format::fts::U32_BYTES,
         fts::{bm25, builder::TERM_META_SIZE, short::short_df, tokenize::Phrase},
-        id_space::{FtsDocId, RowId},
+        id_space::{DocMap, FtsDocId, RowId},
     },
     utils::terms::{DictEntry, make_key},
 };
@@ -257,7 +257,11 @@ impl FtsReader {
                 .map(|()| out)
         });
         work.kernel_cpu_ns = walk_ns;
-        Ok((self.ids_to_rows(walk?), work))
+        let docs = walk?;
+        if !docs.is_empty() {
+            self.ensure_doc_map().await?;
+        }
+        Ok((self.ids_to_rows(docs)?, work))
     }
 
     /// Phrase-aware unranked match **count** — the atoms sibling of
@@ -441,7 +445,10 @@ impl FtsReader {
                 .collect(),
         });
         work.kernel_cpu_ns = walk_ns;
-        Ok((self.ids_to_rows(docs), work))
+        if !docs.is_empty() {
+            self.ensure_doc_map().await?;
+        }
+        Ok((self.ids_to_rows(docs)?, work))
     }
 
     /// Unranked token-match **count** — the cardinality
@@ -556,6 +563,12 @@ impl FtsReader {
                 Some(dict_bytes),
             )
             .await?;
+        // A head names its documents by row, so a term with postings here
+        // needs the doc-id map; terms this file lacks read none of it.
+        let doc_map = match cursors.iter().any(Option::is_some) {
+            true => Some(self.ensure_doc_map().await?),
+            false => None,
+        };
         let norms = col_meta.dl_norm_k1();
         Ok(entries
             .into_iter()
@@ -564,7 +577,7 @@ impl FtsReader {
                 let mut cursor = cursor?;
                 // A depth of zero is read as one: an empty head would read
                 // as a term no document carries.
-                let (head, bound) = self.head_of(&mut cursor, norms, head_depth.max(1));
+                let (head, bound) = self.head_of(&mut cursor, norms, doc_map?, head_depth.max(1));
                 Some(TermIndexFact {
                     df: cursor.df,
                     bound,
@@ -580,7 +593,13 @@ impl FtsReader {
     /// the term's bound here. Blocks whose maximum cannot beat the running
     /// `depth`-th impact are skipped undecoded, as the single-term search
     /// skips them; the cursor is consumed.
-    fn head_of(&self, cursor: &mut TermCursor, norms: &NormTable, depth: usize) -> (TermHead, f32) {
+    fn head_of(
+        &self,
+        cursor: &mut TermCursor,
+        norms: &NormTable,
+        doc_map: &DocMap,
+        depth: usize,
+    ) -> (TermHead, f32) {
         // Most terms have a document or two: the heap is sized by what the
         // term has, up to the depth and the tail.
         let mut heap: BinaryHeap<TopKEntry<(FtsDocId, u32)>> =
@@ -613,7 +632,7 @@ impl FtsReader {
         let buckets = norms.buckets();
         let docs = hits
             .into_iter()
-            .map(|((id, tf), _)| (self.row_of(id).get(), tf, buckets[id.get() as usize]))
+            .map(|((id, tf), _)| (doc_map.row_of(id).get(), tf, buckets[id.get() as usize]))
             .collect();
         (TermHead { docs, tail }, bound)
     }
@@ -646,7 +665,8 @@ impl FtsReader {
         }
         entries.truncate(limit);
         self.ensure_norms(column_id).await?;
-        self.ensure_doc_map().await?;
+        // Every term walked here has a document, and a head names it by row.
+        let doc_map = self.ensure_doc_map().await?;
         let col_meta = &self.columns[column_id as usize];
         let mut out = Vec::with_capacity(entries.len());
         let mut with_postings: Vec<usize> = Vec::new();
@@ -660,7 +680,7 @@ impl FtsReader {
                     let bound = bm25::tf_factor(tf, col_meta.dl_norm_k1().get(doc_id));
                     let head = TermHead {
                         docs: vec![(
-                            self.row_of(FtsDocId::new(doc_id)).get(),
+                            doc_map.row_of(FtsDocId::new(doc_id)).get(),
                             tf,
                             col_meta.dl_norm_k1().buckets()[doc_id as usize],
                         )],
