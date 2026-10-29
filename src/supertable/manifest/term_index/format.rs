@@ -77,7 +77,8 @@ use uuid::Uuid;
 
 use super::{
     TermIndexError,
-    tier::{TierChunkRef, TierEntry, push_chunk_refs, read_chunk_refs},
+    rebase::{OrdinalShift, rewrite_varint},
+    tier::{TierChunkRef, TierEntry, push_chunk_refs, read_chunk_refs, rebase_chunk},
 };
 use crate::{
     supertable::manifest::{part::ContentHash, term_range::prefix_upper_bound},
@@ -870,6 +871,75 @@ pub(crate) fn encode_slice(dict: &[u8], postings: &[u8]) -> Vec<u8> {
     out.extend_from_slice(dict);
     out.extend_from_slice(postings);
     out
+}
+
+/// Renumber every ordinal of `slice`, an encoded slice, through `shift`, in
+/// place: each posting's, each inline tier entry's, and the ordinals in the
+/// chunk directories its runs name in `tier`, the slice's tier object. Runs
+/// sit back to back in key order, so one walk of the postings region finds
+/// them all, and the dictionary is not read. A varint is rewritten at its own
+/// width, which [`OrdinalShift::new`] guarantees; the slice keeps its length.
+///
+/// On an error the bytes may be partly renumbered: the caller works on a
+/// copy and drops it.
+pub(crate) fn rebase_slice(
+    slice: &mut [u8],
+    mut tier: Option<&mut [u8]>,
+    shift: &OrdinalShift,
+) -> Result<(), TermIndexError> {
+    let mut c = Cursor {
+        bytes: &*slice,
+        at: 0,
+    };
+    check_magic_version(&mut c, SLICE_MAGIC, &[SLICE_FORMAT_VERSION], "slice")?;
+    let dict_len = c.u64("slice dict length")? as usize;
+    let postings_len = c.u64("slice postings length")? as usize;
+    let start = SLICE_HEADER_LEN
+        .checked_add(dict_len)
+        .filter(|start| start.checked_add(postings_len) == Some(slice.len()))
+        .ok_or_else(|| malformed("rebase: slice lengths"))?;
+    let postings = &mut slice[start..];
+    let mut at = 0usize;
+    while at < postings.len() {
+        let n = read_varint(postings, &mut at).ok_or_else(|| malformed("run count"))?;
+        let tag = *postings.get(at).ok_or_else(|| malformed("run tier tag"))?;
+        at += 1;
+        match tag {
+            TIER_ABSENT => {}
+            TIER_INLINE => {
+                let n =
+                    read_varint(postings, &mut at).ok_or_else(|| malformed("run tier entries"))?;
+                for _ in 0..n {
+                    rewrite_varint(postings, &mut at, |ordinal| shift.apply(ordinal))?;
+                    read_doc_facts(postings, &mut at).ok_or_else(|| malformed("inline entry"))?;
+                }
+            }
+            TIER_PRESENT => {
+                let chunks = read_chunk_refs(postings, &mut at)?;
+                let object = tier
+                    .as_deref_mut()
+                    .ok_or_else(|| malformed("rebase: a chunked run without a tier object"))?;
+                for chunk in &chunks {
+                    rebase_chunk(object, chunk, shift)?;
+                }
+            }
+            other => {
+                return Err(TermIndexError::Malformed(format!(
+                    "run: unknown tier tag {other}"
+                )));
+            }
+        }
+        for _ in 0..n {
+            let posting = at;
+            rewrite_varint(postings, &mut at, |tagged| {
+                Ok((shift.apply(tagged >> 1)? << 1) | (tagged & 1))
+            })?;
+            // Read the posting whole from its start to step past the rest.
+            at = posting;
+            read_posting(postings, &mut at)?;
+        }
+    }
+    Ok(())
 }
 
 /// Where one dictionary block of a slice starts; see [`Slice::block_marks`].

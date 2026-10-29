@@ -34,6 +34,7 @@ pub(crate) mod build;
 #[cfg(test)]
 mod fold_tool;
 pub(crate) mod format;
+mod rebase;
 pub(crate) mod tier;
 
 use std::{
@@ -61,11 +62,12 @@ pub(crate) use format::TierRef;
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
 use futures::{StreamExt, TryStreamExt, stream};
 use rayon::ThreadPool;
+use rebase::{OrdinalShift, rebase_layer, remove_spilled};
 use tempfile::Builder as TempDirBuilder;
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
 use tokio::{fs as async_fs, io::AsyncWriteExt, task, task::JoinSet};
-use tracing::warn;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -504,7 +506,9 @@ pub(crate) async fn append_delta(
 /// A delta layer built and written once, numbered from a reserved
 /// ordinal past the root it was built against. A commit that loses its race
 /// appends the same layer to the winner's root, padding up to its first
-/// ordinal, instead of building and uploading it again.
+/// ordinal, instead of building and uploading it again. When the winner's
+/// root has grown past that ordinal, the layer is moved to new ordinals
+/// from the bytes it keeps (see [`rebase`]) rather than built again.
 pub(crate) struct ReservedLayer {
     /// The ordinal its first superfile takes. Its postings name
     /// `base + i` for the `i`-th of `superfiles`.
@@ -512,15 +516,33 @@ pub(crate) struct ReservedLayer {
     superfiles: Vec<Uuid>,
     id_mins: Vec<i128>,
     layer: Layer,
-    /// Appended only at exactly the root's length, and rebuilt there
+    /// The layer's slice and tier bytes, kept to move it.
+    bytes: Arc<LayerBytes>,
+    /// Appended only at exactly the root's length, and moved there
     /// otherwise, so the root is never padded on its account.
     exact: bool,
+}
+
+/// The slice and tier objects of a layer, by content hash.
+struct LayerBytes {
+    slices: Vec<(ContentHash, BuiltBytes)>,
+    tiers: Vec<(ContentHash, BuiltBytes)>,
 }
 
 impl ReservedLayer {
     /// The ordinal just past the layer's last superfile.
     pub(crate) fn end(&self) -> u32 {
         self.base + self.superfiles.len() as u32
+    }
+
+    /// Whether it was built from `contributions`, in their order.
+    fn built_from(&self, contributions: &[Contribution]) -> bool {
+        self.superfiles.len() == contributions.len()
+            && self
+                .superfiles
+                .iter()
+                .zip(contributions)
+                .all(|(id, c)| *id == c.superfile_id)
     }
 }
 
@@ -539,26 +561,86 @@ pub(crate) async fn reserve_layer(
         ordinal_base = base,
     )
     .in_scope(|| build_layer(contributions, policy, base))?;
-    write_tiers(storage, built.tiers).await?;
-    write_slices(storage, built.slices).await?;
+    write_tiers(storage, built.tiers.clone()).await?;
+    write_slices(storage, built.slices.clone()).await?;
     Ok(ReservedLayer {
         base,
         superfiles: built.superfiles,
         id_mins: built.id_mins,
         layer: built.layer,
+        bytes: Arc::new(LayerBytes {
+            slices: built.slices,
+            tiers: built.tiers,
+        }),
         exact,
     })
+}
+
+/// `reserved` moved to start at `base` and its moved objects written, or
+/// `None` when it cannot be moved in place (see [`OrdinalShift::new`]) or
+/// the move failed, for the caller to build it again. The CPU work runs on
+/// `pool`, one slice per task.
+async fn move_reserved(
+    storage: &Arc<dyn StorageProvider>,
+    reserved: &ReservedLayer,
+    base: u32,
+    pool: Option<&ThreadPool>,
+) -> Result<Option<ReservedLayer>, TermIndexError> {
+    let n = reserved.superfiles.len() as u32;
+    let Some(shift) = OrdinalShift::new(reserved.base, base, n) else {
+        return Ok(None);
+    };
+    let span = detail_span!(
+        "term_index.rebase_layer",
+        from = reserved.base,
+        to = base,
+        superfiles = n,
+        slices = reserved.layer.slices.len(),
+    );
+    let (layer, bytes) = (reserved.layer.clone(), Arc::clone(&reserved.bytes));
+    let moved = run_on_pool(pool, "term-index layer rebase", move || {
+        span.in_scope(|| rebase_layer(&layer, &bytes.slices, &bytes.tiers, &shift))
+    })
+    .await
+    .map_err(|e| TermIndexError::Build(e.to_string()))?;
+    let moved = match moved {
+        Ok(moved) => moved,
+        // Bytes this build wrote that the move cannot parse: the writer and
+        // the move disagree on the format, which is a bug.
+        Err(error @ TermIndexError::Malformed(_)) => {
+            error!(%error, "term index: a reserved layer did not parse for a move; building it again");
+            return Ok(None);
+        }
+        Err(error) => {
+            warn!(%error, "term index: moving a reserved layer failed; building it again");
+            return Ok(None);
+        }
+    };
+    write_tiers(storage, moved.tiers.clone()).await?;
+    write_slices(storage, moved.slices.clone()).await?;
+    Ok(Some(ReservedLayer {
+        base,
+        superfiles: reserved.superfiles.clone(),
+        id_mins: reserved.id_mins.clone(),
+        layer: moved.layer,
+        bytes: Arc::new(LayerBytes {
+            slices: moved.slices,
+            tiers: moved.tiers,
+        }),
+        exact: reserved.exact,
+    }))
 }
 
 /// [`append_delta`] for a commit that may retry: the layer is built once,
 /// [`RESERVED_ORDINAL_SLACK`] ordinals past `prior`'s length, and kept in
 /// `reserved`. Each call pads `prior` with nil entries up to the reserved
 /// ordinal and appends it, writing only the root unless the root's layers
-/// make a run [`fold_tail`] merges, on `pool`. The layer is built
-/// again only when `prior` has grown past the reserved ordinal, or the
-/// contributions are not the ones it was built from. An `exact` layer is
-/// never padded: it is reused only at `prior`'s exact length and otherwise
-/// rebuilt there, without the slack.
+/// make a run [`fold_tail`] merges, on `pool`. When `prior` has grown past
+/// the reserved ordinal, the layer is moved to new ordinals, the slack past
+/// `prior`'s length, and its moved slices written; it is built again only
+/// when it cannot be moved, or the contributions are not the ones it was
+/// built from. An `exact` layer is never padded: it is reused only at
+/// `prior`'s exact length and otherwise moved there, without the slack.
 ///
 /// Like every delta, it names only ordinals at or past the length of the
 /// root it extends, which `layers_since` relies on. Optimize's rebuild
@@ -575,17 +657,28 @@ pub(crate) async fn append_reserved(
     let len = root.superfiles.len();
     let exact = reserved.as_ref().is_some_and(|r| r.exact);
     let reusable = reserved.as_ref().is_some_and(|r| {
-        (r.base as usize == len || (!exact && r.base as usize > len))
-            && r.superfiles.len() == contributions.len()
-            && r.superfiles
-                .iter()
-                .zip(contributions)
-                .all(|(id, c)| *id == c.superfile_id)
+        (r.base as usize == len || (!exact && r.base as usize > len)) && r.built_from(contributions)
     });
     if !reusable {
         let slack = if exact { 0 } else { RESERVED_ORDINAL_SLACK };
         let base = len as u32 + slack;
-        *reserved = Some(reserve_layer(storage, contributions, policy, base, exact).await?);
+        let moved = match reserved
+            .as_ref()
+            .filter(|kept| kept.built_from(contributions))
+        {
+            Some(kept) => move_reserved(storage, kept, base, pool).await?,
+            None => None,
+        };
+        let next = match moved {
+            Some(moved) => moved,
+            None => reserve_layer(storage, contributions, policy, base, exact).await?,
+        };
+        // The replaced layer's objects are written; its spilled copies are
+        // read by nothing again.
+        if let Some(replaced) = reserved.replace(next) {
+            remove_spilled(&replaced.bytes.slices);
+            remove_spilled(&replaced.bytes.tiers);
+        }
     }
     let layer = reserved.as_ref().expect("reserved above");
     let padding = layer.base as usize - len;
@@ -6917,10 +7010,11 @@ mod tests {
         );
     }
 
-    /// A root grown past the reserved ordinal, or other contributions, get
-    /// a layer built again; its postings still name the right superfile.
+    /// A root grown past the reserved ordinal gets the layer moved, other
+    /// contributions get one built again; either way its postings name the
+    /// right superfile.
     #[tokio::test]
-    async fn append_reserved_rebuilds_when_it_cannot_reuse() {
+    async fn append_reserved_moves_or_rebuilds_when_it_cannot_reuse() {
         let dir = TempDir::new().expect("tempdir");
         let policy = BuildPolicy::default();
         let (store_dir, local, prior) = store_with_base(&dir, &policy).await;
@@ -6953,7 +7047,11 @@ mod tests {
         )
         .await
         .expect("outgrown");
-        assert_ne!(slice_objects(&store_dir), slices_before, "rebuilt");
+        assert_ne!(
+            slice_objects(&store_dir),
+            slices_before,
+            "moved slices written"
+        );
         let root = load_root(local.as_ref(), &reference).await.expect("root");
         assert_eq!(
             root.superfiles.len(),
@@ -6975,6 +7073,238 @@ mod tests {
             [Uuid::from_u128(10)]
         );
         assert!(posted_superfiles(&root, &local, "merged").await.is_empty());
+    }
+
+    /// A slice target small enough that a few terms make several slices.
+    const SMALL_SLICE_TARGET_BYTES: usize = 64;
+    /// Documents a superfile holds of the term every tier shape shares: past
+    /// one block, and past the head the fixtures keep.
+    const COMMON_DOCS: u32 = 130;
+    /// Documents a fixture head keeps of that term.
+    const COMMON_HEAD: usize = 100;
+
+    /// Three superfiles whose terms take every shape a run has: a tier in
+    /// chunks of several blocks with tails, an inline tier, no tier, and
+    /// every location kind.
+    fn mixed_contributions(dir: &TempDir) -> Vec<Contribution> {
+        let common = |first: u32| -> Vec<(u32, f32)> {
+            (0..COMMON_DOCS)
+                .map(|i| (first + i, 1.0 + i as f32 / 10.0))
+                .collect()
+        };
+        vec![
+            contribution_with_heads(
+                dir,
+                1,
+                &[
+                    ("body", "common", common(0)),
+                    ("body", "rare", vec![(5, 2.0)]),
+                ],
+                COMMON_HEAD,
+            ),
+            contribution_with_heads(
+                dir,
+                2,
+                &[
+                    ("body", "common", common(1_000)),
+                    ("body", "rare", vec![(7, 3.0)]),
+                ],
+                COMMON_HEAD,
+            ),
+            contribution(
+                dir,
+                3,
+                &[
+                    ("body", "common", 400),
+                    ("body", "plain", 1),
+                    ("body", "short", 50),
+                ],
+            ),
+        ]
+    }
+
+    /// `objects` in content-hash order, for comparing sets of objects.
+    fn by_hash(mut objects: Vec<(ContentHash, BuiltBytes)>) -> Vec<(ContentHash, BuiltBytes)> {
+        objects.sort_by_key(|(hash, _)| hash.0);
+        objects
+    }
+
+    /// A layer moved to other ordinals is, byte for byte, what a build at
+    /// those ordinals writes, up and down, resident and spilled: every
+    /// posting, inline tier entry and chunk directory renumbered, nothing
+    /// else changed.
+    #[test]
+    fn a_moved_layer_equals_a_build_at_its_new_ordinals() {
+        let dir = TempDir::new().expect("tempdir");
+        let contributions = mixed_contributions(&dir);
+        let n = contributions.len() as u32;
+        let resident = BuildPolicy {
+            slice_target_bytes: SMALL_SLICE_TARGET_BYTES,
+            ..BuildPolicy::default()
+        };
+        let spilling = BuildPolicy {
+            spill_to_disk: true,
+            ..resident.clone()
+        };
+        for policy in [&resident, &spilling] {
+            for (from, to) in [(300, 5_000), (5_000, 300), (70_000, 900_000)] {
+                let at_from = build_layer(&contributions, policy, from).expect("build at from");
+                assert!(at_from.layer.slices.len() > 1, "several slices");
+                assert!(!at_from.tiers.is_empty(), "a chunked tier");
+                let shift = OrdinalShift::new(from, to, n).expect("same widths");
+                let moved = rebase_layer(&at_from.layer, &at_from.slices, &at_from.tiers, &shift)
+                    .expect("move");
+                let at_to = build_layer(&contributions, policy, to).expect("build at to");
+                assert_eq!(moved.layer, at_to.layer, "{from} → {to}: slice list");
+                assert_eq!(moved.slices, at_to.slices, "{from} → {to}: slices");
+                assert_eq!(
+                    by_hash(moved.tiers),
+                    by_hash(at_to.tiers),
+                    "{from} → {to}: tier objects"
+                );
+            }
+        }
+    }
+
+    /// A move refuses a layer that names an ordinal it does not move, and
+    /// leaves the kept bytes as they were.
+    #[test]
+    fn a_move_refuses_an_ordinal_outside_the_layer() {
+        let dir = TempDir::new().expect("tempdir");
+        let contributions = mixed_contributions(&dir);
+        let policy = BuildPolicy {
+            slice_target_bytes: SMALL_SLICE_TARGET_BYTES,
+            ..BuildPolicy::default()
+        };
+        let built = build_layer(&contributions, &policy, 300).expect("build");
+        let before = built.slices.clone();
+        // One ordinal short: the layer's last superfile is not moved.
+        let shift = OrdinalShift::new(300, 5_000, contributions.len() as u32 - 1).expect("shift");
+        assert!(rebase_layer(&built.layer, &built.slices, &built.tiers, &shift).is_err());
+        assert_eq!(built.slices, before, "kept bytes untouched");
+    }
+
+    /// A retry whose root outgrew the reservation moves the layer it built
+    /// rather than building it again: it succeeds with the contributions'
+    /// spill gone, and publishes the layer a build at the new ordinals
+    /// would.
+    #[tokio::test]
+    async fn append_reserved_moves_its_layer_without_its_contributions() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy::default();
+        let (_store_dir, local, prior) = store_with_base(&dir, &policy).await;
+        let merged = mixed_contributions(&dir);
+        let mut reserved = None;
+        append_reserved(
+            &local,
+            Some(prior.clone()),
+            &merged,
+            &policy,
+            &mut reserved,
+            None,
+        )
+        .await
+        .expect("first attempt");
+
+        let mut outgrown = prior;
+        let extra = RESERVED_ORDINAL_SLACK as usize + 1;
+        outgrown.superfiles.extend(repeat_n(Uuid::nil(), extra));
+        outgrown.id_mins.extend(repeat_n(0, extra));
+        let base = outgrown.superfiles.len() as u32 + RESERVED_ORDINAL_SLACK;
+        let expected = build_layer(&merged, &policy, base).expect("build at the new base");
+        for c in &merged {
+            fs::remove_file(&c.path).expect("drop the contribution spill");
+        }
+
+        let reference = append_reserved(
+            &local,
+            Some(outgrown),
+            &merged,
+            &policy,
+            &mut reserved,
+            None,
+        )
+        .await
+        .expect("moved without the contributions");
+        let root = load_root(local.as_ref(), &reference).await.expect("root");
+        assert_eq!(root.layers.last(), Some(&expected.layer));
+        assert_eq!(
+            posted_superfiles(&root, &local, "rare").await,
+            [1, 2].map(Uuid::from_u128)
+        );
+    }
+
+    /// A move that would change how many bytes an ordinal takes is not made
+    /// in place: the layer is built again from its contributions.
+    #[tokio::test]
+    async fn append_reserved_builds_again_across_a_varint_width() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy::default();
+        let (_store_dir, local, prior) = store_with_base(&dir, &policy).await;
+        let merged = mixed_contributions(&dir);
+        let mut reserved = None;
+        append_reserved(
+            &local,
+            Some(prior.clone()),
+            &merged,
+            &policy,
+            &mut reserved,
+            None,
+        )
+        .await
+        .expect("first attempt");
+
+        // Grown far enough that the new base's ordinals take a byte more.
+        let mut outgrown = prior;
+        let extra = 8_200;
+        outgrown.superfiles.extend(repeat_n(Uuid::nil(), extra));
+        outgrown.id_mins.extend(repeat_n(0, extra));
+        let reference = append_reserved(
+            &local,
+            Some(outgrown.clone()),
+            &merged,
+            &policy,
+            &mut reserved,
+            None,
+        )
+        .await
+        .expect("built again");
+        let root = load_root(local.as_ref(), &reference).await.expect("root");
+        let base = outgrown.superfiles.len() as u32 + RESERVED_ORDINAL_SLACK;
+        let expected = build_layer(&merged, &policy, base).expect("build at the new base");
+        assert_eq!(root.layers.last(), Some(&expected.layer));
+
+        // The same crossing without the contributions: the build, and so
+        // the retry, fails.
+        let mut fresh = None;
+        append_reserved(
+            &local,
+            Some(prior_of(&outgrown, extra)),
+            &merged,
+            &policy,
+            &mut fresh,
+            None,
+        )
+        .await
+        .expect("first attempt");
+        for c in &merged {
+            fs::remove_file(&c.path).expect("drop the contribution spill");
+        }
+        assert!(
+            append_reserved(&local, Some(outgrown), &merged, &policy, &mut fresh, None)
+                .await
+                .is_err(),
+            "no move across the width, so a build was tried"
+        );
+    }
+
+    /// `root` without its last `n` superfiles: the root a commit started
+    /// from before `n` more landed.
+    fn prior_of(root: &Root, n: usize) -> Root {
+        let mut prior = root.clone();
+        prior.superfiles.truncate(root.superfiles.len() - n);
+        prior.id_mins.truncate(root.id_mins.len() - n);
+        prior
     }
 
     /// A compaction that loses its commit to an ingest commit appends the
